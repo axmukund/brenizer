@@ -19,3 +19,7 @@ export {
   createMaskTexture,
   type Compositor,
 } from './composition';
+export {
+  createPyramidBlender,
+  type PyramidBlender,
+} from './pyramid';

@@ -4,9 +4,11 @@ import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
 import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
+  createPyramidBlender,
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
   makeViewMatrix, computeBlockCosts, labelsToMask, featherMask, createMaskTexture,
-  type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor, type ManagedTexture,
+  type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
+  type PyramidBlender, type ManagedTexture,
 } from './gl';
 import {
   runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
@@ -18,6 +20,7 @@ let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
 let kpRenderer: KeypointRenderer | null = null;
 let compositor: Compositor | null = null;
+let pyramidBlender: PyramidBlender | null = null;
 
 /** Expose for UI to trigger image preview via WebGL */
 export function getGLContext(): GLContext | null { return glCtx; }
@@ -121,6 +124,7 @@ async function boot(): Promise<void> {
     warpRenderer = createWarpRenderer(glCtx.gl);
     kpRenderer = createKeypointRenderer(glCtx.gl);
     compositor = createCompositor(glCtx.gl);
+    pyramidBlender = createPyramidBlender(glCtx.gl);
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
   } catch (e) {
     console.warn('WebGL2 init failed:', e);
@@ -351,6 +355,13 @@ async function renderWarpedPreview(
   const blockSize = settings?.seamBlockSize ?? 16;
   const featherWidth = settings?.featherWidth ?? 60;
   const useGraphCut = settings?.seamMethod === 'graphcut' && wm !== null;
+  const useMultiband = settings?.multibandEnabled && pyramidBlender !== null;
+  const mbLevels = (() => {
+    const l = settings?.multibandLevels ?? 0;
+    if (l > 0) return l;
+    // Auto: based on composite size
+    return Math.min(6, Math.max(3, Math.floor(Math.log2(Math.min(compW, compH))) - 3));
+  })();
 
   const gridN = 8;
   let imgIdx = 0;
@@ -470,11 +481,18 @@ async function renderWarpedPreview(
       // Upload mask as texture
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
-      // Blend: composite = mix(composite, newImage, mask)
-      compositor.blendWithMask(
-        currentCompTex.texture, newImageTex.texture,
-        maskTex.texture, altCompFBO.fbo, compW, compH,
-      );
+      // Blend using pyramid or simple compositor
+      if (useMultiband) {
+        pyramidBlender!.blend(
+          currentCompTex.texture, newImageTex.texture,
+          maskTex.texture, altCompFBO.fbo, compW, compH, mbLevels,
+        );
+      } else {
+        compositor.blendWithMask(
+          currentCompTex.texture, newImageTex.texture,
+          maskTex.texture, altCompFBO.fbo, compW, compH,
+        );
+      }
       maskTex.dispose();
 
       // Swap composite buffers
@@ -496,10 +514,17 @@ async function renderWarpedPreview(
       const feathered = featherMask(alphaMask, compW, compH, featherWidth / compositeScale);
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
-      compositor.blendWithMask(
-        currentCompTex.texture, newImageTex.texture,
-        maskTex.texture, altCompFBO.fbo, compW, compH,
-      );
+      if (useMultiband) {
+        pyramidBlender!.blend(
+          currentCompTex.texture, newImageTex.texture,
+          maskTex.texture, altCompFBO.fbo, compW, compH, mbLevels,
+        );
+      } else {
+        compositor.blendWithMask(
+          currentCompTex.texture, newImageTex.texture,
+          maskTex.texture, altCompFBO.fbo, compW, compH,
+        );
+      }
       maskTex.dispose();
 
       [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
