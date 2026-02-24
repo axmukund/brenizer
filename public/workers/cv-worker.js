@@ -469,8 +469,181 @@ self.addEventListener('message', async (ev) => {
     }
 
     if (msg.type === 'computeLocalMesh') {
-      // TODO: compute per-vertex local homographies and return mesh buffers
-      postMessage({type:'mesh', imageId: msg.imageId, verticesBuffer: new Float32Array([]).buffer, uvsBuffer: new Float32Array([]).buffer, indicesBuffer: new Uint32Array([]).buffer, bounds:{minX:0,minY:0,maxX:0,maxY:0}});
+      const { imageId, parentId, meshGrid, sigma, depthSigma, minSupport } = msg;
+      const G = meshGrid || 4;
+      const img = images[imageId];
+      if (!img) {
+        postMessage({type:'error', message:`Image ${imageId} not found`});
+        return;
+      }
+
+      // Find edge between imageId and parentId to get inlier correspondences
+      const edge = edges.find(e =>
+        (e.i === imageId && e.j === parentId) || (e.i === parentId && e.j === imageId)
+      );
+
+      // Global transforms for image and parent
+      const Ti = transforms[imageId];
+      const Tp = transforms[parentId];
+
+      if (!edge || !Ti || !Tp) {
+        // Fallback: return identity mesh warped by global transform
+        const result = buildGlobalMesh(imageId, G, Ti, img);
+        postMessage({type:'mesh', imageId, ...result});
+        return;
+      }
+
+      // Build correspondences: x_src (in image i coords) → X_target (in global coords via parent)
+      // Edge inliers are {xi, yi, xj, yj}
+      // If edge.i === imageId: xi,yi are in imageId coords; xj,yj in parentId coords
+      // If edge.i === parentId: swap
+      const srcPts = []; // [x, y] in image i coords
+      const dstPts = []; // [X, Y] in global coords
+
+      for (const inl of edge.inliers) {
+        let si_x, si_y, sp_x, sp_y;
+        if (edge.i === imageId) {
+          si_x = inl.xi; si_y = inl.yi;
+          sp_x = inl.xj; sp_y = inl.yj;
+        } else {
+          si_x = inl.xj; si_y = inl.yj;
+          sp_x = inl.xi; sp_y = inl.yi;
+        }
+
+        // Project parent point to global using Tp
+        const denom = Tp[6] * sp_x + Tp[7] * sp_y + Tp[8];
+        if (Math.abs(denom) < 1e-10) continue;
+        const gx = (Tp[0] * sp_x + Tp[1] * sp_y + Tp[2]) / denom;
+        const gy = (Tp[3] * sp_x + Tp[4] * sp_y + Tp[5]) / denom;
+
+        srcPts.push([si_x, si_y]);
+        dstPts.push([gx, gy]);
+      }
+
+      if (srcPts.length < 4) {
+        // Not enough correspondences for DLT; use global transform
+        const result = buildGlobalMesh(imageId, G, Ti, img);
+        postMessage({type:'mesh', imageId, ...result});
+        return;
+      }
+
+      // Optionally load depth data for depth weighting
+      const depthData = img.depth; // Uint16Array or null
+      const useDepth = depthData && depthSigma > 0;
+
+      // Build mesh grid
+      const cols = G + 1;
+      const rows = G + 1;
+      const w = img.width;
+      const h = img.height;
+
+      const vertices = new Float32Array(cols * rows * 2);
+      const uvs = new Float32Array(cols * rows * 2);
+
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const u = c / G;
+          const v = r / G;
+          const vx = u * w; // vertex position in image coords
+          const vy = v * h;
+          const vi = (r * cols + c) * 2;
+
+          uvs[vi] = u;
+          uvs[vi + 1] = v;
+
+          // Compute weighted DLT for this vertex
+          const weights = new Float64Array(srcPts.length);
+          let totalWeight = 0;
+          const sigma2 = sigma * sigma;
+
+          for (let k = 0; k < srcPts.length; k++) {
+            const dx = srcPts[k][0] - vx;
+            const dy = srcPts[k][1] - vy;
+            let ws = Math.exp(-(dx * dx + dy * dy) / (2 * sigma2));
+
+            if (useDepth) {
+              // Sample depth at source point and vertex
+              const dSrc = sampleDepth(depthData, w, h, srcPts[k][0], srcPts[k][1]);
+              const dV = sampleDepth(depthData, w, h, vx, vy);
+              const dd = dSrc - dV;
+              const depthSigma2 = depthSigma * depthSigma;
+              const wd = Math.exp(-(dd * dd) / (2 * depthSigma2));
+              ws *= wd;
+            }
+
+            weights[k] = ws;
+            totalWeight += ws;
+          }
+
+          // Check effective support
+          const effectiveSupport = totalWeight;
+          let gx, gy;
+
+          if (effectiveSupport < minSupport || srcPts.length < 4) {
+            // Fallback to global transform
+            const denom = Ti[6] * vx + Ti[7] * vy + Ti[8];
+            if (Math.abs(denom) < 1e-10) {
+              gx = vx; gy = vy;
+            } else {
+              gx = (Ti[0] * vx + Ti[1] * vy + Ti[2]) / denom;
+              gy = (Ti[3] * vx + Ti[4] * vy + Ti[5]) / denom;
+            }
+          } else {
+            // Weighted DLT to find local homography H_v mapping src→dst
+            const Hv = weightedDLT(srcPts, dstPts, weights);
+            if (Hv) {
+              const denom = Hv[6] * vx + Hv[7] * vy + Hv[8];
+              if (Math.abs(denom) < 1e-10) {
+                gx = vx; gy = vy;
+              } else {
+                gx = (Hv[0] * vx + Hv[1] * vy + Hv[2]) / denom;
+                gy = (Hv[3] * vx + Hv[4] * vy + Hv[5]) / denom;
+              }
+            } else {
+              // DLT failed, fallback
+              const denom = Ti[6] * vx + Ti[7] * vy + Ti[8];
+              if (Math.abs(denom) < 1e-10) {
+                gx = vx; gy = vy;
+              } else {
+                gx = (Ti[0] * vx + Ti[1] * vy + Ti[2]) / denom;
+                gy = (Ti[3] * vx + Ti[4] * vy + Ti[5]) / denom;
+              }
+            }
+          }
+
+          vertices[vi] = gx;
+          vertices[vi + 1] = gy;
+          minX = Math.min(minX, gx);
+          minY = Math.min(minY, gy);
+          maxX = Math.max(maxX, gx);
+          maxY = Math.max(maxY, gy);
+        }
+      }
+
+      // Triangulate
+      const indices = [];
+      for (let r = 0; r < G; r++) {
+        for (let c = 0; c < G; c++) {
+          const tl = r * cols + c;
+          const tr = tl + 1;
+          const bl = tl + cols;
+          const br = bl + 1;
+          indices.push(tl, bl, tr, tr, bl, br);
+        }
+      }
+
+      const indicesArr = new Uint32Array(indices);
+
+      postMessage({
+        type:'mesh',
+        imageId,
+        verticesBuffer: vertices.buffer,
+        uvsBuffer: uvs.buffer,
+        indicesBuffer: indicesArr.buffer,
+        bounds: { minX, minY, maxX, maxY }
+      }, [vertices.buffer, uvs.buffer, indicesArr.buffer]);
       return;
     }
 
@@ -524,4 +697,204 @@ function invertH(H) {
     (f*g-d*i)*invDet, (a*i-c*g)*invDet, (c*d-a*f)*invDet,
     (d*h-e*g)*invDet, (b*g-a*h)*invDet, (a*e-b*d)*invDet
   ]);
+}
+
+// Build a mesh using the global transform (fallback for APAP)
+function buildGlobalMesh(imageId, G, T, img) {
+  const cols = G + 1;
+  const rows = G + 1;
+  const w = img.width;
+  const h = img.height;
+
+  const vertices = new Float32Array(cols * rows * 2);
+  const uvs = new Float32Array(cols * rows * 2);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const u = c / G;
+      const v = r / G;
+      const vx = u * w;
+      const vy = v * h;
+      const vi = (r * cols + c) * 2;
+      uvs[vi] = u;
+      uvs[vi + 1] = v;
+
+      if (T) {
+        const denom = T[6] * vx + T[7] * vy + T[8];
+        if (Math.abs(denom) > 1e-10) {
+          const gx = (T[0] * vx + T[1] * vy + T[2]) / denom;
+          const gy = (T[3] * vx + T[4] * vy + T[5]) / denom;
+          vertices[vi] = gx;
+          vertices[vi + 1] = gy;
+          minX = Math.min(minX, gx);
+          minY = Math.min(minY, gy);
+          maxX = Math.max(maxX, gx);
+          maxY = Math.max(maxY, gy);
+        } else {
+          vertices[vi] = vx;
+          vertices[vi + 1] = vy;
+        }
+      } else {
+        vertices[vi] = vx;
+        vertices[vi + 1] = vy;
+        minX = Math.min(minX, vx);
+        minY = Math.min(minY, vy);
+        maxX = Math.max(maxX, vx);
+        maxY = Math.max(maxY, vy);
+      }
+    }
+  }
+
+  const indices = [];
+  for (let r = 0; r < G; r++) {
+    for (let c = 0; c < G; c++) {
+      const tl = r * cols + c;
+      const tr = tl + 1;
+      const bl = tl + cols;
+      const br = bl + 1;
+      indices.push(tl, bl, tr, tr, bl, br);
+    }
+  }
+
+  return {
+    verticesBuffer: vertices.buffer,
+    uvsBuffer: uvs.buffer,
+    indicesBuffer: new Uint32Array(indices).buffer,
+    bounds: { minX, minY, maxX, maxY }
+  };
+}
+
+// Sample depth value at (x, y) from Uint16Array depth map using nearest-neighbor
+function sampleDepth(depthData, w, h, x, y) {
+  const ix = Math.min(Math.max(Math.round(x), 0), w - 1);
+  const iy = Math.min(Math.max(Math.round(y), 0), h - 1);
+  return depthData[iy * w + ix] / 65535.0;
+}
+
+/**
+ * Weighted DLT (Direct Linear Transform) to solve for a homography H
+ * that maps srcPts[i] → dstPts[i] with weights[i].
+ * Returns 9-element Float64Array (row-major 3x3) or null if degenerate.
+ */
+function weightedDLT(srcPts, dstPts, weights) {
+  const n = srcPts.length;
+  if (n < 4) return null;
+
+  // Build weighted A matrix for Ah = 0
+  // Each correspondence gives 2 rows in A (9 columns)
+  // Row 1: [0, 0, 0, -w*x, -w*y, -w, w*y'*x, w*y'*y, w*y']
+  // Row 2: [w*x, w*y, w, 0, 0, 0, -w*x'*x, -w*x'*y, -w*x']
+  const rows = 2 * n;
+  const cols = 9;
+
+  // Use AtA (9x9) directly instead of forming the full A matrix
+  const AtA = new Float64Array(81); // 9x9
+
+  for (let k = 0; k < n; k++) {
+    const w = weights[k];
+    if (w < 1e-12) continue;
+    const sx = srcPts[k][0];
+    const sy = srcPts[k][1];
+    const dx = dstPts[k][0];
+    const dy = dstPts[k][1];
+
+    // Row 1 of A for this correspondence
+    const r1 = [0, 0, 0, -w * sx, -w * sy, -w, w * dy * sx, w * dy * sy, w * dy];
+    // Row 2 of A for this correspondence
+    const r2 = [w * sx, w * sy, w, 0, 0, 0, -w * dx * sx, -w * dx * sy, -w * dx];
+
+    // Accumulate AtA += r1^T * r1 + r2^T * r2
+    for (let i = 0; i < 9; i++) {
+      for (let j = i; j < 9; j++) {
+        const val = r1[i] * r1[j] + r2[i] * r2[j];
+        AtA[i * 9 + j] += val;
+        if (i !== j) AtA[j * 9 + i] += val; // symmetric
+      }
+    }
+  }
+
+  // Find smallest eigenvector of AtA using power iteration on (AtA)^{-1}
+  // Instead, use a simpler approach: solve AtA * h = 0 by fixing h[8] = 1
+  // This gives us a 8x8 system AtA_reduced * h_reduced = -AtA_col8
+  const A8 = new Float64Array(64); // 8x8
+  const b8 = new Float64Array(8);
+
+  for (let i = 0; i < 8; i++) {
+    for (let j = 0; j < 8; j++) {
+      A8[i * 8 + j] = AtA[i * 9 + j];
+    }
+    b8[i] = -AtA[i * 9 + 8];
+  }
+
+  // Solve 8x8 system using Gaussian elimination
+  const h8 = solveLinear8(A8, b8);
+  if (!h8) return null;
+
+  const H = new Float64Array(9);
+  for (let i = 0; i < 8; i++) H[i] = h8[i];
+  H[8] = 1.0;
+
+  // Normalize so H[8] = 1 (already is)
+  return H;
+}
+
+/**
+ * Solve an 8x8 linear system Ax = b using Gaussian elimination with partial pivoting.
+ * A is 8x8 row-major, b is length 8.
+ * Returns solution x or null if singular.
+ */
+function solveLinear8(A, b) {
+  const n = 8;
+  // Copy to augmented matrix
+  const m = new Float64Array(n * (n + 1));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      m[i * (n + 1) + j] = A[i * n + j];
+    }
+    m[i * (n + 1) + n] = b[i];
+  }
+
+  // Forward elimination with partial pivoting
+  for (let col = 0; col < n; col++) {
+    // Find pivot
+    let maxVal = Math.abs(m[col * (n + 1) + col]);
+    let maxRow = col;
+    for (let row = col + 1; row < n; row++) {
+      const val = Math.abs(m[row * (n + 1) + col]);
+      if (val > maxVal) { maxVal = val; maxRow = row; }
+    }
+    if (maxVal < 1e-12) return null;
+
+    // Swap rows
+    if (maxRow !== col) {
+      for (let j = 0; j <= n; j++) {
+        const tmp = m[col * (n + 1) + j];
+        m[col * (n + 1) + j] = m[maxRow * (n + 1) + j];
+        m[maxRow * (n + 1) + j] = tmp;
+      }
+    }
+
+    // Eliminate
+    const pivot = m[col * (n + 1) + col];
+    for (let row = col + 1; row < n; row++) {
+      const factor = m[row * (n + 1) + col] / pivot;
+      for (let j = col; j <= n; j++) {
+        m[row * (n + 1) + j] -= factor * m[col * (n + 1) + j];
+      }
+    }
+  }
+
+  // Back substitution
+  const x = new Float64Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let sum = m[i * (n + 1) + n];
+    for (let j = i + 1; j < n; j++) {
+      sum -= m[i * (n + 1) + j] * x[j];
+    }
+    const diag = m[i * (n + 1) + i];
+    if (Math.abs(diag) < 1e-12) return null;
+    x[i] = sum / diag;
+  }
+  return x;
 }

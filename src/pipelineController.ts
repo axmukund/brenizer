@@ -4,7 +4,7 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg } from './workers/workerTypes';
+import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus } from './ui';
@@ -51,6 +51,7 @@ export interface GlobalTransform {
 let lastTransforms: Map<string, GlobalTransform> = new Map();
 let lastRefId: string | null = null;
 let lastMstOrder: string[] = [];
+let lastMstParent: Record<string, string | null> = {};
 
 export function getLastTransforms(): Map<string, GlobalTransform> {
   return lastTransforms;
@@ -74,6 +75,20 @@ let lastDepthMaps: Map<string, DepthMap> = new Map();
 
 export function getLastDepthMaps(): Map<string, DepthMap> {
   return lastDepthMaps;
+}
+
+/** APAP mesh data per image. */
+export interface APAPMesh {
+  imageId: string;
+  vertices: Float32Array;
+  uvs: Float32Array;
+  indices: Uint32Array;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
+}
+let lastMeshes: Map<string, APAPMesh> = new Map();
+
+export function getLastMeshes(): Map<string, APAPMesh> {
+  return lastMeshes;
 }
 
 export function getWorkerManager(): WorkerManager | null {
@@ -296,6 +311,7 @@ export async function runStitchPreview(): Promise<void> {
   const mstMsg = await mstPromise as CVMSTMsg;
   lastRefId = mstMsg.refId;
   lastMstOrder = mstMsg.order;
+  lastMstParent = mstMsg.parent;
   setStatus(`MST built — ref: ${active.find(i => i.id === lastRefId)?.name ?? lastRefId}, order: ${lastMstOrder.length} images`);
 
   const transformsMsg = await transformsPromise;
@@ -377,6 +393,76 @@ export async function runStitchPreview(): Promise<void> {
       }
     }
     setStatus(`Depth estimation complete — ${lastDepthMaps.size}/${active.length} images.`);
+  }
+
+  // Step 8: APAP local mesh computation (if meshGrid > 0)
+  lastMeshes = new Map();
+  if (settings.meshGrid > 0 && lastMstOrder.length > 0) {
+    setStatus('Computing APAP local meshes…');
+
+    // Send depth data to cv-worker for mesh weighting (via addImage with depth)
+    // The depth data was already ingested can be passed as part of computeLocalMesh msg depth field
+    // Actually, depth is stored in the cv-worker images[] if we sent it via addImage.
+    // We need to re-send addImage with depth if we have it.
+    // For now, depth weighting requires depth maps to be part of the image in cv-worker.
+    // We'll resend the depth data for images that have it.
+    if (lastDepthMaps.size > 0) {
+      for (const [id, dm] of lastDepthMaps) {
+        const img = images.find(i => i.id === id);
+        if (!img) continue;
+        const feat = lastFeatures.get(id);
+        if (!feat) continue;
+        // Re-add image with depth buffer
+        const depthBuf = dm.depth.buffer.slice(0) as ArrayBuffer;
+        workerManager!.sendCV({
+          type: 'addImage',
+          imageId: id,
+          grayBuffer: new Uint8ClampedArray(1).buffer as ArrayBuffer, // dummy, already have gray
+          width: feat.keypoints.length > 0 ? Math.round(img.width * feat.scaleFactor) : img.width,
+          height: feat.keypoints.length > 0 ? Math.round(img.height * feat.scaleFactor) : img.height,
+          depth: depthBuf,
+        }, [depthBuf]);
+        await workerManager!.waitCV('progress', 5000);
+      }
+    }
+
+    for (let idx = 0; idx < lastMstOrder.length; idx++) {
+      const nodeId = lastMstOrder[idx];
+      const parentId = lastMstParent[nodeId];
+      if (!parentId) continue; // skip reference image
+
+      const meshPromise = new Promise<CVMeshMsg>((resolve) => {
+        const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+          if (msg.type === 'mesh' && msg.imageId === nodeId) {
+            resolve(msg as CVMeshMsg);
+          }
+        };
+        workerManager!.onCV(handler);
+      });
+
+      workerManager!.sendCV({
+        type: 'computeLocalMesh',
+        imageId: nodeId,
+        parentId: parentId,
+        meshGrid: settings.meshGrid,
+        sigma: 100,       // spatial sigma in alignment pixels
+        depthSigma: 0.1,  // depth sigma (normalized)
+        minSupport: 4,
+      });
+
+      const meshMsg = await meshPromise;
+      lastMeshes.set(nodeId, {
+        imageId: nodeId,
+        vertices: new Float32Array(meshMsg.verticesBuffer),
+        uvs: new Float32Array(meshMsg.uvsBuffer),
+        indices: new Uint32Array(meshMsg.indicesBuffer),
+        bounds: meshMsg.bounds,
+      });
+
+      setStatus(`APAP mesh: ${idx + 1}/${lastMstOrder.length - 1}`);
+    }
+
+    setStatus(`APAP meshes computed for ${lastMeshes.size} images.`);
   }
 
   setStatus(`Pipeline complete — ${active.length} images aligned.`);
