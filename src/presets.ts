@@ -1,2 +1,153 @@
-// presets placeholder
-export const PRESETS = {};
+import type { Capabilities } from './capabilities';
+
+/** All tuneable pipeline parameters. */
+export interface PipelineSettings {
+  maxImages: number;
+  alignScale: number;
+  orbFeatures: number;
+  pairWindowW: number;
+  matchAllPairs: boolean;
+  ratioTest: number;
+  ransacThreshPx: number;
+  refineIters: number;
+  meshGrid: number;       // 0 = off
+  depthEnabled: boolean;
+  depthInputSize: number;
+  seamMethod: 'graphcut' | 'feather';
+  seamBlockSize: number;
+  depthSeamBias: number;
+  featherWidth: number;
+  multibandEnabled: boolean;
+  multibandLevels: number; // 0 = auto
+  exposureComp: boolean;
+  exportScale: number;
+  exportFormat: 'png' | 'jpeg';
+  exportJpegQuality: number;
+}
+
+export type ModeName = 'auto' | 'desktopHQ' | 'mobileQuality' | 'mobileSafe';
+
+const DESKTOP_HQ: PipelineSettings = {
+  maxImages: 25,
+  alignScale: 1536,
+  orbFeatures: 5000,
+  pairWindowW: 6,
+  matchAllPairs: false,
+  ratioTest: 0.75,
+  ransacThreshPx: 3,
+  refineIters: 30,
+  meshGrid: 12,
+  depthEnabled: true,
+  depthInputSize: 256,
+  seamMethod: 'graphcut',
+  seamBlockSize: 16,
+  depthSeamBias: 1.0,
+  featherWidth: 60,
+  multibandEnabled: true,
+  multibandLevels: 0, // auto ≤ 6
+  exposureComp: true,
+  exportScale: 0.5,
+  exportFormat: 'png',
+  exportJpegQuality: 0.92,
+};
+
+const MOBILE_QUALITY: PipelineSettings = {
+  maxImages: 18,
+  alignScale: 1024,
+  orbFeatures: 3500,
+  pairWindowW: 4,
+  matchAllPairs: false,
+  ratioTest: 0.75,
+  ransacThreshPx: 3,
+  refineIters: 15,
+  meshGrid: 10,
+  depthEnabled: true,
+  depthInputSize: 192,
+  seamMethod: 'graphcut',
+  seamBlockSize: 24,
+  depthSeamBias: 1.0,
+  featherWidth: 40,
+  multibandEnabled: true,
+  multibandLevels: 4,
+  exposureComp: true,
+  exportScale: 0.33,
+  exportFormat: 'jpeg',
+  exportJpegQuality: 0.90,
+};
+
+const MOBILE_SAFE: PipelineSettings = {
+  maxImages: 12,
+  alignScale: 768,
+  orbFeatures: 2000,
+  pairWindowW: 3,
+  matchAllPairs: false,
+  ratioTest: 0.75,
+  ransacThreshPx: 3,
+  refineIters: 8,
+  meshGrid: 8,
+  depthEnabled: true,
+  depthInputSize: 128,
+  seamMethod: 'graphcut',
+  seamBlockSize: 32,
+  depthSeamBias: 1.0,
+  featherWidth: 30,
+  multibandEnabled: true,
+  multibandLevels: 3,
+  exposureComp: true,
+  exportScale: 0.25,
+  exportFormat: 'jpeg',
+  exportJpegQuality: 0.85,
+};
+
+const MOBILE_LITE: PipelineSettings = {
+  maxImages: 10,
+  alignScale: 768,
+  orbFeatures: 1500,
+  pairWindowW: 3,
+  matchAllPairs: false,
+  ratioTest: 0.75,
+  ransacThreshPx: 3,
+  refineIters: 4,
+  meshGrid: 0,
+  depthEnabled: false,
+  depthInputSize: 128,
+  seamMethod: 'feather',
+  seamBlockSize: 32,
+  depthSeamBias: 0,
+  featherWidth: 30,
+  multibandEnabled: false,
+  multibandLevels: 0,
+  exposureComp: false,
+  exportScale: 0.25,
+  exportFormat: 'jpeg',
+  exportJpegQuality: 0.80,
+};
+
+export const PRESETS: Record<string, PipelineSettings> = {
+  desktopHQ: DESKTOP_HQ,
+  mobileQuality: MOBILE_QUALITY,
+  mobileSafe: MOBILE_SAFE,
+  mobileLite: MOBILE_LITE,
+};
+
+/** Select the effective mode given user choice + capabilities. */
+export function resolveMode(userMode: ModeName, mobileSafeFlag: boolean, caps: Capabilities): string {
+  if (mobileSafeFlag) return 'mobileSafe';
+
+  if (userMode !== 'auto') return userMode;
+
+  // Auto selection
+  if (caps.isMobile) {
+    const strong = (caps.deviceMemory !== null && caps.deviceMemory >= 4)
+      || (caps.hardwareConcurrency >= 6 && caps.floatFBO);
+    return strong ? 'mobileQuality' : 'mobileSafe';
+  }
+
+  return 'desktopHQ';
+}
+
+/** Get a full settings object for a resolved mode name. Returns a copy. */
+export function getPreset(mode: string): PipelineSettings {
+  const base = PRESETS[mode] || PRESETS.desktopHQ;
+  return { ...base };
+}
