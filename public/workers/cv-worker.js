@@ -69,13 +69,25 @@ self.addEventListener('message', async (ev) => {
     if (msg.type === 'addImage') {
       const {imageId, grayBuffer, width, height, depth} = msg;
       const gray = new Uint8ClampedArray(grayBuffer);
-      images[imageId] = {
-        width, height, gray,
-        depth: depth ? new Uint16Array(depth) : null,
-        keypoints: null,
-        descriptors: null,
-        descCols: 0
-      };
+      if (images[imageId]) {
+        // Merge: only overwrite gray if the buffer is non-trivial
+        if (grayBuffer.byteLength > 1) {
+          images[imageId].gray = gray;
+          images[imageId].width = width;
+          images[imageId].height = height;
+        }
+        if (depth) {
+          images[imageId].depth = new Uint16Array(depth);
+        }
+      } else {
+        images[imageId] = {
+          width, height, gray,
+          depth: depth ? new Uint16Array(depth) : null,
+          keypoints: null,
+          descriptors: null,
+          descCols: 0
+        };
+      }
       postMessage({type:'progress', stage:'addImage', percent:100, info:`added ${imageId}`});
       return;
     }

@@ -245,12 +245,14 @@ export async function runStitchPreview(): Promise<void> {
     featurePromises.set(
       img.id,
       new Promise<CVFeaturesMsg>((resolve) => {
+        let unsub: (() => void) | null = null;
         const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
           if (msg.type === 'features' && msg.imageId === img.id) {
+            if (unsub) unsub();
             resolve(msg as CVFeaturesMsg);
           }
         };
-        workerManager!.onCV(handler);
+        unsub = workerManager!.onCV(handler);
       }),
     );
   }
@@ -287,12 +289,14 @@ export async function runStitchPreview(): Promise<void> {
   setStatus('Matching image pairs…');
 
   const edgesPromise = new Promise<CVEdgesMsg>((resolve) => {
+    let unsub: (() => void) | null = null;
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'edges') {
+        if (unsub) unsub();
         resolve(msg as CVEdgesMsg);
       }
     };
-    workerManager!.onCV(handler);
+    unsub = workerManager!.onCV(handler);
   });
 
   workerManager!.sendCV({
@@ -332,12 +336,14 @@ export async function runStitchPreview(): Promise<void> {
   const mstPromise = workerManager!.waitCV('mst', 15000);
   // We also need the follow-up transforms message
   const transformsPromise = new Promise<CVTransformsMsg>((resolve) => {
+    let unsub: (() => void) | null = null;
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'transforms') {
+        if (unsub) unsub();
         resolve(msg as CVTransformsMsg);
       }
     };
-    workerManager!.onCV(handler);
+    unsub = workerManager!.onCV(handler);
   });
 
   workerManager!.sendCV({ type: 'buildMST' });
@@ -361,12 +367,14 @@ export async function runStitchPreview(): Promise<void> {
   setStatus('Refining transforms…');
 
   const refineTransformPromise = new Promise<CVTransformsMsg>((resolve) => {
+    let unsub: (() => void) | null = null;
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'transforms') {
+        if (unsub) unsub();
         resolve(msg as CVTransformsMsg);
       }
     };
-    workerManager!.onCV(handler);
+    unsub = workerManager!.onCV(handler);
   });
 
   workerManager!.sendCV({
@@ -390,12 +398,14 @@ export async function runStitchPreview(): Promise<void> {
     setStatus('Computing exposure gains…');
 
     const exposurePromise = new Promise<CVExposureMsg>((resolve) => {
+      let unsub: (() => void) | null = null;
       const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
         if (msg.type === 'exposure') {
+          if (unsub) unsub();
           resolve(msg as CVExposureMsg);
         }
       };
-      workerManager!.onCV(handler);
+      unsub = workerManager!.onCV(handler);
     });
 
     workerManager!.sendCV({ type: 'computeExposure' });
@@ -491,12 +501,14 @@ export async function runStitchPreview(): Promise<void> {
       if (!parentId) continue; // skip reference image
 
       const meshPromise = new Promise<CVMeshMsg>((resolve) => {
+        let unsub: (() => void) | null = null;
         const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
           if (msg.type === 'mesh' && msg.imageId === nodeId) {
+            if (unsub) unsub();
             resolve(msg as CVMeshMsg);
           }
         };
-        workerManager!.onCV(handler);
+        unsub = workerManager!.onCV(handler);
       });
 
       workerManager!.sendCV({

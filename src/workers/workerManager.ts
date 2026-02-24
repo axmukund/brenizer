@@ -14,9 +14,10 @@ export interface WorkerManager {
   sendCV(msg: CVInMsg, transfer?: Transferable[]): void;
   sendDepth(msg: DepthInMsg, transfer?: Transferable[]): void;
   sendSeam(msg: SeamInMsg, transfer?: Transferable[]): void;
-  onCV(handler: (msg: CVOutMsg) => void): void;
-  onDepth(handler: (msg: DepthOutMsg) => void): void;
-  onSeam(handler: (msg: SeamOutMsg) => void): void;
+  /** Register handler; returns an unsubscribe function. */
+  onCV(handler: (msg: CVOutMsg) => void): () => void;
+  onDepth(handler: (msg: DepthOutMsg) => void): () => void;
+  onSeam(handler: (msg: SeamOutMsg) => void): () => void;
   /** Wait for next message of a given type from a worker. */
   waitCV<T extends CVOutMsg['type']>(type: T, timeoutMs?: number): Promise<Extract<CVOutMsg, { type: T }>>;
   waitDepth<T extends DepthOutMsg['type']>(type: T, timeoutMs?: number): Promise<Extract<DepthOutMsg, { type: T }>>;
@@ -41,7 +42,7 @@ export function createWorkerManager(): WorkerManager {
 
   function createCV(): Worker {
     if (cvWorker) return cvWorker;
-    cvWorker = new Worker(new URL('/workers/cv-worker.js', window.location.href).toString());
+    cvWorker = new Worker(new URL('workers/cv-worker.js', getBaseUrl()).toString());
     cvWorker.onmessage = (e) => {
       const msg = e.data as CVOutMsg;
       cvHandlers.forEach(h => h(msg));
@@ -73,7 +74,7 @@ export function createWorkerManager(): WorkerManager {
 
   function createSeam(): Worker {
     if (seamWorker) return seamWorker;
-    seamWorker = new Worker(new URL('/workers/seam-worker.js', window.location.href).toString());
+    seamWorker = new Worker(new URL('workers/seam-worker.js', getBaseUrl()).toString());
     seamWorker.onmessage = (e) => {
       const msg = e.data as SeamOutMsg;
       seamHandlers.forEach(h => h(msg));
@@ -171,9 +172,18 @@ export function createWorkerManager(): WorkerManager {
       createSeam().postMessage(msg, transfer);
     },
 
-    onCV(handler) { cvHandlers.push(handler); },
-    onDepth(handler) { depthHandlers.push(handler); },
-    onSeam(handler) { seamHandlers.push(handler); },
+    onCV(handler) {
+      cvHandlers.push(handler);
+      return () => { const i = cvHandlers.indexOf(handler); if (i >= 0) cvHandlers.splice(i, 1); };
+    },
+    onDepth(handler) {
+      depthHandlers.push(handler);
+      return () => { const i = depthHandlers.indexOf(handler); if (i >= 0) depthHandlers.splice(i, 1); };
+    },
+    onSeam(handler) {
+      seamHandlers.push(handler);
+      return () => { const i = seamHandlers.indexOf(handler); if (i >= 0) seamHandlers.splice(i, 1); };
+    },
 
     waitCV(type, timeoutMs) { return waitForMsg(cvHandlers, type, timeoutMs); },
     waitDepth(type, timeoutMs) { return waitForMsg(depthHandlers, type, timeoutMs); },

@@ -36,7 +36,7 @@ void main() {
   // Where new image has zero alpha (outside warp), keep composite
   m *= newI.a;
   fragColor = mix(comp, newI, m);
-  fragColor.a = max(comp.a, newI.a * m);
+  fragColor.a = max(comp.a, newI.a);
 }
 `;
 

@@ -160,6 +160,11 @@ async function boot(): Promise<void> {
     });
   });
 
+  // Wire Settings toggle
+  document.getElementById('btn-settings')?.addEventListener('click', () => {
+    document.getElementById('settings-panel')?.classList.toggle('open');
+  });
+
   // Tab switching
   document.querySelectorAll('#main-tabs .tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -176,7 +181,10 @@ async function boot(): Promise<void> {
       });
       const tabId = (btn as HTMLElement).dataset.tab!;
       const target = document.getElementById(`tab-${tabId}`);
-      if (target) target.style.display = 'flex';
+      if (target) {
+        // Preview tab uses flex layout for canvas; others use block for scrollable content
+        target.style.display = tabId === 'preview' ? 'flex' : 'block';
+      }
     });
   });
 
@@ -237,6 +245,10 @@ function renderMatchHeatmap(
   const bar = document.getElementById('capabilities-bar');
   if (!bar) return;
 
+  // Remove any previous heatmap
+  const prev = bar.querySelector('.inlier-matrix');
+  if (prev) prev.remove();
+
   // Build NxN inlier count matrix
   const n = images.length;
   const matrix: number[][] = Array.from({ length: n }, () => Array(n).fill(0));
@@ -257,7 +269,7 @@ function renderMatchHeatmap(
 
   // Build HTML table
   const shortNames = images.map(i => i.name.replace(/\.[^.]+$/, '').slice(0, 8));
-  let html = '<div style="margin-top:8px;font-size:11px;"><strong>Inlier Matrix</strong>';
+  let html = '<div class="inlier-matrix" style="margin-top:8px;font-size:11px;"><strong>Inlier Matrix</strong>';
   html += '<table style="border-collapse:collapse;margin-top:4px;">';
   html += '<tr><td></td>';
   for (const name of shortNames) html += `<td style="padding:2px 4px;font-size:10px;text-align:center;">${name}</td>`;
@@ -476,6 +488,8 @@ async function renderWarpedPreview(
   let altCompTex = compositeTexB;
   let altCompFBO = compositeB;
 
+  try {
+
   // Clear composite
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.viewport(0, 0, compW, compH);
@@ -619,7 +633,7 @@ async function renderWarpedPreview(
 
       // Convert block labels to pixel mask + feather
       const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, blockSize, compW, compH);
-      const feathered = featherMask(pixelMask, compW, compH, featherWidth / compositeScale);
+      const feathered = featherMask(pixelMask, compW, compH, Math.max(1, Math.round(featherWidth * compositeScale)));
 
       // Upload mask as texture
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
@@ -654,7 +668,7 @@ async function renderWarpedPreview(
       for (let i = 0; i < compW * compH; i++) {
         alphaMask[i] = newPixels[i * 4 + 3];
       }
-      const feathered = featherMask(alphaMask, compW, compH, featherWidth / compositeScale);
+      const feathered = featherMask(alphaMask, compW, compH, Math.max(1, Math.round(featherWidth * compositeScale)));
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
       if (useMultiband) {
@@ -691,9 +705,11 @@ async function renderWarpedPreview(
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
 
   // Cleanup FBOs
+  } finally {
   compositeA.dispose(); compositeTexA.dispose();
   compositeB.dispose(); compositeTexB.dispose();
   newImageFBO.dispose(); newImageTex.dispose();
+  }
 
   setStatus(`Composite complete — ${images.length} images blended.`);
 
@@ -894,7 +910,7 @@ async function exportComposite(): Promise<void> {
       const seamResult = await resultPromise;
       const blockLabels = new Uint8Array(seamResult.labelsBuffer);
       const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, blockSize, outW, outH);
-      const feathered = featherMask(pixelMask, outW, outH, featherWidth);
+      const feathered = featherMask(pixelMask, outW, outH, Math.max(1, Math.round(featherWidth * compositeScale)));
       const maskTex = createMaskTexture(gl, feathered, outW, outH);
 
       if (useMultiband) {
@@ -914,7 +930,7 @@ async function exportComposite(): Promise<void> {
 
       const alphaMask = new Uint8Array(outW * outH);
       for (let i = 0; i < outW * outH; i++) alphaMask[i] = newPixels[i * 4 + 3];
-      const feathered = featherMask(alphaMask, outW, outH, featherWidth);
+      const feathered = featherMask(alphaMask, outW, outH, Math.max(1, Math.round(featherWidth * compositeScale)));
       const maskTex = createMaskTexture(gl, feathered, outW, outH);
 
       if (useMultiband) {
