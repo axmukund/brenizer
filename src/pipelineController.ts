@@ -4,7 +4,7 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import type { CVFeaturesMsg, CVEdgesMsg, CVEdge } from './workers/workerTypes';
+import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus } from './ui';
 
@@ -40,6 +40,25 @@ export function getLastFeatures(): Map<string, ImageFeatures> {
 
 export function getLastEdges(): MatchEdge[] {
   return lastEdges;
+}
+
+/** Global transforms from the last pipeline run. */
+export interface GlobalTransform {
+  imageId: string;
+  T: Float64Array; // 3x3 row-major
+}
+let lastTransforms: Map<string, GlobalTransform> = new Map();
+let lastRefId: string | null = null;
+let lastMstOrder: string[] = [];
+
+export function getLastTransforms(): Map<string, GlobalTransform> {
+  return lastTransforms;
+}
+export function getLastRefId(): string | null {
+  return lastRefId;
+}
+export function getLastMstOrder(): string[] {
+  return lastMstOrder;
 }
 
 export function getWorkerManager(): WorkerManager | null {
@@ -242,6 +261,68 @@ export async function runStitchPreview(): Promise<void> {
 
   // Dispatch event for match heatmap overlay
   window.dispatchEvent(new CustomEvent('edges-ready'));
+
+  // Step 5: Build MST and compute initial global transforms
+  setStatus('Building MST and initial transforms…');
+
+  const mstPromise = workerManager!.waitCV('mst', 15000);
+  // We also need the follow-up transforms message
+  const transformsPromise = new Promise<CVTransformsMsg>((resolve) => {
+    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+      if (msg.type === 'transforms') {
+        resolve(msg as CVTransformsMsg);
+      }
+    };
+    workerManager!.onCV(handler);
+  });
+
+  workerManager!.sendCV({ type: 'buildMST' });
+
+  const mstMsg = await mstPromise as CVMSTMsg;
+  lastRefId = mstMsg.refId;
+  lastMstOrder = mstMsg.order;
+  setStatus(`MST built — ref: ${active.find(i => i.id === lastRefId)?.name ?? lastRefId}, order: ${lastMstOrder.length} images`);
+
+  const transformsMsg = await transformsPromise;
+  lastTransforms = new Map();
+  for (const t of transformsMsg.transforms) {
+    lastTransforms.set(t.imageId, {
+      imageId: t.imageId,
+      T: new Float64Array(t.TBuffer),
+    });
+  }
+
+  // Step 6: Refine transforms (LM — placeholder for now, sends back same transforms)
+  setStatus('Refining transforms…');
+
+  const refineTransformPromise = new Promise<CVTransformsMsg>((resolve) => {
+    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+      if (msg.type === 'transforms') {
+        resolve(msg as CVTransformsMsg);
+      }
+    };
+    workerManager!.onCV(handler);
+  });
+
+  workerManager!.sendCV({
+    type: 'refine',
+    maxIters: settings.refineIters,
+    huberDeltaPx: 2.0,
+    lambdaInit: 0.01,
+  });
+
+  const refinedMsg = await refineTransformPromise;
+  for (const t of refinedMsg.transforms) {
+    lastTransforms.set(t.imageId, {
+      imageId: t.imageId,
+      T: new Float64Array(t.TBuffer),
+    });
+  }
+
+  setStatus(`Pipeline complete — ${active.length} images aligned.`);
+
+  // Dispatch event so main.ts can render warped preview
+  window.dispatchEvent(new CustomEvent('transforms-ready'));
 
   setState({ pipelineStatus: 'idle' });
 }

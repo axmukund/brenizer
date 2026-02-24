@@ -3,7 +3,7 @@ import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
 import { createGLContext, createWarpRenderer, createKeypointRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer, type KeypointRenderer } from './gl';
-import { runStitchPreview, getLastFeatures, getLastEdges } from './pipelineController';
+import { runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId } from './pipelineController';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -171,6 +171,16 @@ async function boot(): Promise<void> {
     // Render inline match heatmap in the status area
     renderMatchHeatmap(active, edges);
   });
+
+  // Render warped multi-image preview after transforms are computed
+  window.addEventListener('transforms-ready', async () => {
+    const { images } = getState();
+    const active = images.filter(i => !i.excluded);
+    const transforms = getLastTransforms();
+    if (active.length === 0 || !glCtx || !warpRenderer || transforms.size === 0) return;
+
+    await renderWarpedPreview(active, transforms);
+  });
 }
 
 /** Render a simple text-based match inlier matrix in the capabilities bar. */
@@ -224,6 +234,112 @@ function renderMatchHeatmap(
   }
   html += '</table></div>';
   bar.innerHTML += html;
+}
+
+/**
+ * Render a warped multi-image preview using global transforms.
+ * Each image is drawn with its 3x3 homography applied through an identity mesh
+ * whose vertices are transformed to global coords.
+ */
+async function renderWarpedPreview(
+  images: import('./appState').ImageEntry[],
+  transforms: Map<string, import('./pipelineController').GlobalTransform>,
+): Promise<void> {
+  if (!glCtx || !warpRenderer) return;
+  const { gl, canvas } = glCtx;
+  const features = getLastFeatures();
+
+  // Size canvas to container
+  const container = document.getElementById('canvas-container')!;
+  canvas.width = container.clientWidth;
+  canvas.height = container.clientHeight;
+  canvas.style.display = 'block';
+  document.getElementById('canvas-placeholder')!.style.display = 'none';
+
+  // Compute bounding box across all warped image corners in global coords
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+  for (const img of images) {
+    const t = transforms.get(img.id);
+    if (!t) continue;
+    const feat = features.get(img.id);
+    const sf = feat?.scaleFactor ?? 1;
+    const w = img.width * sf;
+    const h = img.height * sf;
+    const T = t.T;
+    // Transform 4 corners through T (row-major 3x3)
+    const corners = [[0, 0], [w, 0], [w, h], [0, h]];
+    for (const [cx, cy] of corners) {
+      const denom = T[6] * cx + T[7] * cy + T[8];
+      if (Math.abs(denom) < 1e-10) continue;
+      const gx = (T[0] * cx + T[1] * cy + T[2]) / denom;
+      const gy = (T[3] * cx + T[4] * cy + T[5]) / denom;
+      minX = Math.min(minX, gx);
+      minY = Math.min(minY, gy);
+      maxX = Math.max(maxX, gx);
+      maxY = Math.max(maxY, gy);
+    }
+  }
+
+  if (!isFinite(minX)) return;
+
+  const globalW = maxX - minX;
+  const globalH = maxY - minY;
+
+  // View matrix: maps global coords → clip space
+  const viewMat = makeViewMatrix(canvas.width, canvas.height, 0, 0, 1, globalW, globalH);
+
+  // Clear canvas
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.05, 0.05, 0.1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  // Draw each image warped into global space
+  const gridN = 8; // grid subdivision for mesh (helps with projective distortion)
+  for (const img of images) {
+    const t = transforms.get(img.id);
+    if (!t) continue;
+    const feat = features.get(img.id);
+    const sf = feat?.scaleFactor ?? 1;
+    const alignW = Math.round(img.width * sf);
+    const alignH = Math.round(img.height * sf);
+    const T = t.T;
+
+    // Build a mesh in image coords, project vertices through T, then offset by -minX/-minY
+    const mesh = createIdentityMesh(alignW, alignH, gridN, gridN);
+    const warpedPositions = new Float32Array(mesh.positions.length);
+    for (let i = 0; i < mesh.positions.length; i += 2) {
+      const x = mesh.positions[i];
+      const y = mesh.positions[i + 1];
+      const denom = T[6] * x + T[7] * y + T[8];
+      if (Math.abs(denom) < 1e-10) {
+        warpedPositions[i] = x;
+        warpedPositions[i + 1] = y;
+      } else {
+        warpedPositions[i] = (T[0] * x + T[1] * y + T[2]) / denom - minX;
+        warpedPositions[i + 1] = (T[3] * x + T[4] * y + T[5]) / denom - minY;
+      }
+    }
+    mesh.positions = warpedPositions;
+
+    // Decode image and create texture
+    const bmp = await createImageBitmap(img.file);
+    // Resize to alignment scale
+    const offscreen = new OffscreenCanvas(alignW, alignH);
+    const ctx2d = offscreen.getContext('2d')!;
+    ctx2d.drawImage(bmp, 0, 0, alignW, alignH);
+    bmp.close();
+    const resizedBmp = await createImageBitmap(offscreen);
+    const tex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
+    resizedBmp.close();
+
+    warpRenderer.drawMesh(tex.texture, mesh, viewMat, 1.0, 0.7);
+    tex.dispose();
+  }
+
+  gl.disable(gl.BLEND);
 }
 
 boot().catch(err => {
