@@ -11,3 +11,11 @@ export {
   type KeypointRenderer,
   type MeshData,
 } from './mesh';
+export {
+  createCompositor,
+  computeBlockCosts,
+  labelsToMask,
+  featherMask,
+  createMaskTexture,
+  type Compositor,
+} from './composition';

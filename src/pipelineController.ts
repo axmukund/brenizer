@@ -98,6 +98,33 @@ export function getLastGains(): Map<string, number> {
   return lastGains;
 }
 
+/** Per-image seam masks (Uint8 alpha mask at alignment scale). */
+export interface SeamMask {
+  imageId: string;
+  mask: Uint8Array;     // alpha mask [0..255] at alignment scale
+  width: number;
+  height: number;
+  offsetX: number;      // offset in global composite coords
+  offsetY: number;
+}
+let lastSeamMasks: Map<string, SeamMask> = new Map();
+
+export function getLastSeamMasks(): Map<string, SeamMask> {
+  return lastSeamMasks;
+}
+
+/** Computed global bounding box of the composite. */
+export interface CompositeBounds {
+  minX: number; minY: number;
+  maxX: number; maxY: number;
+  width: number; height: number;
+}
+let lastCompositeBounds: CompositeBounds | null = null;
+
+export function getLastCompositeBounds(): CompositeBounds | null {
+  return lastCompositeBounds;
+}
+
 export function getWorkerManager(): WorkerManager | null {
   return workerManager;
 }

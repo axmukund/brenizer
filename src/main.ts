@@ -2,12 +2,22 @@ import { detectCapabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
-import { createGLContext, createWarpRenderer, createKeypointRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer, type KeypointRenderer } from './gl';
-import { runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId, getLastGains } from './pipelineController';
+import {
+  createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
+  createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
+  makeViewMatrix, computeBlockCosts, labelsToMask, featherMask, createMaskTexture,
+  type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor, type ManagedTexture,
+} from './gl';
+import {
+  runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
+  getLastGains, getLastMeshes, getLastMstOrder, getWorkerManager,
+} from './pipelineController';
+import type { SeamResultMsg } from './workers/workerTypes';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
 let kpRenderer: KeypointRenderer | null = null;
+let compositor: Compositor | null = null;
 
 /** Expose for UI to trigger image preview via WebGL */
 export function getGLContext(): GLContext | null { return glCtx; }
@@ -110,6 +120,7 @@ async function boot(): Promise<void> {
     glCtx = createGLContext(canvas);
     warpRenderer = createWarpRenderer(glCtx.gl);
     kpRenderer = createKeypointRenderer(glCtx.gl);
+    compositor = createCompositor(glCtx.gl);
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
   } catch (e) {
     console.warn('WebGL2 init failed:', e);
@@ -237,18 +248,26 @@ function renderMatchHeatmap(
 }
 
 /**
- * Render a warped multi-image preview using global transforms.
- * Each image is drawn with its 3x3 homography applied through an identity mesh
- * whose vertices are transformed to global coords.
+ * Render incremental composition with seam finding.
+ * For each image in MST order:
+ *  1. Warp into global space via APAP mesh or global homography
+ *  2. Compute overlap costs at block-grid resolution
+ *  3. Solve graph cut via seam-worker
+ *  4. Generate feathered seam mask
+ *  5. Blend into composite
  */
 async function renderWarpedPreview(
   images: import('./appState').ImageEntry[],
   transforms: Map<string, import('./pipelineController').GlobalTransform>,
 ): Promise<void> {
-  if (!glCtx || !warpRenderer) return;
+  if (!glCtx || !warpRenderer || !compositor) return;
   const { gl, canvas } = glCtx;
   const features = getLastFeatures();
   const gains = getLastGains();
+  const meshes = getLastMeshes();
+  const { settings } = getState();
+  const refId = getLastRefId();
+  const wm = getWorkerManager();
 
   // Size canvas to container
   const container = document.getElementById('canvas-container')!;
@@ -259,7 +278,6 @@ async function renderWarpedPreview(
 
   // Compute bounding box across all warped image corners in global coords
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-
   for (const img of images) {
     const t = transforms.get(img.id);
     if (!t) continue;
@@ -268,7 +286,6 @@ async function renderWarpedPreview(
     const w = img.width * sf;
     const h = img.height * sf;
     const T = t.T;
-    // Transform 4 corners through T (row-major 3x3)
     const corners = [[0, 0], [w, 0], [w, h], [0, h]];
     for (const [cx, cy] of corners) {
       const denom = T[6] * cx + T[7] * cy + T[8];
@@ -281,66 +298,236 @@ async function renderWarpedPreview(
       maxY = Math.max(maxY, gy);
     }
   }
-
   if (!isFinite(minX)) return;
 
   const globalW = maxX - minX;
   const globalH = maxY - minY;
 
-  // View matrix: maps global coords → clip space
-  const viewMat = makeViewMatrix(canvas.width, canvas.height, 0, 0, 1, globalW, globalH);
+  // Clamp composite size to safe GPU limits
+  const maxTexSize = glCtx.maxTextureSize;
+  const compositeScale = Math.min(1, maxTexSize / Math.max(globalW, globalH));
+  const compW = Math.round(globalW * compositeScale);
+  const compH = Math.round(globalH * compositeScale);
 
-  // Clear canvas
-  gl.viewport(0, 0, canvas.width, canvas.height);
-  gl.clearColor(0.05, 0.05, 0.1, 1);
+  // Create FBOs for composition
+  const compositeTexA = createEmptyTexture(gl, compW, compH);
+  const compositeTexB = createEmptyTexture(gl, compW, compH);
+  const compositeA = createFBO(gl, compositeTexA.texture);
+  const compositeB = createFBO(gl, compositeTexB.texture);
+  const newImageTex = createEmptyTexture(gl, compW, compH);
+  const newImageFBO = createFBO(gl, newImageTex.texture);
+
+  // View matrix for composite space: maps [0, compW] × [0, compH] → clip [-1, 1]
+  const compViewMat = new Float32Array([
+    2 / compW, 0, 0,
+    0, -2 / compH, 0,
+    -1, 1, 1,
+  ]);
+
+  let currentCompTex = compositeTexA;
+  let currentCompFBO = compositeA;
+  let altCompTex = compositeTexB;
+  let altCompFBO = compositeB;
+
+  // Clear composite
+  gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+  gl.viewport(0, 0, compW, compH);
+  gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  // Draw each image warped into global space
-  const gridN = 8; // grid subdivision for mesh (helps with projective distortion)
-  for (const img of images) {
-    const t = transforms.get(img.id);
+  // Determine MST order, falling back to image order with ref first
+  const mstOrder = (() => {
+    const order: string[] = getLastMstOrder();
+    if (order.length > 0) return order;
+    // Fallback: ref first, then rest
+    const ids = images.map(i => i.id);
+    if (refId && ids.includes(refId)) {
+      return [refId, ...ids.filter(id => id !== refId)];
+    }
+    return ids;
+  })();
+
+  const blockSize = settings?.seamBlockSize ?? 16;
+  const featherWidth = settings?.featherWidth ?? 60;
+  const useGraphCut = settings?.seamMethod === 'graphcut' && wm !== null;
+
+  const gridN = 8;
+  let imgIdx = 0;
+
+  for (const imgId of mstOrder) {
+    const img = images.find(i => i.id === imgId);
+    if (!img) continue;
+    const t = transforms.get(imgId);
     if (!t) continue;
-    const feat = features.get(img.id);
+    const feat = features.get(imgId);
     const sf = feat?.scaleFactor ?? 1;
     const alignW = Math.round(img.width * sf);
     const alignH = Math.round(img.height * sf);
     const T = t.T;
+    const gain = gains.get(imgId) ?? 1.0;
 
-    // Build a mesh in image coords, project vertices through T, then offset by -minX/-minY
-    const mesh = createIdentityMesh(alignW, alignH, gridN, gridN);
-    const warpedPositions = new Float32Array(mesh.positions.length);
-    for (let i = 0; i < mesh.positions.length; i += 2) {
-      const x = mesh.positions[i];
-      const y = mesh.positions[i + 1];
-      const denom = T[6] * x + T[7] * y + T[8];
-      if (Math.abs(denom) < 1e-10) {
-        warpedPositions[i] = x;
-        warpedPositions[i + 1] = y;
-      } else {
-        warpedPositions[i] = (T[0] * x + T[1] * y + T[2]) / denom - minX;
-        warpedPositions[i + 1] = (T[3] * x + T[4] * y + T[5]) / denom - minY;
+    // Build warped mesh (APAP if available, else global transform)
+    let mesh: import('./gl').MeshData;
+    const apap = meshes.get(imgId);
+    if (apap) {
+      // Use APAP mesh (already in global coords), offset by -minX, -minY and scale
+      const warpedPos = new Float32Array(apap.vertices.length);
+      for (let i = 0; i < apap.vertices.length; i += 2) {
+        warpedPos[i] = (apap.vertices[i] - minX) * compositeScale;
+        warpedPos[i + 1] = (apap.vertices[i + 1] - minY) * compositeScale;
       }
+      mesh = { positions: warpedPos, uvs: new Float32Array(apap.uvs), indices: new Uint32Array(apap.indices) };
+    } else {
+      // Global homography mesh
+      const baseMesh = createIdentityMesh(alignW, alignH, gridN, gridN);
+      const warpedPositions = new Float32Array(baseMesh.positions.length);
+      for (let i = 0; i < baseMesh.positions.length; i += 2) {
+        const x = baseMesh.positions[i];
+        const y = baseMesh.positions[i + 1];
+        const denom = T[6] * x + T[7] * y + T[8];
+        if (Math.abs(denom) < 1e-10) {
+          warpedPositions[i] = (x - minX) * compositeScale;
+          warpedPositions[i + 1] = (y - minY) * compositeScale;
+        } else {
+          warpedPositions[i] = ((T[0] * x + T[1] * y + T[2]) / denom - minX) * compositeScale;
+          warpedPositions[i + 1] = ((T[3] * x + T[4] * y + T[5]) / denom - minY) * compositeScale;
+        }
+      }
+      baseMesh.positions = warpedPositions;
+      mesh = baseMesh;
     }
-    mesh.positions = warpedPositions;
 
     // Decode image and create texture
     const bmp = await createImageBitmap(img.file);
-    // Resize to alignment scale
     const offscreen = new OffscreenCanvas(alignW, alignH);
     const ctx2d = offscreen.getContext('2d')!;
     ctx2d.drawImage(bmp, 0, 0, alignW, alignH);
     bmp.close();
     const resizedBmp = await createImageBitmap(offscreen);
-    const tex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
+    const imgTex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
     resizedBmp.close();
 
-    warpRenderer.drawMesh(tex.texture, mesh, viewMat, gains.get(img.id) ?? 1.0, 0.7);
-    tex.dispose();
+    // Render new warped image to newImageFBO
+    gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+    gl.viewport(0, 0, compW, compH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.BLEND);
+    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    imgTex.dispose();
+
+    if (imgIdx === 0) {
+      // First image: copy directly to composite
+      // Render new image to alt composite FBO
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, newImageFBO.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, currentCompFBO.fbo);
+      gl.blitFramebuffer(0, 0, compW, compH, 0, 0, compW, compH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    } else if (useGraphCut) {
+      // Seam finding via graph cut
+      // Read back composite and new image at full resolution
+      const compPixels = new Uint8Array(compW * compH * 4);
+      const newPixels = new Uint8Array(compW * compH * 4);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+      gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+      gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // Compute block costs
+      const costs = computeBlockCosts(compPixels, newPixels, compW, compH, blockSize);
+
+      // Send to seam worker
+      const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
+      const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
+      const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
+
+      const jobId = `seam-${imgId}`;
+      const resultPromise = wm!.waitSeam('result', 15000) as Promise<SeamResultMsg>;
+
+      wm!.sendSeam({
+        type: 'solve',
+        jobId,
+        gridW: costs.gridW,
+        gridH: costs.gridH,
+        dataCostsBuffer: dataCostsBuf,
+        edgeWeightsBuffer: edgeWeightsBuf,
+        hardConstraintsBuffer: hardBuf,
+        params: {},
+      }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
+
+      const seamResult = await resultPromise;
+      const blockLabels = new Uint8Array(seamResult.labelsBuffer);
+
+      // Convert block labels to pixel mask + feather
+      const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, blockSize, compW, compH);
+      const feathered = featherMask(pixelMask, compW, compH, featherWidth / compositeScale);
+
+      // Upload mask as texture
+      const maskTex = createMaskTexture(gl, feathered, compW, compH);
+
+      // Blend: composite = mix(composite, newImage, mask)
+      compositor.blendWithMask(
+        currentCompTex.texture, newImageTex.texture,
+        maskTex.texture, altCompFBO.fbo, compW, compH,
+      );
+      maskTex.dispose();
+
+      // Swap composite buffers
+      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+    } else {
+      // Feather-only fallback: simple alpha blend
+      // Create a mask where new image has alpha
+      const newPixels = new Uint8Array(compW * compH * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+      gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      // Create mask from new image alpha
+      const alphaMask = new Uint8Array(compW * compH);
+      for (let i = 0; i < compW * compH; i++) {
+        alphaMask[i] = newPixels[i * 4 + 3];
+      }
+      const feathered = featherMask(alphaMask, compW, compH, featherWidth / compositeScale);
+      const maskTex = createMaskTexture(gl, feathered, compW, compH);
+
+      compositor.blendWithMask(
+        currentCompTex.texture, newImageTex.texture,
+        maskTex.texture, altCompFBO.fbo, compW, compH,
+      );
+      maskTex.dispose();
+
+      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+    }
+
+    imgIdx++;
+    setStatus(`Compositing: ${imgIdx}/${mstOrder.length}`);
   }
 
+  // Display final composite on screen
+  const viewMat = makeViewMatrix(canvas.width, canvas.height, 0, 0, 1, compW, compH);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.05, 0.05, 0.1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.BLEND);
+
+  // Draw composite as fullscreen quad
+  const screenMesh = createIdentityMesh(compW, compH, 1, 1);
+  warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
+
+  // Cleanup FBOs
+  compositeA.dispose(); compositeTexA.dispose();
+  compositeB.dispose(); compositeTexB.dispose();
+  newImageFBO.dispose(); newImageTex.dispose();
+
+  setStatus(`Composite complete — ${images.length} images blended.`);
 }
 
 boot().catch(err => {
