@@ -152,6 +152,14 @@ async function boot(): Promise<void> {
     });
   });
 
+  // Wire Export button
+  document.getElementById('btn-export')!.addEventListener('click', () => {
+    exportComposite().catch(err => {
+      console.error('Export error:', err);
+      setStatus(`Export error: ${err.message}`);
+    });
+  });
+
   // Draw keypoint overlay after feature extraction completes
   window.addEventListener('features-ready', async () => {
     const { images } = getState();
@@ -553,6 +561,304 @@ async function renderWarpedPreview(
   newImageFBO.dispose(); newImageTex.dispose();
 
   setStatus(`Composite complete — ${images.length} images blended.`);
+
+  // Enable export button
+  document.getElementById('btn-export')!.removeAttribute('disabled');
+}
+
+/**
+ * Export the current composite as a downloadable image file.
+ * Re-renders at export scale, crops transparent edges, downloads via toBlob.
+ */
+async function exportComposite(): Promise<void> {
+  if (!glCtx || !warpRenderer || !compositor) return;
+  const { gl } = glCtx;
+  const { images: allImages, settings } = getState();
+  const active = allImages.filter(i => !i.excluded);
+  const transforms = getLastTransforms();
+  const features = getLastFeatures();
+  const gains = getLastGains();
+  const meshes = getLastMeshes();
+  const refId = getLastRefId();
+
+  if (active.length === 0 || transforms.size === 0 || !settings) {
+    setStatus('Nothing to export. Run Stitch Preview first.');
+    return;
+  }
+
+  setStatus('Exporting…');
+  const exportScale = settings.exportScale;
+  const exportFormat = settings.exportFormat;
+  const jpegQuality = settings.exportJpegQuality;
+
+  // Compute global bounding box at alignment scale
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const img of active) {
+    const t = transforms.get(img.id);
+    if (!t) continue;
+    const feat = features.get(img.id);
+    const sf = feat?.scaleFactor ?? 1;
+    const w = img.width * sf;
+    const h = img.height * sf;
+    const T = t.T;
+    for (const [cx, cy] of [[0, 0], [w, 0], [w, h], [0, h]]) {
+      const denom = T[6] * cx + T[7] * cy + T[8];
+      if (Math.abs(denom) < 1e-10) continue;
+      minX = Math.min(minX, (T[0] * cx + T[1] * cy + T[2]) / denom);
+      minY = Math.min(minY, (T[3] * cx + T[4] * cy + T[5]) / denom);
+      maxX = Math.max(maxX, (T[0] * cx + T[1] * cy + T[2]) / denom);
+      maxY = Math.max(maxY, (T[3] * cx + T[4] * cy + T[5]) / denom);
+    }
+  }
+  if (!isFinite(minX)) return;
+
+  const globalW = maxX - minX;
+  const globalH = maxY - minY;
+  const maxTexSize = glCtx.maxTextureSize;
+  let outW = Math.round(globalW * exportScale);
+  let outH = Math.round(globalH * exportScale);
+  if (outW > maxTexSize || outH > maxTexSize) {
+    const clampScale = maxTexSize / Math.max(outW, outH);
+    outW = Math.round(outW * clampScale);
+    outH = Math.round(outH * clampScale);
+    setStatus(`Export clamped to ${outW}×${outH} (GPU max ${maxTexSize})`);
+  }
+  const compositeScale = outW / globalW;
+
+  // Create FBOs for export rendering
+  const compositeTexA = createEmptyTexture(gl, outW, outH);
+  const compositeTexB = createEmptyTexture(gl, outW, outH);
+  const compositeA = createFBO(gl, compositeTexA.texture);
+  const compositeB = createFBO(gl, compositeTexB.texture);
+  const newImageTex = createEmptyTexture(gl, outW, outH);
+  const newImageFBO = createFBO(gl, newImageTex.texture);
+
+  const compViewMat = new Float32Array([2 / outW, 0, 0, 0, -2 / outH, 0, -1, 1, 1]);
+
+  let currentCompTex = compositeTexA;
+  let currentCompFBO = compositeA;
+  let altCompTex = compositeTexB;
+  let altCompFBO = compositeB;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+  gl.viewport(0, 0, outW, outH);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  const mstOrder = (() => {
+    const order = getLastMstOrder();
+    if (order.length > 0) return order;
+    const ids = active.map(i => i.id);
+    if (refId && ids.includes(refId)) return [refId, ...ids.filter(id => id !== refId)];
+    return ids;
+  })();
+
+  const blockSize = settings.seamBlockSize;
+  const featherWidth = settings.featherWidth;
+  const useMultiband = settings.multibandEnabled && pyramidBlender !== null;
+  const mbLevels = settings.multibandLevels > 0
+    ? settings.multibandLevels
+    : Math.min(6, Math.max(3, Math.floor(Math.log2(Math.min(outW, outH))) - 3));
+  const wm = getWorkerManager();
+  const useGraphCut = settings.seamMethod === 'graphcut' && wm !== null;
+
+  let imgIdx = 0;
+  const gridN = 8;
+
+  for (const imgId of mstOrder) {
+    const img = active.find(i => i.id === imgId);
+    if (!img) continue;
+    const t = transforms.get(imgId);
+    if (!t) continue;
+    const feat = features.get(imgId);
+    const sf = feat?.scaleFactor ?? 1;
+    const alignW = Math.round(img.width * sf);
+    const alignH = Math.round(img.height * sf);
+    const T = t.T;
+    const gain = gains.get(imgId) ?? 1.0;
+
+    // Build warped mesh
+    let mesh: import('./gl').MeshData;
+    const apap = meshes.get(imgId);
+    if (apap) {
+      const warpedPos = new Float32Array(apap.vertices.length);
+      for (let i = 0; i < apap.vertices.length; i += 2) {
+        warpedPos[i] = (apap.vertices[i] - minX) * compositeScale;
+        warpedPos[i + 1] = (apap.vertices[i + 1] - minY) * compositeScale;
+      }
+      mesh = { positions: warpedPos, uvs: new Float32Array(apap.uvs), indices: new Uint32Array(apap.indices) };
+    } else {
+      const baseMesh = createIdentityMesh(alignW, alignH, gridN, gridN);
+      const warpedPositions = new Float32Array(baseMesh.positions.length);
+      for (let i = 0; i < baseMesh.positions.length; i += 2) {
+        const x = baseMesh.positions[i], y = baseMesh.positions[i + 1];
+        const denom = T[6] * x + T[7] * y + T[8];
+        if (Math.abs(denom) < 1e-10) {
+          warpedPositions[i] = (x - minX) * compositeScale;
+          warpedPositions[i + 1] = (y - minY) * compositeScale;
+        } else {
+          warpedPositions[i] = ((T[0] * x + T[1] * y + T[2]) / denom - minX) * compositeScale;
+          warpedPositions[i + 1] = ((T[3] * x + T[4] * y + T[5]) / denom - minY) * compositeScale;
+        }
+      }
+      baseMesh.positions = warpedPositions;
+      mesh = baseMesh;
+    }
+
+    // Decode image at alignment scale
+    const bmp = await createImageBitmap(img.file);
+    const off = new OffscreenCanvas(alignW, alignH);
+    const ctx2d = off.getContext('2d')!;
+    ctx2d.drawImage(bmp, 0, 0, alignW, alignH);
+    bmp.close();
+    const resizedBmp = await createImageBitmap(off);
+    const imgTex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
+    resizedBmp.close();
+
+    // Warp to newImageFBO
+    gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+    gl.viewport(0, 0, outW, outH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.BLEND);
+    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    imgTex.dispose();
+
+    if (imgIdx === 0) {
+      // First image — just copy
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, newImageFBO.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, currentCompFBO.fbo);
+      gl.blitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    } else if (useGraphCut) {
+      // Graph cut seam finding
+      const compPixels = new Uint8Array(outW * outH * 4);
+      const newPixels = new Uint8Array(outW * outH * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+      gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+      gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize);
+      const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
+      const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
+      const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
+
+      const resultPromise = wm!.waitSeam('result', 30000) as Promise<SeamResultMsg>;
+      wm!.sendSeam({
+        type: 'solve', jobId: `export-${imgId}`,
+        gridW: costs.gridW, gridH: costs.gridH,
+        dataCostsBuffer: dataCostsBuf, edgeWeightsBuffer: edgeWeightsBuf,
+        hardConstraintsBuffer: hardBuf, params: {},
+      }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
+
+      const seamResult = await resultPromise;
+      const blockLabels = new Uint8Array(seamResult.labelsBuffer);
+      const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, blockSize, outW, outH);
+      const feathered = featherMask(pixelMask, outW, outH, featherWidth);
+      const maskTex = createMaskTexture(gl, feathered, outW, outH);
+
+      if (useMultiband) {
+        pyramidBlender!.blend(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH, mbLevels);
+      } else {
+        compositor.blendWithMask(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH);
+      }
+      maskTex.dispose();
+      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+    } else {
+      // Feather-only fallback
+      const newPixels = new Uint8Array(outW * outH * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+      gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      const alphaMask = new Uint8Array(outW * outH);
+      for (let i = 0; i < outW * outH; i++) alphaMask[i] = newPixels[i * 4 + 3];
+      const feathered = featherMask(alphaMask, outW, outH, featherWidth);
+      const maskTex = createMaskTexture(gl, feathered, outW, outH);
+
+      if (useMultiband) {
+        pyramidBlender!.blend(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH, mbLevels);
+      } else {
+        compositor.blendWithMask(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH);
+      }
+      maskTex.dispose();
+      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+    }
+
+    imgIdx++;
+    setStatus(`Export: ${imgIdx}/${mstOrder.length}`);
+  }
+
+  // Read back final composite
+  setStatus('Encoding…');
+  const pixels = new Uint8Array(outW * outH * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+  gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // WebGL reads bottom-up — flip vertically
+  const flipped = new Uint8ClampedArray(outW * outH * 4);
+  for (let y = 0; y < outH; y++) {
+    const srcRow = (outH - 1 - y) * outW * 4;
+    const dstRow = y * outW * 4;
+    flipped.set(pixels.subarray(srcRow, srcRow + outW * 4), dstRow);
+  }
+
+  // Auto-crop transparent edges
+  let cropMinX = outW, cropMinY = outH, cropMaxX = 0, cropMaxY = 0;
+  for (let y = 0; y < outH; y++) {
+    for (let x = 0; x < outW; x++) {
+      if (flipped[(y * outW + x) * 4 + 3] > 10) {
+        cropMinX = Math.min(cropMinX, x);
+        cropMinY = Math.min(cropMinY, y);
+        cropMaxX = Math.max(cropMaxX, x);
+        cropMaxY = Math.max(cropMaxY, y);
+      }
+    }
+  }
+
+  const exportCanvas = new OffscreenCanvas(outW, outH);
+  const exportCtx = exportCanvas.getContext('2d')!;
+  exportCtx.putImageData(new ImageData(flipped, outW, outH), 0, 0);
+
+  let finalCanvas: OffscreenCanvas;
+  if (cropMaxX > cropMinX && cropMaxY > cropMinY) {
+    const cw = cropMaxX - cropMinX + 1;
+    const ch = cropMaxY - cropMinY + 1;
+    finalCanvas = new OffscreenCanvas(cw, ch);
+    const fctx = finalCanvas.getContext('2d')!;
+    fctx.drawImage(exportCanvas, cropMinX, cropMinY, cw, ch, 0, 0, cw, ch);
+  } else {
+    finalCanvas = exportCanvas;
+  }
+
+  const mimeType = exportFormat === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const quality = exportFormat === 'jpeg' ? jpegQuality : undefined;
+  const blob = await finalCanvas.convertToBlob({ type: mimeType, quality });
+
+  // Trigger download
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `mosaic.${exportFormat === 'jpeg' ? 'jpg' : 'png'}`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  // Cleanup
+  compositeA.dispose(); compositeTexA.dispose();
+  compositeB.dispose(); compositeTexB.dispose();
+  newImageFBO.dispose(); newImageTex.dispose();
+
+  setStatus(`Exported ${finalCanvas.width}×${finalCanvas.height} ${exportFormat.toUpperCase()}.`);
 }
 
 boot().catch(err => {
