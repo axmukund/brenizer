@@ -5,6 +5,7 @@
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
 import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg } from './workers/workerTypes';
+import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus } from './ui';
 
@@ -59,6 +60,20 @@ export function getLastRefId(): string | null {
 }
 export function getLastMstOrder(): string[] {
   return lastMstOrder;
+}
+
+/** Per-image depth map data. */
+export interface DepthMap {
+  imageId: string;
+  depth: Uint16Array;
+  width: number;
+  height: number;
+  nearIsOne: boolean;
+}
+let lastDepthMaps: Map<string, DepthMap> = new Map();
+
+export function getLastDepthMaps(): Map<string, DepthMap> {
+  return lastDepthMaps;
 }
 
 export function getWorkerManager(): WorkerManager | null {
@@ -317,6 +332,51 @@ export async function runStitchPreview(): Promise<void> {
       imageId: t.imageId,
       T: new Float64Array(t.TBuffer),
     });
+  }
+
+  // Step 7: Depth inference (optional, best-effort)
+  lastDepthMaps = new Map();
+  if (settings.depthEnabled && ready.depth) {
+    setStatus('Running depth estimation…');
+    for (let idx = 0; idx < active.length; idx++) {
+      const img = active[idx];
+      try {
+        // Decode image to RGBA at depth input size
+        const bmp = await createImageBitmap(img.file);
+        const depthSize = settings.depthInputSize;
+        const offscreen = new OffscreenCanvas(depthSize, depthSize);
+        const ctx = offscreen.getContext('2d')!;
+        ctx.drawImage(bmp, 0, 0, depthSize, depthSize);
+        bmp.close();
+        const imgData = ctx.getImageData(0, 0, depthSize, depthSize);
+        const rgbaBuf = imgData.data.buffer as ArrayBuffer;
+
+        workerManager!.sendDepth(
+          {
+            type: 'infer',
+            imageId: img.id,
+            rgbaBuffer: rgbaBuf,
+            width: depthSize,
+            height: depthSize,
+          },
+          [rgbaBuf],
+        );
+
+        const result = await workerManager!.waitDepth('result', 30000) as DepthResultMsg;
+        lastDepthMaps.set(img.id, {
+          imageId: img.id,
+          depth: new Uint16Array(result.depthUint16Buffer),
+          width: result.depthW,
+          height: result.depthH,
+          nearIsOne: result.nearIsOne,
+        });
+        setStatus(`Depth: ${img.name} (${idx + 1}/${active.length})`);
+      } catch (e) {
+        console.warn(`Depth inference failed for ${img.name}:`, e);
+        // Continue without depth for this image
+      }
+    }
+    setStatus(`Depth estimation complete — ${lastDepthMaps.size}/${active.length} images.`);
   }
 
   setStatus(`Pipeline complete — ${active.length} images aligned.`);
