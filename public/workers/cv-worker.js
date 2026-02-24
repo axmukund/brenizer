@@ -107,6 +107,19 @@ self.addEventListener('message', async (ev) => {
       return;
     }
 
+    if (msg.type === 'buildGraph') {
+      // TODO: build weighted graph from edges
+      postMessage({type:'progress', stage:'buildGraph', percent:100, info:'graph built (placeholder)'});
+      return;
+    }
+
+    if (msg.type === 'computeExposure') {
+      // TODO: solve per-image exposure gains
+      const gains = Object.keys(images).map(id => ({imageId: id, gain: 1.0}));
+      postMessage({type:'exposure', gains});
+      return;
+    }
+
     postMessage({type:'error', message:`unknown message: ${JSON.stringify(msg).slice(0,200)}`});
   } catch (err) {
     postMessage({type:'error', message: err.message || err.toString()});

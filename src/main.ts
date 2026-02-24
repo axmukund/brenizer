@@ -3,6 +3,7 @@ import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
 import { createGLContext, createWarpRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer } from './gl';
+import { runStitchPreview } from './pipelineController';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -75,11 +76,18 @@ async function boot(): Promise<void> {
       const newMode = resolveMode(s.userMode, s.mobileSafeFlag, s.capabilities);
       if (newMode !== s.resolvedMode) {
         const newSettings = getPreset(newMode);
-        // Use direct assignment to avoid infinite loop
         setState({ resolvedMode: newMode, settings: newSettings });
         setStatus(`Mode changed to ${newMode}`);
       }
     }
+  });
+
+  // Wire Stitch Preview button
+  document.getElementById('btn-stitch')!.addEventListener('click', () => {
+    runStitchPreview().catch(err => {
+      console.error('Pipeline error:', err);
+      setStatus(`Pipeline error: ${err.message}`);
+    });
   });
 }
 
