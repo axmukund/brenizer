@@ -4,7 +4,7 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import type { CVFeaturesMsg } from './workers/workerTypes';
+import type { CVFeaturesMsg, CVEdgesMsg, CVEdge } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus } from './ui';
 
@@ -23,8 +23,23 @@ export interface ImageFeatures {
 /** Feature results from the last run, keyed by imageId. */
 let lastFeatures: Map<string, ImageFeatures> = new Map();
 
+/** Edge results from the last matching run. */
+export interface MatchEdge {
+  i: string;
+  j: string;
+  H: Float64Array;
+  inliers: Float32Array; // [xi, yi, xj, yj, ...]
+  rms: number;
+  inlierCount: number;
+}
+let lastEdges: MatchEdge[] = [];
+
 export function getLastFeatures(): Map<string, ImageFeatures> {
   return lastFeatures;
+}
+
+export function getLastEdges(): MatchEdge[] {
+  return lastEdges;
 }
 
 export function getWorkerManager(): WorkerManager | null {
@@ -181,8 +196,52 @@ export async function runStitchPreview(): Promise<void> {
     (s, f) => s + f.keypoints.length / 2, 0,
   );
   setStatus(`Feature extraction complete — ${totalKp} keypoints across ${active.length} images.`);
-  setState({ pipelineStatus: 'idle' });
 
-  // Dispatch custom event so main.ts can draw overlay
+  // Dispatch custom event so main.ts can draw keypoint overlay
   window.dispatchEvent(new CustomEvent('features-ready'));
+
+  // Step 4: Match pairs — knnMatch + ratio test + RANSAC homography
+  setStatus('Matching image pairs…');
+
+  const edgesPromise = new Promise<CVEdgesMsg>((resolve) => {
+    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+      if (msg.type === 'edges') {
+        resolve(msg as CVEdgesMsg);
+      }
+    };
+    workerManager!.onCV(handler);
+  });
+
+  workerManager!.sendCV({
+    type: 'matchGraph',
+    windowW: settings.pairWindowW,
+    ratio: settings.ratioTest,
+    ransacThreshPx: settings.ransacThreshPx,
+    minInliers: 15,
+    matchAllPairs: settings.matchAllPairs,
+  });
+
+  const edgesMsg = await edgesPromise;
+  lastEdges = edgesMsg.edges.map((e: CVEdge) => ({
+    i: e.i,
+    j: e.j,
+    H: new Float64Array(e.HBuffer),
+    inliers: new Float32Array(e.inliersBuffer),
+    rms: e.rms,
+    inlierCount: e.inlierCount,
+  }));
+
+  if (lastEdges.length === 0) {
+    setStatus('No matching pairs found. Try adding more overlapping images.');
+    setState({ pipelineStatus: 'idle' });
+    return;
+  }
+
+  const totalInliers = lastEdges.reduce((s, e) => s + e.inlierCount, 0);
+  setStatus(`Matching complete — ${lastEdges.length} edges, ${totalInliers} total inliers.`);
+
+  // Dispatch event for match heatmap overlay
+  window.dispatchEvent(new CustomEvent('edges-ready'));
+
+  setState({ pipelineStatus: 'idle' });
 }

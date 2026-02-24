@@ -3,7 +3,7 @@ import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
 import { createGLContext, createWarpRenderer, createKeypointRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer, type KeypointRenderer } from './gl';
-import { runStitchPreview, getLastFeatures } from './pipelineController';
+import { runStitchPreview, getLastFeatures, getLastEdges } from './pipelineController';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -151,6 +151,79 @@ async function boot(): Promise<void> {
       renderKeypointOverlay(img.id, img.width, img.height);
     }
   });
+
+  // Display match edge info after matching completes
+  window.addEventListener('edges-ready', () => {
+    const edges = getLastEdges();
+    const { images } = getState();
+    const active = images.filter(i => !i.excluded);
+    if (edges.length === 0) return;
+
+    // Log match matrix to console for diagnostics
+    console.group('Match Graph');
+    for (const e of edges) {
+      const nameI = active.find(i => i.id === e.i)?.name ?? e.i;
+      const nameJ = active.find(i => i.id === e.j)?.name ?? e.j;
+      console.log(`${nameI} ↔ ${nameJ}: ${e.inlierCount} inliers, RMS=${e.rms.toFixed(2)}`);
+    }
+    console.groupEnd();
+
+    // Render inline match heatmap in the status area
+    renderMatchHeatmap(active, edges);
+  });
+}
+
+/** Render a simple text-based match inlier matrix in the capabilities bar. */
+function renderMatchHeatmap(
+  images: import('./appState').ImageEntry[],
+  edges: import('./pipelineController').MatchEdge[],
+): void {
+  const bar = document.getElementById('capabilities-bar');
+  if (!bar) return;
+
+  // Build NxN inlier count matrix
+  const n = images.length;
+  const matrix: number[][] = Array.from({ length: n }, () => Array(n).fill(0));
+  const idToIdx = new Map(images.map((img, i) => [img.id, i]));
+
+  for (const e of edges) {
+    const a = idToIdx.get(e.i);
+    const b = idToIdx.get(e.j);
+    if (a !== undefined && b !== undefined) {
+      matrix[a][b] = e.inlierCount;
+      matrix[b][a] = e.inlierCount;
+    }
+  }
+
+  // Find max for colour scaling
+  let maxCount = 1;
+  for (const row of matrix) for (const v of row) if (v > maxCount) maxCount = v;
+
+  // Build HTML table
+  const shortNames = images.map(i => i.name.replace(/\.[^.]+$/, '').slice(0, 8));
+  let html = '<div style="margin-top:8px;font-size:11px;"><strong>Inlier Matrix</strong>';
+  html += '<table style="border-collapse:collapse;margin-top:4px;">';
+  html += '<tr><td></td>';
+  for (const name of shortNames) html += `<td style="padding:2px 4px;font-size:10px;text-align:center;">${name}</td>`;
+  html += '</tr>';
+  for (let r = 0; r < n; r++) {
+    html += `<tr><td style="padding:2px 4px;font-size:10px;">${shortNames[r]}</td>`;
+    for (let c = 0; c < n; c++) {
+      if (r === c) {
+        html += '<td style="background:#333;width:24px;height:20px;text-align:center;font-size:9px;">–</td>';
+      } else {
+        const v = matrix[r][c];
+        const t = v / maxCount;
+        const r0 = Math.round(255 * (1 - t));
+        const g0 = Math.round(255 * t);
+        const bg = `rgb(${r0},${g0},60)`;
+        html += `<td style="background:${bg};width:24px;height:20px;text-align:center;font-size:9px;color:#fff;">${v || ''}</td>`;
+      }
+    }
+    html += '</tr>';
+  }
+  html += '</table></div>';
+  bar.innerHTML += html;
 }
 
 boot().catch(err => {
