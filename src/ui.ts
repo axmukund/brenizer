@@ -1,6 +1,12 @@
 import { getState, setState, subscribe, type ImageEntry } from './appState';
 import { capsSummary, type Capabilities } from './capabilities';
 
+// Lazy import to avoid circular dep — set by main.ts
+let _renderImagePreview: ((entry: ImageEntry) => Promise<void>) | null = null;
+export function setRenderImagePreview(fn: (entry: ImageEntry) => Promise<void>): void {
+  _renderImagePreview = fn;
+}
+
 // ── helpers ──────────────────────────────────────────────
 function $(id: string) { return document.getElementById(id)!; }
 
@@ -117,6 +123,11 @@ function renderImageList(): void {
     const thumb = document.createElement('img');
     thumb.src = img.thumbUrl;
     thumb.alt = img.name;
+    thumb.style.cursor = 'pointer';
+    thumb.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (_renderImagePreview) _renderImagePreview(img);
+    });
 
     const info = document.createElement('div');
     info.className = 'img-info';
