@@ -4,8 +4,10 @@ export { createTextureFromImage, createEmptyTexture, type ManagedTexture } from 
 export { createFBO, type ManagedFBO } from './framebuffers';
 export {
   createWarpRenderer,
+  createKeypointRenderer,
   createIdentityMesh,
   makeViewMatrix,
   type WarpRenderer,
+  type KeypointRenderer,
   type MeshData,
 } from './mesh';

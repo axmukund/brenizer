@@ -2,11 +2,12 @@ import { detectCapabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
-import { createGLContext, createWarpRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer } from './gl';
-import { runStitchPreview } from './pipelineController';
+import { createGLContext, createWarpRenderer, createKeypointRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer, type KeypointRenderer } from './gl';
+import { runStitchPreview, getLastFeatures } from './pipelineController';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
+let kpRenderer: KeypointRenderer | null = null;
 
 /** Expose for UI to trigger image preview via WebGL */
 export function getGLContext(): GLContext | null { return glCtx; }
@@ -40,6 +41,51 @@ export async function renderImagePreview(imageEntry: { file: File; width: number
   tex.dispose();
 }
 
+/**
+ * Draw keypoint overlay for a specific image.
+ * The keypoints are in alignment-space coords so we must account for the scale.
+ */
+export function renderKeypointOverlay(imageId: string, imgW: number, imgH: number): void {
+  if (!glCtx || !kpRenderer) return;
+  const features = getLastFeatures().get(imageId);
+  if (!features || features.keypoints.length < 2) return;
+
+  const { gl, canvas } = glCtx;
+  // keypoints are in alignment-scaled coords; map them to original coords
+  // then build a viewMatrix that matches the one used for image preview
+  const sf = features.scaleFactor;
+  const origW = imgW;
+  const origH = imgH;
+  const alignW = Math.round(origW * sf);
+  const alignH = Math.round(origH * sf);
+
+  // Scale keypoints from alignment coords to original image coords
+  const kps = features.keypoints;
+  const scaledKps = new Float32Array(kps.length);
+  for (let i = 0; i < kps.length; i += 2) {
+    scaledKps[i] = kps[i] / sf;
+    scaledKps[i + 1] = kps[i + 1] / sf;
+  }
+
+  // Use same viewMatrix as renderImagePreview
+  const viewMat = makeViewMatrix(canvas.width, canvas.height, 0, 0, 1, origW, origH);
+
+  // Distinct colours per-image for multi-image display (cycle through palette)
+  const palette: [number, number, number, number][] = [
+    [0, 1, 0.3, 0.8],  // green
+    [1, 0.3, 0, 0.8],  // red-orange
+    [0.2, 0.6, 1, 0.8], // blue
+    [1, 1, 0, 0.8],    // yellow
+    [1, 0, 1, 0.8],    // magenta
+    [0, 1, 1, 0.8],    // cyan
+  ];
+  const { images } = getState();
+  const idx = images.findIndex(i => i.id === imageId);
+  const color = palette[idx % palette.length];
+
+  kpRenderer.drawKeypoints(scaledKps, viewMat, color, 6);
+}
+
 async function boot(): Promise<void> {
   // Init UI first so elements are wired
   initUI();
@@ -63,6 +109,7 @@ async function boot(): Promise<void> {
     const canvas = document.getElementById('preview-canvas') as HTMLCanvasElement;
     glCtx = createGLContext(canvas);
     warpRenderer = createWarpRenderer(glCtx.gl);
+    kpRenderer = createKeypointRenderer(glCtx.gl);
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
   } catch (e) {
     console.warn('WebGL2 init failed:', e);
@@ -88,6 +135,21 @@ async function boot(): Promise<void> {
       console.error('Pipeline error:', err);
       setStatus(`Pipeline error: ${err.message}`);
     });
+  });
+
+  // Draw keypoint overlay after feature extraction completes
+  window.addEventListener('features-ready', async () => {
+    const { images } = getState();
+    const active = images.filter(i => !i.excluded);
+    if (active.length === 0 || !glCtx || !warpRenderer) return;
+
+    // Re-render the first image then overlay keypoints for all
+    const first = active[0];
+    await renderImagePreview(first);
+
+    for (const img of active) {
+      renderKeypointOverlay(img.id, img.width, img.height);
+    }
   });
 }
 

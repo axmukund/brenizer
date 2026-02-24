@@ -4,10 +4,28 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import { getState, setState } from './appState';
+import type { CVFeaturesMsg } from './workers/workerTypes';
+import { getState, setState, type ImageEntry } from './appState';
 import { setStatus } from './ui';
 
 let workerManager: WorkerManager | null = null;
+
+/** Per-image feature data received from cv-worker. */
+export interface ImageFeatures {
+  imageId: string;
+  keypoints: Float32Array;  // [x0,y0, x1,y1, ...]
+  descriptors: Uint8Array;
+  descCols: number;
+  /** Scale factor used to resize image for alignment (image coords → alignment coords). */
+  scaleFactor: number;
+}
+
+/** Feature results from the last run, keyed by imageId. */
+let lastFeatures: Map<string, ImageFeatures> = new Map();
+
+export function getLastFeatures(): Map<string, ImageFeatures> {
+  return lastFeatures;
+}
 
 export function getWorkerManager(): WorkerManager | null {
   return workerManager;
@@ -33,6 +51,45 @@ export async function initWorkers(): Promise<{ cv: boolean; depth: boolean; seam
 
   setStatus(`Workers: ${parts.join(' | ')}`);
   return result;
+}
+
+/**
+ * Decode an image file to grayscale at the alignment scale.
+ * Returns { gray, width, height, scaleFactor }.
+ */
+async function imageToGray(
+  entry: ImageEntry,
+  alignScale: number,
+): Promise<{ gray: Uint8ClampedArray; width: number; height: number; scaleFactor: number }> {
+  const bmp = await createImageBitmap(entry.file);
+  const origW = bmp.width;
+  const origH = bmp.height;
+
+  // Compute scale so max(w,h) <= alignScale
+  const maxDim = Math.max(origW, origH);
+  const scaleFactor = maxDim > alignScale ? alignScale / maxDim : 1;
+  const w = Math.round(origW * scaleFactor);
+  const h = Math.round(origH * scaleFactor);
+
+  // Draw onto offscreen canvas
+  const offscreen = new OffscreenCanvas(w, h);
+  const ctx = offscreen.getContext('2d')!;
+  ctx.drawImage(bmp, 0, 0, w, h);
+  bmp.close();
+
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const rgba = imgData.data;
+
+  // Convert to grayscale (luminance)
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const r = rgba[i * 4];
+    const g = rgba[i * 4 + 1];
+    const b = rgba[i * 4 + 2];
+    gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+  }
+
+  return { gray, width: w, height: h, scaleFactor };
 }
 
 /** Run the full stitch preview pipeline. */
@@ -61,6 +118,71 @@ export async function runStitchPreview(): Promise<void> {
     return;
   }
 
-  setStatus('Workers ready. Pipeline placeholder complete.');
+  setStatus('Extracting features…');
+
+  // Step 2: Convert images to grayscale and send to cv-worker
+  const scaleFactors: Record<string, number> = {};
+  for (const img of active) {
+    const { gray, width, height, scaleFactor } = await imageToGray(img, settings.alignScale);
+    scaleFactors[img.id] = scaleFactor;
+    const buf = gray.buffer as ArrayBuffer;
+    workerManager!.sendCV(
+      {
+        type: 'addImage',
+        imageId: img.id,
+        grayBuffer: buf,
+        width,
+        height,
+      },
+      [buf],
+    );
+    // Wait for ack
+    await workerManager!.waitCV('progress', 5000);
+  }
+
+  // Step 3: Compute features (ORB)
+  // Collect features messages as they arrive
+  const featurePromises = new Map<string, Promise<CVFeaturesMsg>>();
+  for (const img of active) {
+    featurePromises.set(
+      img.id,
+      new Promise<CVFeaturesMsg>((resolve) => {
+        const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+          if (msg.type === 'features' && msg.imageId === img.id) {
+            resolve(msg as CVFeaturesMsg);
+          }
+        };
+        workerManager!.onCV(handler);
+      }),
+    );
+  }
+
+  workerManager!.sendCV({
+    type: 'computeFeatures',
+    orbParams: { nFeatures: settings.orbFeatures },
+  });
+
+  // Wait for all features
+  lastFeatures = new Map();
+  for (const img of active) {
+    const featMsg = await featurePromises.get(img.id)!;
+    lastFeatures.set(img.id, {
+      imageId: img.id,
+      keypoints: new Float32Array(featMsg.keypointsBuffer),
+      descriptors: new Uint8Array(featMsg.descriptorsBuffer),
+      descCols: featMsg.descCols,
+      scaleFactor: scaleFactors[img.id],
+    });
+    const numKp = new Float32Array(featMsg.keypointsBuffer).length / 2;
+    setStatus(`Features: ${img.name} — ${numKp} keypoints`);
+  }
+
+  const totalKp = Array.from(lastFeatures.values()).reduce(
+    (s, f) => s + f.keypoints.length / 2, 0,
+  );
+  setStatus(`Feature extraction complete — ${totalKp} keypoints across ${active.length} images.`);
   setState({ pipelineStatus: 'idle' });
+
+  // Dispatch custom event so main.ts can draw overlay
+  window.dispatchEvent(new CustomEvent('features-ready'));
 }

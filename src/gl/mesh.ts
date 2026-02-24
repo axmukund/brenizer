@@ -58,6 +58,36 @@ void main() {
 }
 `;
 
+// ── keypoint overlay shaders ────────────────────────────
+
+const POINT_VERT = `#version 300 es
+precision highp float;
+in vec2 a_position;
+uniform mat3 u_viewMatrix;
+uniform float u_pointSize;
+out vec2 v_pos;
+void main() {
+  vec3 p = u_viewMatrix * vec3(a_position, 1.0);
+  gl_Position = vec4(p.xy, 0.0, 1.0);
+  gl_PointSize = u_pointSize;
+  v_pos = a_position;
+}
+`;
+
+const POINT_FRAG = `#version 300 es
+precision highp float;
+uniform vec4 u_color;
+out vec4 fragColor;
+void main() {
+  // Draw circle with smooth edge
+  vec2 pc = gl_PointCoord - 0.5;
+  float dist = length(pc);
+  if (dist > 0.5) discard;
+  float alpha = smoothstep(0.5, 0.35, dist);
+  fragColor = vec4(u_color.rgb, u_color.a * alpha);
+}
+`;
+
 // ── types ────────────────────────────────────────────────
 
 export interface MeshData {
@@ -74,6 +104,23 @@ export interface WarpRenderer {
     viewMatrix: Float32Array, // 3x3 col-major
     gain?: number,
     alpha?: number,
+  ): void;
+  dispose(): void;
+}
+
+export interface KeypointRenderer {
+  /**
+   * Draw keypoints as coloured dots over the current framebuffer.
+   * @param keypoints  Float32Array of [x0,y0,x1,y1,...] in image (pixel) coords
+   * @param viewMatrix 3x3 col-major mapping image coords → clip space
+   * @param color      RGBA colour [0-1]
+   * @param pointSize  Size in pixels
+   */
+  drawKeypoints(
+    keypoints: Float32Array,
+    viewMatrix: Float32Array,
+    color?: [number, number, number, number],
+    pointSize?: number,
   ): void;
   dispose(): void;
 }
@@ -245,6 +292,54 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
       gl.deleteBuffer(posBuf);
       gl.deleteBuffer(uvBuf);
       gl.deleteBuffer(idxBuf);
+    },
+  };
+}
+
+/** Create a renderer for drawing keypoint overlays as coloured dots. */
+export function createKeypointRenderer(gl: WebGL2RenderingContext): KeypointRenderer {
+  const prog = createProgram(gl, POINT_VERT, POINT_FRAG);
+  const aPos = gl.getAttribLocation(prog, 'a_position');
+  const uView = gl.getUniformLocation(prog, 'u_viewMatrix');
+  const uColor = gl.getUniformLocation(prog, 'u_color');
+  const uSize = gl.getUniformLocation(prog, 'u_pointSize');
+
+  const vao = gl.createVertexArray()!;
+  const vbo = gl.createBuffer()!;
+
+  return {
+    drawKeypoints(
+      keypoints: Float32Array,
+      viewMatrix: Float32Array,
+      color: [number, number, number, number] = [0, 1, 0, 0.85],
+      pointSize = 6,
+    ) {
+      if (keypoints.length < 2) return;
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+      gl.useProgram(prog);
+
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, keypoints, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+      gl.uniformMatrix3fv(uView, false, viewMatrix);
+      gl.uniform4fv(uColor, color);
+      gl.uniform1f(uSize, pointSize);
+
+      gl.drawArrays(gl.POINTS, 0, keypoints.length / 2);
+      gl.bindVertexArray(null);
+      gl.disable(gl.BLEND);
+    },
+
+    dispose() {
+      gl.deleteProgram(prog);
+      gl.deleteVertexArray(vao);
+      gl.deleteBuffer(vbo);
     },
   };
 }
