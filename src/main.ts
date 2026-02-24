@@ -791,6 +791,8 @@ async function exportComposite(): Promise<void> {
   let altCompTex = compositeTexB;
   let altCompFBO = compositeB;
 
+  try {
+
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.viewport(0, 0, outW, outH);
   gl.clearColor(0, 0, 0, 0);
@@ -1004,12 +1006,14 @@ async function exportComposite(): Promise<void> {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 
+  setStatus(`Exported ${finalCanvas.width}×${finalCanvas.height} ${exportFormat.toUpperCase()}.`);
+
   // Cleanup
+  } finally {
   compositeA.dispose(); compositeTexA.dispose();
   compositeB.dispose(); compositeTexB.dispose();
   newImageFBO.dispose(); newImageTex.dispose();
-
-  setStatus(`Exported ${finalCanvas.width}×${finalCanvas.height} ${exportFormat.toUpperCase()}.`);
+  }
 }
 
 boot().catch(err => {

@@ -88,7 +88,7 @@ void main() {
   float m = texture(u_mask, v_uv).r;
   // Handle alpha: where new image has no data, keep composite
   float effectiveM = m * ln.a;
-  fragColor = vec4(mix(lc.rgb, ln.rgb, effectiveM), max(lc.a, ln.a * m));
+  fragColor = vec4(mix(lc.rgb, ln.rgb, effectiveM), max(lc.a, ln.a));
 }
 `;
 
