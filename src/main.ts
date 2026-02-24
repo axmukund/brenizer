@@ -3,7 +3,7 @@ import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
 import { createGLContext, createWarpRenderer, createKeypointRenderer, createIdentityMesh, createTextureFromImage, makeViewMatrix, type GLContext, type WarpRenderer, type KeypointRenderer } from './gl';
-import { runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId } from './pipelineController';
+import { runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId, getLastGains } from './pipelineController';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -248,6 +248,7 @@ async function renderWarpedPreview(
   if (!glCtx || !warpRenderer) return;
   const { gl, canvas } = glCtx;
   const features = getLastFeatures();
+  const gains = getLastGains();
 
   // Size canvas to container
   const container = document.getElementById('canvas-container')!;
@@ -335,7 +336,7 @@ async function renderWarpedPreview(
     const tex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
     resizedBmp.close();
 
-    warpRenderer.drawMesh(tex.texture, mesh, viewMat, 1.0, 0.7);
+    warpRenderer.drawMesh(tex.texture, mesh, viewMat, gains.get(img.id) ?? 1.0, 0.7);
     tex.dispose();
   }
 

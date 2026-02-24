@@ -4,7 +4,7 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg } from './workers/workerTypes';
+import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus } from './ui';
@@ -89,6 +89,13 @@ let lastMeshes: Map<string, APAPMesh> = new Map();
 
 export function getLastMeshes(): Map<string, APAPMesh> {
   return lastMeshes;
+}
+
+/** Per-image exposure gains (scalar multiplier applied to RGB). */
+let lastGains: Map<string, number> = new Map();
+
+export function getLastGains(): Map<string, number> {
+  return lastGains;
 }
 
 export function getWorkerManager(): WorkerManager | null {
@@ -348,6 +355,31 @@ export async function runStitchPreview(): Promise<void> {
       imageId: t.imageId,
       T: new Float64Array(t.TBuffer),
     });
+  }
+
+  // Step 6b: Exposure compensation (per-image scalar gain)
+  lastGains = new Map();
+  if (settings.exposureComp) {
+    setStatus('Computing exposure gains…');
+
+    const exposurePromise = new Promise<CVExposureMsg>((resolve) => {
+      const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+        if (msg.type === 'exposure') {
+          resolve(msg as CVExposureMsg);
+        }
+      };
+      workerManager!.onCV(handler);
+    });
+
+    workerManager!.sendCV({ type: 'computeExposure' });
+
+    const exposureMsg = await exposurePromise;
+    for (const g of exposureMsg.gains) {
+      lastGains.set(g.imageId, g.gain);
+    }
+
+    const gainStr = exposureMsg.gains.map(g => `${g.gain.toFixed(3)}`).join(', ');
+    setStatus(`Exposure gains: [${gainStr}]`);
   }
 
   // Step 7: Depth inference (optional, best-effort)

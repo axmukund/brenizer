@@ -463,8 +463,103 @@ self.addEventListener('message', async (ev) => {
     }
 
     if (msg.type === 'computeExposure') {
-      const gains = Object.keys(images).map(id => ({imageId: id, gain: 1.0}));
-      postMessage({type:'exposure', gains});
+      const ids = Object.keys(images);
+      const n = ids.length;
+
+      if (n < 2 || edges.length === 0) {
+        const gains = ids.map(id => ({ imageId: id, gain: 1.0 }));
+        postMessage({ type: 'exposure', gains });
+        return;
+      }
+
+      const idToIdx = {};
+      ids.forEach((id, i) => idToIdx[id] = i);
+
+      // For each edge, compute mean log luminance ratio from inlier correspondences
+      // r_ij ≈ log(mean_lum_i) - log(mean_lum_j)  at matching keypoints
+      const edgeRatios = [];
+
+      for (const e of edges) {
+        const imgI = images[e.i];
+        const imgJ = images[e.j];
+        if (!imgI || !imgJ || !imgI.gray || !imgJ.gray) continue;
+
+        // Sample luminance at inlier keypoint positions
+        let sumLogI = 0, sumLogJ = 0, count = 0;
+        for (const inl of e.inliers) {
+          let xi, yi, xj, yj;
+          xi = inl.xi; yi = inl.yi;
+          xj = inl.xj; yj = inl.yj;
+
+          const lumI = sampleGray(imgI.gray, imgI.width, imgI.height, xi, yi);
+          const lumJ = sampleGray(imgJ.gray, imgJ.width, imgJ.height, xj, yj);
+
+          if (lumI > 5 && lumJ > 5) { // avoid very dark pixels
+            sumLogI += Math.log(lumI);
+            sumLogJ += Math.log(lumJ);
+            count++;
+          }
+        }
+
+        if (count >= 5) {
+          // r_ij = mean(log(lum_j)) - mean(log(lum_i))
+          // This means: to make them equal, g_i should compensate for this diff
+          const rij = (sumLogJ / count) - (sumLogI / count);
+          edgeRatios.push({
+            i: idToIdx[e.i],
+            j: idToIdx[e.j],
+            ratio: rij
+          });
+        }
+      }
+
+      if (edgeRatios.length === 0) {
+        const gains = ids.map(id => ({ imageId: id, gain: 1.0 }));
+        postMessage({ type: 'exposure', gains });
+        return;
+      }
+
+      // Solve least squares: for each edge, log(g_j) - log(g_i) ≈ r_ij
+      // Fix reference image gain = 1 (log(g_ref) = 0)
+      const refIdx = refId ? idToIdx[refId] : 0;
+
+      // Build normal equations: A' * A * x = A' * b
+      // where each edge gives one equation: x_j - x_i = r_ij (x = log gains)
+      // With constraint x_ref = 0
+      const AtA = new Float64Array(n * n);
+      const Atb = new Float64Array(n);
+
+      for (const er of edgeRatios) {
+        // Equation: x_j - x_i = r_ij
+        // => -x_i + x_j = r_ij
+        AtA[er.i * n + er.i] += 1;
+        AtA[er.j * n + er.j] += 1;
+        AtA[er.i * n + er.j] -= 1;
+        AtA[er.j * n + er.i] -= 1;
+        Atb[er.i] -= er.ratio; // -1 * r_ij
+        Atb[er.j] += er.ratio; // +1 * r_ij
+      }
+
+      // Fix reference: strong prior x_ref = 0
+      const lambda = 1000;
+      AtA[refIdx * n + refIdx] += lambda;
+      // Atb[refIdx] += 0 (already zero target)
+
+      // Add regularization to pull all gains toward 1
+      const regWeight = 0.01;
+      for (let i = 0; i < n; i++) {
+        AtA[i * n + i] += regWeight;
+      }
+
+      // Solve using Cholesky-like approach (simple Gaussian elimination)
+      const logGains = solveLinearN(AtA, Atb, n);
+
+      const gains = ids.map((id, i) => ({
+        imageId: id,
+        gain: logGains ? Math.exp(logGains[i]) : 1.0
+      }));
+
+      postMessage({ type: 'exposure', gains });
       return;
     }
 
@@ -894,6 +989,82 @@ function solveLinear8(A, b) {
     }
     const diag = m[i * (n + 1) + i];
     if (Math.abs(diag) < 1e-12) return null;
+    x[i] = sum / diag;
+  }
+  return x;
+}
+
+// Sample grayscale pixel value at (x, y) using bilinear interpolation
+function sampleGray(gray, w, h, x, y) {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+
+  const x0 = Math.min(Math.max(ix, 0), w - 1);
+  const x1 = Math.min(x0 + 1, w - 1);
+  const y0 = Math.min(Math.max(iy, 0), h - 1);
+  const y1 = Math.min(y0 + 1, h - 1);
+
+  const v00 = gray[y0 * w + x0];
+  const v10 = gray[y0 * w + x1];
+  const v01 = gray[y1 * w + x0];
+  const v11 = gray[y1 * w + x1];
+
+  return (1 - fx) * (1 - fy) * v00 + fx * (1 - fy) * v10 +
+         (1 - fx) * fy * v01 + fx * fy * v11;
+}
+
+/**
+ * Solve an NxN linear system Ax = b using Gaussian elimination with partial pivoting.
+ * A is NxN row-major Float64Array, b is length N Float64Array.
+ * Returns solution x or null if singular.
+ */
+function solveLinearN(A, b, n) {
+  // Copy to augmented matrix
+  const m = new Float64Array(n * (n + 1));
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      m[i * (n + 1) + j] = A[i * n + j];
+    }
+    m[i * (n + 1) + n] = b[i];
+  }
+
+  // Forward elimination with partial pivoting
+  for (let col = 0; col < n; col++) {
+    let maxVal = Math.abs(m[col * (n + 1) + col]);
+    let maxRow = col;
+    for (let row = col + 1; row < n; row++) {
+      const val = Math.abs(m[row * (n + 1) + col]);
+      if (val > maxVal) { maxVal = val; maxRow = row; }
+    }
+    if (maxVal < 1e-15) return null;
+
+    if (maxRow !== col) {
+      for (let j = 0; j <= n; j++) {
+        const tmp = m[col * (n + 1) + j];
+        m[col * (n + 1) + j] = m[maxRow * (n + 1) + j];
+        m[maxRow * (n + 1) + j] = tmp;
+      }
+    }
+
+    const pivot = m[col * (n + 1) + col];
+    for (let row = col + 1; row < n; row++) {
+      const factor = m[row * (n + 1) + col] / pivot;
+      for (let j = col; j <= n; j++) {
+        m[row * (n + 1) + j] -= factor * m[col * (n + 1) + j];
+      }
+    }
+  }
+
+  const x = new Float64Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let sum = m[i * (n + 1) + n];
+    for (let j = i + 1; j < n; j++) {
+      sum -= m[i * (n + 1) + j] * x[j];
+    }
+    const diag = m[i * (n + 1) + i];
+    if (Math.abs(diag) < 1e-15) return null;
     x[i] = sum / diag;
   }
   return x;
