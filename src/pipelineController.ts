@@ -205,8 +205,16 @@ export async function runStitchPreview(): Promise<void> {
     return;
   }
 
+  // Prevent re-entry while pipeline is already running
+  if (getState().pipelineStatus === 'running') {
+    setStatus('Pipeline already running.');
+    return;
+  }
+
   setState({ pipelineStatus: 'running' });
   setStatus('Starting pipeline…');
+
+  try {
 
   // Step 1: Init workers
   const ready = await initWorkers();
@@ -541,5 +549,7 @@ export async function runStitchPreview(): Promise<void> {
   // Dispatch event so main.ts can render warped preview
   window.dispatchEvent(new CustomEvent('transforms-ready'));
 
-  setState({ pipelineStatus: 'idle' });
+  } finally {
+    setState({ pipelineStatus: 'idle' });
+  }
 }

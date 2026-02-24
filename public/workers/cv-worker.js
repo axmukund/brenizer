@@ -872,11 +872,17 @@ function buildGlobalMesh(imageId, G, T, img) {
   };
 }
 
-// Sample depth value at (x, y) from Uint16Array depth map using nearest-neighbor
+// Sample depth value at image-space (x, y) from depth map.
+// Depth map may be at a different resolution (e.g. 256x256) than the image (w x h),
+// so coordinates are scaled accordingly.
 function sampleDepth(depthData, w, h, x, y) {
-  const ix = Math.min(Math.max(Math.round(x), 0), w - 1);
-  const iy = Math.min(Math.max(Math.round(y), 0), h - 1);
-  return depthData[iy * w + ix] / 65535.0;
+  // Infer depth map dimensions from data length (always square from model)
+  const depthSize = Math.round(Math.sqrt(depthData.length));
+  const sx = depthSize / w;
+  const sy = depthSize / h;
+  const ix = Math.min(Math.max(Math.round(x * sx), 0), depthSize - 1);
+  const iy = Math.min(Math.max(Math.round(y * sy), 0), depthSize - 1);
+  return depthData[iy * depthSize + ix] / 65535.0;
 }
 
 /**
