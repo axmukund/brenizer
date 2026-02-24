@@ -1,10 +1,9 @@
-
 BOKEH MOSAIC STITCHER — SINGLE‑PAGE, CLIENT‑ONLY (GITHUB PAGES)
 Full integrated spec (desktop-first + optional mobile support)
 
 You can hand this entire document to a coding agent. It is intended to be implementable as written.
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 0) Deliverables (what the agent must produce)
 
 A. A working single-page web app that you can host on GitHub Pages (static assets only, no server), that:
@@ -31,7 +30,7 @@ C. A clear README that includes:
 - Recommended browsers and known limitations
 - A short “How to get good Brenizer inputs” capture guide
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 1) Scope and constraints
 
 Hard constraints:
@@ -48,7 +47,7 @@ Non-goals (explicitly not required):
 - HEIC/HEIF decode support across all browsers.
 - PTGui-class robustness on extreme parallax or very large mosaics.
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 2) User experience spec (single-page)
 
 Layout:
@@ -97,7 +96,7 @@ Capture Guide tab (built into the SPA):
 - “Rotate from one spot; don’t step; lock focus/exposure”
 - Common failure causes and what to do
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 3) Runtime architecture
 
 Threads:
@@ -123,7 +122,7 @@ Key principle:
 - Alignment and inference always operate on downscaled images (alignment scale).
 - High-res export is streamed: decode one image → upload texture → warp/blend → release → next.
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 4) Desktop + mobile option (modes, mobileSafe flag, capability detection)
 
 4.1 Capabilities profiling (computed once after WebGL init)
@@ -195,9 +194,9 @@ Auto selection:
 
 4.4 Depth inference EP selection (ORT Web)
 ONNX Runtime Web docs state:
-- WebGPU EP: available out-of-box in latest Chrome/Edge on Windows/macOS/Android; not supported in Safari iOS/macOS; WebGL is “maintenance mode.” ([onnxruntime.ai](https://onnxruntime.ai/docs/get-started/with-javascript/web.html?utm_source=chatgpt.com))
+- WebGPU EP: available out-of-box in latest Chrome/Edge on Windows/macOS/Android; not supported in Safari iOS/macOS; WebGL is “maintenance mode.” (see ONNX Runtime Web docs)
 Implementation rule:
-- If you choose WebGPU EP, import `onnxruntime-web/webgpu` and create session with `executionProviders: ['webgpu']`. ([onnxruntime.ai](https://onnxruntime.ai/docs/tutorials/web/ep-webgpu.html?utm_source=chatgpt.com))
+- If you choose WebGPU EP, import `onnxruntime-web/webgpu` and create session with `executionProviders: ['webgpu']`.
 - Otherwise import `onnxruntime-web` and select EP order:
   - prefer webgl if available
   - else wasm
@@ -215,7 +214,7 @@ In Mobile Safe mode (including Auto→Mobile Safe), enforce time budgets per ste
 
 The app must still produce output (even if downgraded).
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 5) Processing pipeline (preview and export)
 
 5.1 Common preprocessing
@@ -262,9 +261,9 @@ Stages:
 - Export PNG/JPEG via canvas.toBlob.
 
 Note on max texture sizes:
-- MAX_TEXTURE_SIZE is device-dependent; common values are 8192 and 16384, but you must query at runtime. A widely-cited community answer (StackOverflow) suggests 16384 is “typical” on many systems; treat this as non-authoritative guidance only. ([stackoverflow.com](https://stackoverflow.com/questions/75051122/what-is-typical-webgl-max-texture-size-in-2023?utm_source=chatgpt.com))
+- MAX_TEXTURE_SIZE is device-dependent; common values are 8192 and 16384, but you must query at runtime. Treat these as guidance only.
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 6) Algorithms (concrete implementation guidance)
 
 6.1 Feature extraction (cv-worker, OpenCV.js)
@@ -334,8 +333,8 @@ Models:
 - Use smaller by mode.
 
 Runtime:
-- WebGPU EP when supported; docs specify importing `onnxruntime-web/webgpu` and setting `executionProviders: ['webgpu']`. ([onnxruntime.ai](https://onnxruntime.ai/docs/tutorials/web/ep-webgpu.html?utm_source=chatgpt.com))
-- Otherwise WebGL or WASM EP; docs show WebGL is maintenance mode and WebGPU is preferred when available. ([onnxruntime.ai](https://onnxruntime.ai/docs/get-started/with-javascript/web.html?utm_source=chatgpt.com))
+- WebGPU EP when supported; docs specify importing `onnxruntime-web/webgpu` and setting `executionProviders: ['webgpu']`.
+- Otherwise WebGL or WASM EP; docs show WebGL is maintenance mode and WebGPU is preferred when available.
 
 Output:
 - depth map at model resolution
@@ -403,7 +402,7 @@ After all images:
 Fallback rules:
 - If floatFBO unsupported, reduce levels; if artifacts unacceptable, fall back to feather-only blending (must be explicitly reported as “degraded”).
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 7) WebGL2 rendering and GPU resource constraints
 
 You must implement:
@@ -425,12 +424,12 @@ Shader passes (minimum set):
 Design note:
 - Keep seam costs block-grid small so readPixels is cheap and reliable on mobile.
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 8) GH Pages deployment requirements (and optional Turbo mode)
 
 8.1 Base path
 - Vite config must support GH Pages subpath deployment:
-  - base = “/REPO_NAME/” in production
+  - base = "/REPO_NAME/" in production
 
 8.2 Same-origin assets only
 - Host OpenCV, ORT, models, wasm, shaders from your GH Pages origin.
@@ -439,13 +438,266 @@ Design note:
 8.3 Optional Turbo mode (cross-origin isolation for threads)
 - SharedArrayBuffer / WASM threads require cross-origin isolation (COOP+COEP).
 - GH Pages can’t easily set those headers, so use coi-serviceworker if desired.
-- coi-serviceworker explicitly targets cases where you can’t control headers (e.g., GH pages) and must be served from your own origin as a separate file. ([github.com](https://github.com/gzuidhof/coi-serviceworker?utm_source=chatgpt.com))
+- coi-serviceworker explicitly targets cases where you can’t control headers (e.g., GH pages) and must be served from your own origin as a separate file.
 - Turbo mode must not be required for correctness—only for speed.
 
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------
 9) Repo blueprint (starter tree)
 
-... (truncated in file to keep initial scaffold readable)
+/index.html
+/vite.config.ts
+/package.json
+/tsconfig.json
+/README.md
 
+/public/
+  /opencv/
+    opencv.js
+    opencv.wasm
+  /ort/
+    (ORT web assets as required by your chosen build)
+  /models/
+    depth_256.onnx
+    depth_128.onnx
+  /wasm/
+    /maxflow/
+      maxflow.js
+      maxflow.wasm
+  /shaders/
+    warp.vert.glsl
+    warp.frag.glsl
+    cost_blocks.frag.glsl
+    blur_h.frag.glsl
+    blur_v.frag.glsl
+    downsample.frag.glsl
+    upsample.frag.glsl
+    laplacian.frag.glsl
+    blend_laplacian.frag.glsl
+    reconstruct.frag.glsl
+  /workers/
+    cv-worker.js
+    seam-worker.js
+  /sw/
+    coi-serviceworker.js
 
-[Note: Full spec truncated in this scaffold file. Request full SPEC.md if you want the entire document written into the repo.]
+/src/
+  main.ts
+  appState.ts
+  pipelineController.ts
+  ui.ts
+  capabilities.ts
+  presets.ts
+  gl/
+    glContext.ts
+    programs.ts
+    textures.ts
+    framebuffers.ts
+    mesh.ts
+    pyramid.ts
+  workers/
+    depth.worker.ts
+    workerTypes.ts
+  utils/
+    exif.ts
+    image.ts
+    math.ts
+    linalg.ts
+    timing.ts
+    download.ts
+    budget.ts
+
+--------------------------------------------------------------------------
+10) Worker message contracts (must implement as specified)
+
+10.1 depth.worker.ts (module worker)
+Messages in:
+- init { baseUrl, modelPath, preferWebGPU, targetSize, epPreference }
+- infer { imageId, rgbaBuffer, width, height }
+Messages out:
+- progress { stage, done, total }
+- result { imageId, depthUint16Buffer, depthW, depthH, nearIsOne, epUsed }
+- error { imageId?, message }
+
+10.2 cv-worker.js (classic worker)
+Messages in:
+- init { baseUrl, opencvPath }
+- addImage { imageId, grayBuffer, width, height, rgbSmallBuffer?, depth? }
+- computeFeatures { orbParams }
+- matchGraph { windowW, ratio, ransacThreshPx, minInliers, matchAllPairs }
+- buildGraph { }
+- refine { maxIters, huberDeltaPx, lambdaInit }
+- computeExposure { }
+- buildMST { }
+- computeLocalMesh { imageId, parentId, meshGrid, sigma, depthSigma, minSupport }
+Messages out:
+- progress { stage, percent, info }
+- features { imageId, keypointsBuffer, descriptorsBuffer, descCols }
+- edges { edges: [{i,j,HBuffer,inliersBuffer,rms,inlierCount}] }
+- transforms { refId, transforms: [{imageId,TBuffer}] }
+- exposure { gains: [{imageId,gain}] }
+- mst { refId, order: [imageId...], parent: {imageId: parentId|null} }
+- mesh { imageId, verticesBuffer, uvsBuffer, indicesBuffer, bounds }
+- error { message }
+
+10.3 seam-worker.js (classic worker)
+Messages in:
+- init { baseUrl, maxflowPath }
+- solve { jobId, gridW, gridH, dataCostsBuffer, edgeWeightsBuffer?, hardConstraintsBuffer, params }
+Messages out:
+- result { jobId, labelsBuffer }
+- error { jobId?, message }
+
+Note:
+- Seam solver must run on coarse grids; never send per-pixel costs.
+
+--------------------------------------------------------------------------
+11) Default settings per mode (explicit)
+
+Auto:
+- if isMobile → Mobile Safe unless capability is strong enough → Mobile Quality
+- else Desktop HQ
+
+Desktop HQ defaults:
+- alignScale 1536
+- ORB 5000
+- W 6
+- ratio 0.75
+- RANSAC 3px
+- refineIters 30
+- meshGrid 12
+- depth ON, input 256
+- seam graph cut ON, block 16
+- depth seam bias 1.0
+- feather 60px
+- multiband ON, levels auto (≤6)
+- exportScale 0.5
+
+Mobile Safe defaults:
+- alignScale 768
+- ORB 2000
+- W 3
+- refineIters 8
+- meshGrid 8
+- depth ON, input 128
+- seam graph cut ON, block 32
+- multiband ON, levels 3
+- exportScale 0.25
+
+--------------------------------------------------------------------------
+12) Work plan checklist (sequenced tasks; buildable)
+
+Phase 0 — Scaffold + GH Pages deploy
+- Create Vite+TS app, confirm base path works on GH Pages.
+- Basic UI layout, file import, thumbnails, reorder, exclude, validation.
+
+Phase 1 — WebGL2 foundation
+- GL context init, shader loader, texture/FBO helpers, simple full-screen draw.
+- Warp mesh renderer (identity mesh) and zoom/pan.
+
+Phase 2 — Depth worker
+- Integrate ORT Web with conditional importing:
+  - WebGPU path uses `onnxruntime-web/webgpu` and `executionProviders: ['webgpu']`.
+  - else webgl/wasm fallback.
+- Implement depth normalization and return Uint16.
+
+Phase 3 — OpenCV worker
+- Load OpenCV.js in classic worker.
+- ORB feature extraction for alignment grayscale.
+- Matching + ratio + findHomography(RANSAC).
+- Return edges and inlier matches.
+
+Phase 4 — Graph + initial stitch sanity
+- Build graph, pick ref, MST, initial transforms.
+- Render all warped images with global homography only (no seams) for validation.
+
+Phase 5 — Global refinement
+- Implement LM refinement and verify improved alignment.
+
+Phase 6 — Exposure compensation
+- Implement gain solve and apply in shader.
+
+Phase 7 — Mesh parallax warp
+- Implement per-vertex weighted DLT local homographies with depth gating.
+- Render mesh warps; confirm reduced parallax artifacts vs global homography.
+
+Phase 8 — Seam costs + graph cut
+- GPU compute block-grid costs; read back.
+- WASM maxflow in seam-worker; generate seam mask; feather blur.
+
+Phase 9 — Multi-band blending
+- Build pyramid pipeline, laplacian blend, reconstruct.
+- Integrate seam masks into pyramid blending.
+
+Phase 10 — Full incremental composition loop
+- Compose in MST order: warp → seam → blend
+- Preview output + overlays + debug views.
+
+Phase 11 — Export (streamed, clamped)
+- Compute bounds; apply exportScale; clamp by MAX_TEXTURE_SIZE.
+- Export PNG/JPEG; ensure one-image-at-a-time decode/upload.
+
+Phase 12 — Modes + mobile support
+- Implement capabilities.ts + presets.ts.
+- Implement Auto selection + mobileSafe flag.
+- Implement downgrade ladder and “Degraded features” reporting.
+
+Phase 13 — Capture Guide + diagnostics
+- Capture guide tab content.
+- Connectivity diagnostics: inlier matrix heatmap + disconnected component warnings.
+
+Phase 14 — Robustness and QA
+- Cancellation support.
+- Fallback paths (no floatFBO; disable multi-band; feather-only).
+- “Why failed” messages (disconnected graph, insufficient inliers, etc.).
+
+Optional Phase 15 — Turbo mode (threads)
+- Add coi-serviceworker (same-origin, separate file) per its usage notes.
+- Detect crossOriginIsolated; enable threaded ORT/OpenCV builds only when available.
+
+--------------------------------------------------------------------------
+13) Acceptance criteria (definition of done)
+
+Functional:
+- Desktop HQ: stitches 10–25 images into a preview and exports successfully.
+- Mobile Safe: stitches 6–12 images into a preview and exports at reduced scale without crashing, with clear degradations if needed.
+
+Quality:
+- Parallax mesh reduces visible double edges in at least one mild-parallax test set versus global homography-only.
+- Depth-guided seam reduces ghosting around near subject in at least one portrait Brenizer set versus depth-off seam.
+
+Stability:
+- Graph disconnected → stitches largest component and reports excluded images.
+- Refinement divergence → fallback to pre-refine transforms and reports.
+- Output too large → clamps and reports.
+
+Usability:
+- Clear progress steps and cancellable long runs.
+- Capture guide present.
+- Diagnostics panel helps users understand failure modes.
+
+--------------------------------------------------------------------------
+14) Implementation notes that prevent common failures
+
+- Do not do per-pixel graph cuts; seam must be solved on a coarse block grid.
+- Do not keep full-res ImageData for all inputs; stream export.
+- Keep all third-party assets same-origin; avoid CDNs.
+- Always query and respect MAX_TEXTURE_SIZE; do not assume 16384.
+- Treat ORT WebGPU as “nice when available” and follow ORT’s supported EP/browser matrix; WebGPU is not supported in Safari iOS per ORT’s own table.
+- When using WebGPU EP in ORT, follow the required import + session option change.
+- If you enable cross-origin isolation via coi-serviceworker, it must be a separate file served from your origin, and it will reload once on first load.
+
+--------------------------------------------------------------------------
+15) Minimal README outline (agent should write this)
+
+- What it is / what it does
+- Supported browsers:
+  - Desktop: Chrome/Edge recommended
+  - Mobile: works in Mobile Safe mode; may degrade
+- File type limitations: JPG/PNG
+- How to capture Brenizer sets (short checklist)
+- Local dev: npm install / npm run dev
+- Build: npm run build
+- Deploy to GH Pages: base path, typical GitHub Actions snippet (optional)
+- Known limitations and troubleshooting
+
+End of full spec.
