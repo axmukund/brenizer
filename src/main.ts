@@ -160,6 +160,26 @@ async function boot(): Promise<void> {
     });
   });
 
+  // Tab switching
+  document.querySelectorAll('#main-tabs .tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#main-tabs .tab-btn').forEach(b => {
+        (b as HTMLElement).style.borderBottomColor = 'transparent';
+        (b as HTMLElement).style.color = 'var(--text-dim)';
+        b.classList.remove('active');
+      });
+      (btn as HTMLElement).style.borderBottomColor = 'var(--accent)';
+      (btn as HTMLElement).style.color = 'var(--text)';
+      btn.classList.add('active');
+      document.querySelectorAll('.tab-content').forEach(t => {
+        (t as HTMLElement).style.display = 'none';
+      });
+      const tabId = (btn as HTMLElement).dataset.tab!;
+      const target = document.getElementById(`tab-${tabId}`);
+      if (target) target.style.display = 'flex';
+    });
+  });
+
   // Draw keypoint overlay after feature extraction completes
   window.addEventListener('features-ready', async () => {
     const { images } = getState();
@@ -193,6 +213,9 @@ async function boot(): Promise<void> {
 
     // Render inline match heatmap in the status area
     renderMatchHeatmap(active, edges);
+
+    // Populate diagnostics panel
+    renderDiagnostics(active, edges);
   });
 
   // Render warped multi-image preview after transforms are computed
@@ -257,6 +280,118 @@ function renderMatchHeatmap(
   }
   html += '</table></div>';
   bar.innerHTML += html;
+}
+
+/** Render connectivity diagnostics panel with heatmap canvas and summary. */
+function renderDiagnostics(
+  images: import('./appState').ImageEntry[],
+  edges: import('./pipelineController').MatchEdge[],
+): void {
+  const emptyEl = document.getElementById('diagnostics-empty');
+  const contentEl = document.getElementById('diagnostics-content');
+  if (!emptyEl || !contentEl) return;
+  emptyEl.style.display = 'none';
+  contentEl.style.display = 'block';
+
+  const n = images.length;
+  const idToIdx = new Map(images.map((img, i) => [img.id, i]));
+  const matrix: number[][] = Array.from({ length: n }, () => Array(n).fill(0));
+  let maxCount = 1;
+  for (const e of edges) {
+    const a = idToIdx.get(e.i);
+    const b = idToIdx.get(e.j);
+    if (a !== undefined && b !== undefined) {
+      matrix[a][b] = e.inlierCount;
+      matrix[b][a] = e.inlierCount;
+      if (e.inlierCount > maxCount) maxCount = e.inlierCount;
+    }
+  }
+
+  // Summary text
+  const summaryEl = document.getElementById('diag-summary')!;
+  const totalEdges = edges.length;
+  const possibleEdges = n * (n - 1) / 2;
+  const avgInliers = totalEdges > 0 ? (edges.reduce((s, e) => s + e.inlierCount, 0) / totalEdges).toFixed(1) : '0';
+  const minInliers = totalEdges > 0 ? Math.min(...edges.map(e => e.inlierCount)) : 0;
+  const maxInliers = totalEdges > 0 ? Math.max(...edges.map(e => e.inlierCount)) : 0;
+
+  // Detect connected components via union-find
+  const parent = Array.from({ length: n }, (_, i) => i);
+  function find(x: number): number { return parent[x] === x ? x : (parent[x] = find(parent[x])); }
+  for (const e of edges) {
+    const a = idToIdx.get(e.i);
+    const b = idToIdx.get(e.j);
+    if (a !== undefined && b !== undefined && e.inlierCount >= 8) {
+      parent[find(a)] = find(b);
+    }
+  }
+  const components = new Map<number, number[]>();
+  for (let i = 0; i < n; i++) {
+    const root = find(i);
+    if (!components.has(root)) components.set(root, []);
+    components.get(root)!.push(i);
+  }
+  const numComponents = components.size;
+  const isConnected = numComponents === 1;
+
+  summaryEl.innerHTML =
+    `<div>${n} images, ${totalEdges}/${possibleEdges} edges matched</div>` +
+    `<div>Inliers: min ${minInliers}, max ${maxInliers}, avg ${avgInliers}</div>` +
+    `<div>Connected components: ${numComponents} ${isConnected ? '✓ fully connected' : '⚠ disconnected!'}</div>`;
+
+  if (!isConnected) {
+    summaryEl.innerHTML += `<div style="color:var(--warn); margin-top:4px;">Warning: The match graph is disconnected. Some images may not be included in the final mosaic. Ensure sufficient overlap between all frames.</div>`;
+  }
+
+  // Heatmap canvas
+  const heatmap = document.getElementById('inlier-heatmap') as HTMLCanvasElement;
+  const cellSize = Math.max(12, Math.min(40, Math.floor(300 / n)));
+  heatmap.width = cellSize * n;
+  heatmap.height = cellSize * n;
+  const ctx = heatmap.getContext('2d')!;
+  ctx.clearRect(0, 0, heatmap.width, heatmap.height);
+
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      if (r === c) {
+        ctx.fillStyle = '#333';
+      } else {
+        const v = matrix[r][c];
+        const t = v / maxCount;
+        ctx.fillStyle = `rgb(${Math.round(255 * (1 - t))},${Math.round(255 * t)},60)`;
+      }
+      ctx.fillRect(c * cellSize, r * cellSize, cellSize - 1, cellSize - 1);
+      if (matrix[r][c] > 0 && r !== c && cellSize >= 20) {
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.max(8, cellSize * 0.4)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(matrix[r][c]), c * cellSize + cellSize / 2, r * cellSize + cellSize / 2);
+      }
+    }
+  }
+
+  // Excluded images
+  const excludedEl = document.getElementById('diag-excluded')!;
+  const { images: allImages } = getState();
+  const excludedImages = allImages.filter(i => i.excluded);
+  if (excludedImages.length > 0) {
+    excludedEl.innerHTML = excludedImages.map(i => `<div style="color:var(--warn);">⚠ ${i.name} — excluded</div>`).join('');
+  } else {
+    excludedEl.textContent = 'No images excluded.';
+  }
+
+  // If disconnected, list component membership
+  if (!isConnected) {
+    let compHtml = '<h4 style="font-size:13px; margin:12px 0 4px; color:var(--warn);">Disconnected Components</h4>';
+    let compIdx = 0;
+    for (const [, members] of components) {
+      compIdx++;
+      const names = members.map(i => images[i]?.name ?? `image-${i}`).join(', ');
+      compHtml += `<div style="font-size:12px; margin-bottom:4px;">Component ${compIdx} (${members.length}): ${names}</div>`;
+    }
+    excludedEl.innerHTML += compHtml;
+  }
 }
 
 /**

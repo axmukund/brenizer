@@ -196,12 +196,77 @@
     </div>
 
     <div id="main-panel">
-      <div id="canvas-container">
-        <canvas id="preview-canvas" width="800" height="600" style="display:none;"></canvas>
-        <div id="canvas-placeholder">
-          Upload images and click "Stitch Preview" to begin
+      <div id="main-tabs" style="display:flex; background:var(--surface); border-bottom:1px solid var(--border); flex-shrink:0;">
+        <button class="tab-btn active" data-tab="preview" style="flex:1; padding:6px 12px; font-size:12px; background:transparent; border:none; border-bottom:2px solid var(--accent); color:var(--text); cursor:pointer;">Preview</button>
+        <button class="tab-btn" data-tab="diagnostics" style="flex:1; padding:6px 12px; font-size:12px; background:transparent; border:none; border-bottom:2px solid transparent; color:var(--text-dim); cursor:pointer;">Diagnostics</button>
+        <button class="tab-btn" data-tab="guide" style="flex:1; padding:6px 12px; font-size:12px; background:transparent; border:none; border-bottom:2px solid transparent; color:var(--text-dim); cursor:pointer;">Capture Guide</button>
+      </div>
+
+      <div id="tab-preview" class="tab-content" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+        <div id="canvas-container">
+          <canvas id="preview-canvas" width="800" height="600" style="display:none;"></canvas>
+          <div id="canvas-placeholder">
+            Upload images and click "Stitch Preview" to begin
+          </div>
         </div>
       </div>
+
+      <div id="tab-diagnostics" class="tab-content" style="flex:1; display:none; overflow-y:auto; padding:16px;">
+        <h3 style="font-size:14px; margin-bottom:12px;">Connectivity &amp; Overlap Diagnostics</h3>
+        <div id="diagnostics-empty" style="color:var(--text-dim); font-size:13px;">Run Stitch Preview to see diagnostics.</div>
+        <div id="diagnostics-content" style="display:none;">
+          <h4 style="font-size:13px; margin:8px 0 4px;">Match Graph Summary</h4>
+          <div id="diag-summary" style="font-size:12px; color:var(--text-dim); margin-bottom:12px;"></div>
+          <h4 style="font-size:13px; margin:8px 0 4px;">Inlier Heatmap</h4>
+          <canvas id="inlier-heatmap" width="300" height="300" style="max-width:100%; border:1px solid var(--border); border-radius:4px; image-rendering: pixelated;"></canvas>
+          <h4 style="font-size:13px; margin:8px 0 4px;">Excluded / Dropped Images</h4>
+          <div id="diag-excluded" style="font-size:12px; color:var(--text-dim);"></div>
+        </div>
+      </div>
+
+      <div id="tab-guide" class="tab-content" style="flex:1; display:none; overflow-y:auto; padding:16px; font-size:13px; color:var(--text-dim); line-height:1.6;">
+        <h3 style="font-size:15px; color:var(--text); margin-bottom:12px;">How to Capture a Brenizer Mosaic</h3>
+
+        <h4 style="color:var(--text); margin:12px 0 4px;">What is the Brenizer Method?</h4>
+        <p>Shoot a grid of overlapping photos with a wide-aperture lens (f/1.4–f/2.8) to create a single large-format image with an impossibly shallow depth of field.</p>
+
+        <h4 style="color:var(--text); margin:12px 0 4px;">Recommended Shooting Patterns</h4>
+        <table style="border-collapse:collapse; margin:8px 0; width:100%; max-width:300px;">
+          <tr><td style="border:1px solid var(--border); padding:4px 8px;">3×3</td><td style="border:1px solid var(--border); padding:4px 8px;">9 frames — quick, easy</td></tr>
+          <tr><td style="border:1px solid var(--border); padding:4px 8px;">4×4</td><td style="border:1px solid var(--border); padding:4px 8px;">16 frames — good balance</td></tr>
+          <tr><td style="border:1px solid var(--border); padding:4px 8px;">5×5</td><td style="border:1px solid var(--border); padding:4px 8px;">25 frames — highest quality</td></tr>
+        </table>
+
+        <h4 style="color:var(--text); margin:12px 0 4px;">Shooting Checklist</h4>
+        <ul style="padding-left:20px;">
+          <li><strong>Lock focus</strong> — use manual focus or AF-lock on your subject, then don't refocus.</li>
+          <li><strong>Lock exposure</strong> — switch to manual exposure or AE-lock to keep brightness consistent.</li>
+          <li><strong>Rotate from one spot</strong> — pivot around the lens nodal point. Do not step or walk.</li>
+          <li><strong>Overlap 30–50%</strong> — each frame should share at least 30% with its neighbor.</li>
+          <li><strong>Shoot quickly</strong> — minimise time between frames to avoid subject movement.</li>
+          <li><strong>Include your subject</strong> — place the subject in one or two of the central frames.</li>
+          <li><strong>Avoid moving objects</strong> — people walking, cars, etc. cause ghosting at seams.</li>
+        </ul>
+
+        <h4 style="color:var(--text); margin:12px 0 4px;">Common Failure Causes</h4>
+        <ul style="padding-left:20px;">
+          <li><strong>Insufficient overlap</strong> — the stitcher can't find matching features between frames.</li>
+          <li><strong>Parallax from translation</strong> — stepping sideways causes misalignment, especially with near objects.</li>
+          <li><strong>Refocusing between shots</strong> — different focal planes prevent feature matching.</li>
+          <li><strong>Moving subjects</strong> — creates ghosting or doubled edges at seam boundaries.</li>
+          <li><strong>Exposure change</strong> — auto-exposure shifts cause visible bands in the mosaic.</li>
+          <li><strong>Featureless regions</strong> — plain sky or walls don't have enough detail to match.</li>
+        </ul>
+
+        <h4 style="color:var(--text); margin:12px 0 4px;">Tips for Best Results</h4>
+        <ul style="padding-left:20px;">
+          <li>Use a 50mm f/1.4 or 85mm f/1.8 for dramatic bokeh.</li>
+          <li>Start from the subject frame and spiral outward.</li>
+          <li>Shoot in portrait orientation for more vertical coverage per frame.</li>
+          <li>In low light, use a higher ISO rather than longer exposure (to avoid motion blur).</li>
+        </ul>
+      </div>
+
       <div id="settings-panel">
         <h3>Settings</h3>
         <!-- Settings will be populated by JS -->
