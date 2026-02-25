@@ -573,13 +573,33 @@ export async function runStitchPreview(): Promise<void> {
     unsub = workerManager!.onCV(handler);
   });
 
+  // ── Adaptive min-inliers threshold ─────────────────────────────
+  // For small tiles (≤ 512px), the overlap zone contains fewer features
+  // and ORB has less room for matches (especially in sky/featureless areas
+  // where CLAHE-enhanced ORB still only finds sparse corners).
+  // Scale minInliers linearly based on average alignment dimension:
+  //   256px → 4 inliers,  512px → 8,  1024+px → 15
+  // This prevents grid-layout tiles from being disconnected.
+  const avgDim = active.reduce((s, img) => {
+    const feat = lastFeatures.get(img.id);
+    const sf = feat?.scaleFactor ?? 1;
+    return s + Math.max(img.width * sf, img.height * sf);
+  }, 0) / active.length;
+  const adaptiveMinInliers = Math.max(4, Math.min(15, Math.round(avgDim / 70)));
+  console.log(`Adaptive minInliers: ${adaptiveMinInliers} (avg dimension ${avgDim.toFixed(0)}px)`);
+
+  // ── Force all-pairs matching for small image sets ──────────────
+  // With ≤ 12 images, the O(n²) matching cost is low and ensuring
+  // full connectivity (especially in grid-layout tiles) is critical.
+  const forceAllPairs = active.length <= 12 || settings.matchAllPairs;
+
   workerManager!.sendCV({
     type: 'matchGraph',
     windowW: settings.pairWindowW,
     ratio: settings.ratioTest,
     ransacThreshPx: settings.ransacThreshPx,
-    minInliers: 15,
-    matchAllPairs: settings.matchAllPairs,
+    minInliers: adaptiveMinInliers,
+    matchAllPairs: forceAllPairs,
   });
 
   let edgesMsg: CVEdgesMsg;

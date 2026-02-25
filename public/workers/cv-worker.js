@@ -119,6 +119,8 @@ self.addEventListener('message', async (ev) => {
       for (const id of ids) {
         const img = images[id];
         let mat = null;
+        let clahe = null;
+        let enhancedMat = null;
         let orb = null;
         let keypoints = null;
         let descriptors = null;
@@ -126,12 +128,31 @@ self.addEventListener('message', async (ev) => {
 
         try {
           mat = cv.matFromArray(img.height, img.width, cv.CV_8UC1, img.gray);
+
+          // ── CLAHE (Contrast Limited Adaptive Histogram Equalization) ──
+          // Apply CLAHE before ORB to improve feature detection in
+          // low-texture regions (sky, fog, snow, uniform walls).
+          // CLAHE enhances local contrast in 8×8 tile grid without
+          // amplifying noise excessively (clipLimit = 3.0).
+          // This is critical for grid-tile stitching where some tiles
+          // may contain mostly sky or other featureless areas.
+          try {
+            clahe = new cv.CLAHE(3.0, new cv.Size(8, 8));
+            enhancedMat = new cv.Mat();
+            clahe.apply(mat, enhancedMat);
+          } catch (claheErr) {
+            // If CLAHE fails (shouldn't happen, but be safe), use raw image
+            console.warn('CLAHE failed, using raw grayscale:', claheErr);
+            enhancedMat = mat.clone();
+          }
+
           orb = new cv.ORB(nFeatures);
           keypoints = new cv.KeyPointVector();
           descriptors = new cv.Mat();
           mask = new cv.Mat();
 
-          orb.detectAndCompute(mat, mask, keypoints, descriptors);
+          // Run ORB on CLAHE-enhanced image for better keypoints
+          orb.detectAndCompute(enhancedMat, mask, keypoints, descriptors);
 
           // Serialize keypoints to Float32Array [x0,y0,x1,y1,...]
           const numKp = keypoints.size();
@@ -164,6 +185,8 @@ self.addEventListener('message', async (ev) => {
 
         } finally {
           if (mat) mat.delete();
+          if (clahe) clahe.delete();
+          if (enhancedMat) enhancedMat.delete();
           if (orb) orb.delete();
           if (keypoints) keypoints.delete();
           if (descriptors) descriptors.delete();

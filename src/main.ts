@@ -642,6 +642,8 @@ async function renderWarpedPreview(
   let compositeB: import('./gl').ManagedFBO | null = null;
   let newImageTex: import('./gl').ManagedTexture | null = null;
   let newImageFBO: import('./gl').ManagedFBO | null = null;
+  /** Track how many images were actually composited (for the status message). */
+  let compositedImageCount = 0;
 
   try {
   compositeTexA = createEmptyTexture(gl, compW, compH);
@@ -981,6 +983,7 @@ async function renderWarpedPreview(
     }
 
     imgIdx++;
+    compositedImageCount = imgIdx;
     const compPct = Math.round((imgIdx / mstOrder.length) * 100);
     setStatus(`Compositing (${compPct}%) — ${imgIdx}/${mstOrder.length}`);
     updateProgress('compositing', imgIdx / mstOrder.length);
@@ -1015,7 +1018,11 @@ async function renderWarpedPreview(
   }
 
   endProgress();
-  setStatus(`Composite complete — ${images.length} images blended.`);
+  // Report the actual number of composited (connected) images — disconnected
+  // images are not included in mstOrder and are skipped during compositing
+  const skippedCount = images.length - compositedImageCount;
+  const skipNote = skippedCount > 0 ? ` (${skippedCount} disconnected, skipped)` : '';
+  setStatus(`Composite complete — ${compositedImageCount} images blended.${skipNote}`);
 
   // Enable export button
   document.getElementById('btn-export')!.removeAttribute('disabled');

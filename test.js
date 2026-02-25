@@ -147,6 +147,10 @@ async function runTest() {
 
       // Pipeline success signals
       if (status.includes('Pipeline complete') || status.includes('Composite complete')) {
+        // Check if any images were skipped (disconnected) — that's a partial failure
+        if (status.includes('disconnected')) {
+          return 'PARTIAL: ' + status;
+        }
         return 'SUCCESS: ' + status;
       }
       // Pipeline failure signals
@@ -165,7 +169,11 @@ async function runTest() {
   console.log('═══════════════════════════════════════════');
 
   await browser.close();
-  process.exit(result.startsWith('SUCCESS') ? 0 : 1);
+  const exitCode = result.startsWith('SUCCESS') ? 0 : 1;
+  if (result.startsWith('PARTIAL')) {
+    console.log('⚠  Some images were disconnected — partial success');
+  }
+  process.exit(exitCode);
 }
 
 runTest().catch(err => {
