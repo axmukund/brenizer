@@ -16,6 +16,7 @@ export {
   computeBlockCosts,
   labelsToMask,
   featherMask,
+  estimateOverlapWidth,
   createMaskTexture,
   type Compositor,
   type FaceRectComposite,

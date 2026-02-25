@@ -447,6 +447,54 @@ function computeBlockDistanceField(
 }
 
 /**
+ * Estimate the overlap width between two image regions for adaptive feathering.
+ * PTGui-style: the feather width should match the overlap zone width so the
+ * blend transition spans exactly the overlapping region.
+ * Returns the estimated overlap width in pixels, or the fallback if no overlap detected.
+ */
+export function estimateOverlapWidth(
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  width: number,
+  height: number,
+  fallback: number,
+): number {
+  // Sample rows at 1/4, 1/2, 3/4 height to estimate horizontal overlap
+  const sampleRows = [
+    Math.floor(height * 0.25),
+    Math.floor(height * 0.5),
+    Math.floor(height * 0.75),
+  ];
+  let totalOverlap = 0;
+  let samples = 0;
+
+  for (const row of sampleRows) {
+    let overlapStart = -1;
+    let overlapEnd = -1;
+    for (let x = 0; x < width; x++) {
+      const idx = (row * width + x) * 4 + 3;
+      const compHas = compositePixels[idx] > 10;
+      const newHas = newImagePixels[idx] > 10;
+      if (compHas && newHas) {
+        if (overlapStart < 0) overlapStart = x;
+        overlapEnd = x;
+      }
+    }
+    if (overlapStart >= 0 && overlapEnd > overlapStart) {
+      totalOverlap += (overlapEnd - overlapStart);
+      samples++;
+    }
+  }
+
+  if (samples > 0) {
+    const avgOverlap = totalOverlap / samples;
+    // Feather width = ~50% of overlap zone (PTGui uses similar heuristic)
+    return Math.max(4, Math.round(avgOverlap * 0.5));
+  }
+  return fallback;
+}
+
+/**
  * Convert block-grid labels to a full-resolution alpha mask.
  * label 0 = composite region (mask=0), label 1 = new image region (mask=255).
  */

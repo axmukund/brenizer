@@ -372,6 +372,114 @@ self.addEventListener('message', async (ev) => {
       return;
     }
 
+    // ── Cylindrical projection (PTGui-style) ───────────────────────────
+    // Projects image points into cylindrical coordinates for wide-FoV stitching.
+    // Used by PTGui, AutoStitch, and other professional panorama tools.
+    // x_cyl = f * atan2(x - cx, f)
+    // y_cyl = f * (y - cy) / sqrt((x - cx)² + f²)
+    // where f = estimated focal length in pixels, (cx,cy) = image centre.
+    if (msg.type === 'cylindricalProject') {
+      const ids = Object.keys(images);
+      for (const id of ids) {
+        const img = images[id];
+        const w = img.width, h = img.height;
+        // Estimate focal length from image width (assume ~50mm on 35mm sensor ≈ FoV ~40°)
+        const fov = msg.fovDegrees || 40;
+        const f = (w / 2) / Math.tan((fov * Math.PI / 180) / 2);
+        const cx = w / 2, cy = h / 2;
+
+        // Project all keypoints to cylindrical
+        if (img.keypoints && img.keypoints.length > 0) {
+          const n = img.keypoints.length / 2;
+          const cylKp = new Float32Array(n * 2);
+          for (let i = 0; i < n; i++) {
+            const x = img.keypoints[i * 2] - cx;
+            const y = img.keypoints[i * 2 + 1] - cy;
+            cylKp[i * 2] = f * Math.atan2(x, f) + cx;
+            cylKp[i * 2 + 1] = f * y / Math.sqrt(x * x + f * f) + cy;
+          }
+          img.cylindricalKeypoints = cylKp;
+        }
+
+        // Store focal length estimate
+        img.focalLength = f;
+      }
+      postMessage({type:'progress', stage:'cylindrical', percent:100, info:'done'});
+      return;
+    }
+
+    // ── Lens distortion estimation (Brown-Conrady model) ───────────────
+    // Estimates radial distortion from homography residuals.
+    // Models distortion as: r_d = r(1 + k1*r² + k2*r⁴)
+    // where r = normalised distance from principal point.
+    // Uses matched point reprojection errors after homography fitting:
+    // if systematic radial pattern exists in residuals, we can estimate k1, k2.
+    // This is the same model used by PTGui, OpenCV, and Lensfun.
+    if (msg.type === 'estimateLensDistortion') {
+      const ids = Object.keys(images);
+      for (const id of ids) {
+        const img = images[id];
+        const w = img.width, h = img.height;
+        const cx = w / 2, cy = h / 2;
+        const maxR = Math.sqrt(cx * cx + cy * cy);
+
+        // Collect reprojection residuals from all edges involving this image
+        let sumK1Num = 0, sumK1Den = 0;
+        for (const edge of edges) {
+          if (edge.i !== id && edge.j !== id) continue;
+          const H = edge.H;
+          if (!H || H.length < 9) continue;
+
+          // Use inlier correspondences
+          const inliers = edge.inliers;
+          const n = inliers.length / 4;
+          for (let k = 0; k < n; k++) {
+            const xi = inliers[k * 4], yi = inliers[k * 4 + 1];
+            const xj = inliers[k * 4 + 2], yj = inliers[k * 4 + 3];
+
+            // Determine which point belongs to this image
+            const isI = (edge.i === id);
+            const px = isI ? xi : xj, py = isI ? yi : yj;
+            const qx = isI ? xj : yj, qy = isI ? yj : xj;
+
+            // Normalised radius
+            const dx = px - cx, dy = py - cy;
+            const r = Math.sqrt(dx * dx + dy * dy) / maxR;
+            const r2 = r * r;
+
+            // Compute homography-predicted position
+            const d = H[6] * px + H[7] * py + H[8];
+            if (Math.abs(d) < 1e-10) continue;
+            const predX = (H[0] * px + H[1] * py + H[2]) / d;
+            const predY = (H[3] * px + H[4] * py + H[5]) / d;
+
+            // Radial component of residual (dot product with radial direction)
+            const resX = qx - predX, resY = qy - predY;
+            const radDir = r > 1e-6 ? [dx / (r * maxR), dy / (r * maxR)] : [0, 0];
+            const radialRes = resX * radDir[0] + resY * radDir[1];
+
+            // Least squares: k1 ≈ sum(radialRes * r²) / sum(r⁴)
+            sumK1Num += radialRes * r2;
+            sumK1Den += r2 * r2;
+          }
+        }
+
+        const k1 = sumK1Den > 1e-10 ? sumK1Num / sumK1Den : 0;
+        // Clamp to reasonable range for typical camera lenses
+        img.distortionK1 = Math.max(-0.5, Math.min(0.5, k1));
+        img.distortionK2 = 0; // Higher-order term requires more data
+
+        postMessage({
+          type: 'distortion',
+          imageId: id,
+          k1: img.distortionK1,
+          k2: img.distortionK2,
+        });
+      }
+      postMessage({type:'progress', stage:'distortion', percent:100, info:'done'});
+      return;
+    }
+
     if (msg.type === 'matchGraph') {
       const {windowW, ratio, ransacThreshPx, minInliers, matchAllPairs} = msg;
       const ids = Object.keys(images);

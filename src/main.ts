@@ -6,7 +6,8 @@ import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
   createPyramidBlender,
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
-  makeViewMatrix, computeBlockCosts, labelsToMask, featherMask, createMaskTexture,
+  makeViewMatrix, computeBlockCosts, labelsToMask, featherMask, estimateOverlapWidth,
+  createMaskTexture,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
   type PyramidBlender, type ManagedTexture, type FaceRectComposite,
 } from './gl';
