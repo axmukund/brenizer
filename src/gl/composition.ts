@@ -489,6 +489,9 @@ function computeBlockDistanceField(
  * Estimate the overlap width between two image regions for adaptive feathering.
  * PTGui-style: the feather width should match the overlap zone width so the
  * blend transition spans exactly the overlapping region.
+ *
+ * Measures overlap in both horizontal and vertical directions and returns
+ * the minimum (to match the narrowest dimension of the overlap zone).
  * Returns the estimated overlap width in pixels, or the fallback if no overlap detected.
  */
 export function estimateOverlapWidth(
@@ -498,14 +501,14 @@ export function estimateOverlapWidth(
   height: number,
   fallback: number,
 ): number {
-  // Sample rows at 1/4, 1/2, 3/4 height to estimate horizontal overlap
+  // ── Horizontal overlap: sample rows at 1/4, 1/2, 3/4 height ──
   const sampleRows = [
     Math.floor(height * 0.25),
     Math.floor(height * 0.5),
     Math.floor(height * 0.75),
   ];
-  let totalOverlap = 0;
-  let samples = 0;
+  let totalHOverlap = 0;
+  let hSamples = 0;
 
   for (const row of sampleRows) {
     let overlapStart = -1;
@@ -520,13 +523,45 @@ export function estimateOverlapWidth(
       }
     }
     if (overlapStart >= 0 && overlapEnd > overlapStart) {
-      totalOverlap += (overlapEnd - overlapStart);
-      samples++;
+      totalHOverlap += (overlapEnd - overlapStart);
+      hSamples++;
     }
   }
 
-  if (samples > 0) {
-    const avgOverlap = totalOverlap / samples;
+  // ── Vertical overlap: sample columns at 1/4, 1/2, 3/4 width ──
+  const sampleCols = [
+    Math.floor(width * 0.25),
+    Math.floor(width * 0.5),
+    Math.floor(width * 0.75),
+  ];
+  let totalVOverlap = 0;
+  let vSamples = 0;
+
+  for (const col of sampleCols) {
+    let overlapStart = -1;
+    let overlapEnd = -1;
+    for (let y = 0; y < height; y++) {
+      const idx = (y * width + col) * 4 + 3;
+      const compHas = compositePixels[idx] > 10;
+      const newHas = newImagePixels[idx] > 10;
+      if (compHas && newHas) {
+        if (overlapStart < 0) overlapStart = y;
+        overlapEnd = y;
+      }
+    }
+    if (overlapStart >= 0 && overlapEnd > overlapStart) {
+      totalVOverlap += (overlapEnd - overlapStart);
+      vSamples++;
+    }
+  }
+
+  // Use the smaller of horizontal and vertical overlap — the feather should
+  // match the narrower dimension of the overlap zone to avoid excessive blurring
+  const avgH = hSamples > 0 ? totalHOverlap / hSamples : Infinity;
+  const avgV = vSamples > 0 ? totalVOverlap / vSamples : Infinity;
+  const avgOverlap = Math.min(avgH, avgV);
+
+  if (isFinite(avgOverlap) && avgOverlap > 0) {
     // Feather width = ~50% of overlap zone (PTGui uses similar heuristic)
     return Math.max(4, Math.round(avgOverlap * 0.5));
   }

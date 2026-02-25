@@ -1,3 +1,25 @@
+/**
+ * main.ts — Application entry point and rendering pipeline.
+ *
+ * Responsibilities:
+ *  - WebGL2 context initialization (canvas, shaders, compositors)
+ *  - Image preview rendering (single image + keypoint overlay)
+ *  - Warped multi-image compositing (APAP mesh warp → seam find → blend)
+ *  - Full-resolution export with auto-crop
+ *  - UI event wiring (stitch button, export, tabs, drag-drop)
+ *
+ * Compositing pipeline (per image in MST order):
+ *  1. Decode image → resize to alignment scale → upload as GPU texture
+ *  2. Warp through APAP mesh (or global homography) into composite space
+ *  3. Read back composite + warped pixels for CPU-side seam cost computation
+ *  4. Solve graph-cut min-cut via seam-worker (or feather-only fallback)
+ *  5. Convert block labels → pixel mask → feather → upload mask texture
+ *  6. Blend into composite via Laplacian pyramid (or simple mask blend)
+ *  7. Ping-pong between two FBOs to avoid read-write hazard
+ *
+ * The same pipeline is used for both preview and export, with export using
+ * a separate exportScale (or full-resolution when maxResExport is enabled).
+ */
 import { detectCapabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
@@ -31,8 +53,16 @@ function safeGainVal(v: number): number {
 
 /**
  * Project a per-image saliency map into composite pixel coordinates.
- * For each composite pixel, inverse-warp through T to image-space and sample.
- * Returns null if no saliency data is available.
+ *
+ * For each composite pixel, inverse-warp through T⁻¹ to image-space and
+ * sample the saliency value. Uses sparse 4×4 sampling with block fill for
+ * performance (saliency is inherently low-frequency, so nearest-neighbor
+ * at 1/4 resolution is sufficient).
+ *
+ * The projected saliency map is used by computeBlockCosts() to penalise
+ * seam placement through high-saliency regions (objects, faces, texture).
+ *
+ * Returns null if no saliency data is available for the given image.
  */
 function projectSaliencyToComposite(
   imgId: string,
@@ -419,13 +449,20 @@ function renderDiagnostics(
   const minInliers = totalEdges > 0 ? Math.min(...edges.map(e => e.inlierCount)) : 0;
   const maxInliers = totalEdges > 0 ? Math.max(...edges.map(e => e.inlierCount)) : 0;
 
-  // Detect connected components via union-find
+  // Detect connected components via union-find.
+  // Use adaptive threshold consistent with the pipeline's minInliers
+  // (based on average alignment dimension), not a hardcoded value.
+  // This ensures diagnostics match the actual connectivity used for stitching.
+  const avgImgDim = images.length > 0
+    ? images.reduce((s, img) => s + Math.max(img.width, img.height), 0) / images.length
+    : 1024;
+  const connectivityThreshold = Math.max(4, Math.min(15, Math.round(avgImgDim / 70)));
   const parent = Array.from({ length: n }, (_, i) => i);
   function find(x: number): number { return parent[x] === x ? x : (parent[x] = find(parent[x])); }
   for (const e of edges) {
     const a = idToIdx.get(e.i);
     const b = idToIdx.get(e.j);
-    if (a !== undefined && b !== undefined && e.inlierCount >= 8) {
+    if (a !== undefined && b !== undefined && e.inlierCount >= connectivityThreshold) {
       parent[find(a)] = find(b);
     }
   }

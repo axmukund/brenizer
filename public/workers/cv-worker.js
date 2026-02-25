@@ -1,6 +1,21 @@
-// cv-worker.js - classic worker using OpenCV.js
-// Loads opencv.js via importScripts and exposes message handlers per spec.
-// Messages accepted:
+/**
+ * cv-worker.js — Core computer vision worker using OpenCV.js
+ *
+ * Runs in a Web Worker context. Loads OpenCV.js via importScripts and
+ * exposes message handlers for each pipeline stage. All OpenCV Mat objects
+ * are carefully managed with try/finally to prevent WASM memory leaks.
+ *
+ * Pipeline stages implemented:
+ *  - Feature extraction: ORB with CLAHE preprocessing for low-texture regions
+ *  - Saliency: gradient magnitude (Sobel) + colour distinctness (Achanta) + focus (Laplacian)
+ *  - Vignetting: radial polynomial V(r) = 1 + ar² + br⁴ estimated from luminance falloff
+ *  - Matching: cross-checked kNN with MAGSAC++ σ-consensus scoring
+ *  - MST: maximum spanning tree with BFS transform propagation + perspective validation
+ *  - Refinement: Levenberg-Marquardt bundle adjustment with Huber loss
+ *  - Exposure: per-channel RGB gain compensation (L2 + Huber options)
+ *  - APAP mesh: Tikhonov-regularized weighted DLT with depth/face weighting
+ *
+ * Messages accepted:
 //  - {type:'init', baseUrl, opencvPath}
 //  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?}
 //  - {type:'computeFeatures', orbParams}
@@ -303,21 +318,17 @@ self.addEventListener('message', async (ev) => {
         }
         img.blurScore = focusCount > 0 ? focusSum / focusCount : 0;
 
+        // Transfer a *copy* of the saliency buffer to main thread —
+        // the original stays on the image for later seam-placement use.
+        const saliencyCopy = new Float32Array(saliency);
         postMessage({
           type: 'saliency',
           imageId: id,
-          saliencyBuffer: saliency.buffer,
+          saliencyBuffer: saliencyCopy.buffer,
           width: w,
           height: h,
           blurScore: img.blurScore,
-        }, [saliency.buffer]);
-
-        // Re-create saliency since we transferred the buffer
-        img.saliency = new Float32Array(w * h);
-        // Recompute (fast since data is still in gradMag/colDist/focusMap)
-        for (let i = 0; i < w * h; i++) {
-          img.saliency[i] = 0.4 * gradMag[i] + 0.3 * colDist[i] + 0.3 * focusMap[i];
-        }
+        }, [saliencyCopy.buffer]);
 
         done++;
         postMessage({type:'progress', stage:'saliency', percent: Math.round(100 * done / ids.length), info: `${done}/${ids.length}`});
@@ -1557,6 +1568,26 @@ self.addEventListener('message', async (ev) => {
 
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
+      // Maximum reasonable global coordinate: images shouldn't project
+      // far beyond a few image-widths from the origin.
+      // Defined once outside the vertex loop for efficiency.
+      const maxGlobalExtent = Math.max(w, h) * 5;
+
+      // Maximum acceptable deviation of local APAP warp from global transform
+      const maxDeviation = Math.max(w, h) * 0.5;
+
+      // Helper: project vertex through a homography with safety checks.
+      // Returns [gx, gy] or null if behind camera or out of range.
+      function projectVertex(H, px, py) {
+        const denom = H[6] * px + H[7] * py + H[8];
+        if (denom < 1e-4) return null; // behind camera or near-singular
+        const gx = (H[0] * px + H[1] * py + H[2]) / denom;
+        const gy = (H[3] * px + H[4] * py + H[5]) / denom;
+        // Reject if projected too far (strong perspective artifact)
+        if (Math.abs(gx) > maxGlobalExtent || Math.abs(gy) > maxGlobalExtent) return null;
+        return [gx, gy];
+      }
+
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const u = c / G;
@@ -1610,21 +1641,6 @@ self.addEventListener('message', async (ev) => {
           const effectiveSupport = totalWeight;
           let gx, gy;
 
-          // Maximum reasonable global coordinate: images shouldn't project
-          // far beyond a few image-widths from the origin
-          const maxGlobalExtent = Math.max(w, h) * 5;
-
-          // Helper: project vertex through a homography with safety checks
-          function projectVertex(H, px, py) {
-            const denom = H[6] * px + H[7] * py + H[8];
-            if (denom < 1e-4) return null; // behind camera or near-singular
-            const gx = (H[0] * px + H[1] * py + H[2]) / denom;
-            const gy = (H[3] * px + H[4] * py + H[5]) / denom;
-            // Reject if projected too far (strong perspective artifact)
-            if (Math.abs(gx) > maxGlobalExtent || Math.abs(gy) > maxGlobalExtent) return null;
-            return [gx, gy];
-          }
-
           // Compute global transform prediction as a reference for sanity checking
           const globalPt = projectVertex(Ti, vx, vy);
           // If perspective projection fails (vertex behind camera), use affine approx
@@ -1637,9 +1653,6 @@ self.addEventListener('message', async (ev) => {
             globalGx = affinePt[0];
             globalGy = affinePt[1];
           }
-
-          // Maximum acceptable deviation from global transform (in pixels)
-          const maxDeviation = Math.max(w, h) * 0.5;
 
           if (effectiveSupport < minSupport || srcPts.length < 4) {
             // Fallback to global transform

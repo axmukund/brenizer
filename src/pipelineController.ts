@@ -1,6 +1,22 @@
 /**
  * Pipeline controller — orchestrates the image stitching pipeline.
- * Manages worker lifecycle, runs pipeline stages in order.
+ *
+ * Manages the CV worker lifecycle and runs pipeline stages in sequence:
+ *  1. Image decoding & grayscale conversion
+ *  2. ORB feature extraction (with CLAHE preprocessing)
+ *  3. AI saliency map computation (gradient + colour + focus)
+ *  4. Vignetting polynomial estimation (PTGui-style)
+ *  5. Face detection (Chrome Shape Detection API)
+ *  6. Pairwise matching (cross-checked kNN + MAGSAC++ RANSAC)
+ *  7. MST construction & global transform propagation
+ *  8. Levenberg-Marquardt bundle adjustment
+ *  9. Per-channel RGB exposure compensation
+ * 10. Depth inference (optional, via ONNX worker)
+ * 11. APAP local mesh computation (Tikhonov-regularized weighted DLT)
+ *
+ * Each stage posts progress updates to the UI for real-time feedback.
+ * The pipeline supports adaptive parameters (e.g. minInliers scales with
+ * image size) to handle both full-frame photos and small grid tiles.
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';

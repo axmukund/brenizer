@@ -1,6 +1,22 @@
-// seam-worker.js - classic worker that solves graph-cut on a coarse block grid.
-// Pure JS Boykov-Kolmogorov style maxflow/mincut solver (no WASM dependency).
-// Messages in:
+/**
+ * seam-worker.js — Graph-cut seam solver running in a Web Worker.
+ *
+ * Solves binary min-cut on a coarse block grid using the Edmonds-Karp
+ * maximum flow algorithm (BFS for shortest augmenting paths). Pure JS
+ * implementation with no WASM dependency — works everywhere WebGL2 does.
+ *
+ * The grid graph represents a downsampled version of the overlap region
+ * between the composite and a new image. Each node is a block of pixels;
+ * the solver assigns each node to either "keep composite" (label 0) or
+ * "take new image" (label 1) to minimise the total cut cost.
+ *
+ * Cost model (from composition.ts):
+ *  - Data costs: distance-from-boundary + colour difference + saliency penalty
+ *  - Edge weights: gradient-domain agreement + Brenizer blur discount
+ *  - Hard constraints: blocks with only one source are clamped
+ *  - Face penalty: keeps seams away from detected faces
+ *
+ * Messages in:
 //  - {type:'init', baseUrl, maxflowPath}
 //  - {type:'solve', jobId, gridW, gridH, dataCostsBuffer, edgeWeightsBuffer, hardConstraintsBuffer, params}
 // Messages out:
