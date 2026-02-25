@@ -230,13 +230,16 @@ async function boot(): Promise<void> {
   document.getElementById('btn-export-fullres')!.addEventListener('click', () => {
     const { settings } = getState();
     if (!settings) return;
-    // Clone to avoid mutating shared state during async export
+    // Only override maxResExport for this export; restore afterwards
+    const prevMaxRes = settings.maxResExport;
     setState({ settings: { ...settings, maxResExport: true } });
     exportComposite().catch(err => {
       console.error('Export error:', err);
       setStatus(`Export error: ${err.message}`);
     }).finally(() => {
-      setState({ settings: { ...settings } }); // restore original
+      // Restore only maxResExport to avoid clobbering user changes during export
+      const cur = getState().settings;
+      if (cur) setState({ settings: { ...cur, maxResExport: prevMaxRes } });
     });
   });
 
@@ -308,9 +311,19 @@ async function boot(): Promise<void> {
     const { images } = getState();
     const active = images.filter(i => !i.excluded);
     const transforms = getLastTransforms();
-    if (active.length === 0 || !glCtx || !warpRenderer || transforms.size === 0) return;
+    if (active.length === 0 || !glCtx || !warpRenderer || transforms.size === 0) {
+      setState({ pipelineStatus: 'idle' });
+      return;
+    }
 
-    await renderWarpedPreview(active, transforms);
+    try {
+      await renderWarpedPreview(active, transforms);
+    } finally {
+      // Mark pipeline idle now that compositing is done
+      if (getState().pipelineStatus === 'running') {
+        setState({ pipelineStatus: 'idle' });
+      }
+    }
   });
 }
 
@@ -884,7 +897,9 @@ async function renderWarpedPreview(
         for (const f of curFaces) seamFaces.push({ ...f, imageLabel: 1 });
       }
       const costs = computeBlockCosts(compPixels, newPixels, compW, compH, blockSize, 0, seamFaces,
-        projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, compW, compH, saliencyMaps));
+        settings?.blurAwareStitching
+          ? projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, compW, compH, saliencyMaps)
+          : null);
 
       // Send to seam worker
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
@@ -1357,7 +1372,9 @@ async function exportComposite(): Promise<void> {
         for (const f of curFacesExport) seamFacesExport.push({ ...f, imageLabel: 1 });
       }
       const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize, 0, seamFacesExport,
-        projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, outW, outH, exportSaliencyMaps));
+        settings?.blurAwareStitching
+          ? projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, outW, outH, exportSaliencyMaps)
+          : null);
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
       const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;

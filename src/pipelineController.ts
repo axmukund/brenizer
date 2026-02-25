@@ -907,9 +907,9 @@ export async function runStitchPreview(): Promise<void> {
     setState({ pipelineStatus: 'error' });
     endProgress();
   } finally {
-    // Only reset to idle if still running (don't override 'error' state)
-    if (getState().pipelineStatus === 'running') {
-      setState({ pipelineStatus: 'idle' });
-    }
+    // pipelineStatus is set to 'idle' by the transforms-ready handler
+    // in main.ts after compositing completes, avoiding the race where
+    // the pipeline is marked idle before renderWarpedPreview finishes.
+    // If status is 'error', leave it as-is for user visibility.
   }
 }

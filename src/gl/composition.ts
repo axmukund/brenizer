@@ -130,7 +130,7 @@ export function computeBlockCosts(
   compW: number,
   compH: number,
   blockSize: number,
-  depthBias: number = 0,
+  _depthBias: number = 0, // reserved for future depth-aware seam placement
   faceRects: FaceRectComposite[] = [],
   /** Optional saliency map (Float32 0–1) at composite resolution. */
   saliencyMap?: Float32Array | null,
