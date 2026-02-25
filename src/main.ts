@@ -430,6 +430,8 @@ async function renderWarpedPreview(
   const features = getLastFeatures();
   const gains = getLastGains();
   const meshes = getLastMeshes();
+  const vignettes = getLastVignette();
+  const saliencyMaps = getLastSaliency();
   const { settings } = getState();
   const refId = getLastRefId();
   const wm = getWorkerManager();
@@ -759,7 +761,13 @@ async function renderWarpedPreview(
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.disable(gl.BLEND);
-    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0);
+    // Pass vignetting correction coefficients and HDR tone mapping flag
+    const vigParams = vignettes.get(imgId);
+    const vigA = vigParams?.a ?? 0;
+    const vigB = vigParams?.b ?? 0;
+    // Enable Reinhard tone mapping when gain exceeds 2× to handle extreme exposure
+    const needsToneMap = gain.some((g: number) => g > 2.0 || g < 0.5);
+    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, vigA, vigB, needsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 
@@ -1201,7 +1209,12 @@ async function exportComposite(): Promise<void> {
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.disable(gl.BLEND);
-    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0);
+    // Vignetting correction + HDR tone mapping for export
+    const expVigParams = getLastVignette().get(imgId);
+    const expVigA = expVigParams?.a ?? 0;
+    const expVigB = expVigParams?.b ?? 0;
+    const expNeedsToneMap = gain.some((g: number) => g > 2.0 || g < 0.5);
+    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, expVigA, expVigB, expNeedsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 

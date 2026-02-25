@@ -27,10 +27,38 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec3 u_gainRGB;  // per-channel RGB exposure gain
 uniform float u_alpha;
+// Vignetting correction: V(r) = 1 + a*r² + b*r⁴ (PTGui polynomial model)
+uniform float u_vigA;     // vignette coefficient a
+uniform float u_vigB;     // vignette coefficient b
+// HDR tone mapping for extreme exposure handling
+uniform float u_toneMap;  // 0 = off, 1 = Reinhard tone mapping
 out vec4 fragColor;
 void main() {
   vec4 c = texture(u_texture, v_uv);
+
+  // ── Vignetting correction ──────────────────────
+  // Undo radial darkening: divide by V(r) where r = distance from center.
+  // V(r) = 1 + a*r² + b*r⁴ estimated per-image (PTGui polynomial model).
+  vec2 centered = v_uv - 0.5;
+  float r2 = dot(centered, centered) * 4.0; // normalised r² ∈ [0, ~1]
+  float r4 = r2 * r2;
+  float vignette = 1.0 + u_vigA * r2 + u_vigB * r4;
+  // Prevent division by near-zero
+  vignette = max(vignette, 0.1);
+  c.rgb /= vignette;
+
+  // ── Per-channel exposure gain ──────────────────
   c.rgb *= u_gainRGB;
+
+  // ── HDR tone mapping (extended Reinhard) ───────
+  // Handles extreme exposure by compressing highlights while preserving
+  // shadow detail. Uses Reinhard global operator: L_d = L(1 + L/L²_white) / (1 + L)
+  // where L_white is the maximum displayable luminance.
+  if (u_toneMap > 0.5) {
+    float Lwhite2 = 4.0; // white point squared
+    c.rgb = c.rgb * (1.0 + c.rgb / Lwhite2) / (1.0 + c.rgb);
+  }
+
   c.a *= u_alpha;
   fragColor = c;
 }
@@ -103,6 +131,9 @@ export interface WarpRenderer {
    * @param gain Exposure gain — scalar (applied uniformly to RGB) or
    *             [R, G, B] tuple for per-channel correction. Defaults to 1.0.
    * @param alpha Opacity [0-1] for blending. Defaults to 1.0.
+   * @param vigA Vignetting coefficient a (polynomial radial model). Default 0.
+   * @param vigB Vignetting coefficient b (polynomial radial model). Default 0.
+   * @param toneMap Enable Reinhard HDR tone mapping for extreme exposure. Default false.
    */
   drawMesh(
     texture: WebGLTexture,
@@ -110,6 +141,9 @@ export interface WarpRenderer {
     viewMatrix: Float32Array, // 3x3 col-major
     gain?: number | [number, number, number],  // scalar or per-channel [R,G,B]
     alpha?: number,
+    vigA?: number,
+    vigB?: number,
+    toneMap?: boolean,
   ): void;
   dispose(): void;
 }
@@ -218,6 +252,9 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
     uTex: gl.getUniformLocation(warpProg, 'u_texture'),
     uGainRGB: gl.getUniformLocation(warpProg, 'u_gainRGB'),
     uAlpha: gl.getUniformLocation(warpProg, 'u_alpha'),
+    uVigA: gl.getUniformLocation(warpProg, 'u_vigA'),
+    uVigB: gl.getUniformLocation(warpProg, 'u_vigB'),
+    uToneMap: gl.getUniformLocation(warpProg, 'u_toneMap'),
   };
 
   // Fullscreen program locations
@@ -258,7 +295,7 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
       gl.bindVertexArray(null);
     },
 
-    drawMesh(texture, mesh, viewMatrix, gain: number | [number, number, number] = 1.0, alpha = 1.0) {
+    drawMesh(texture, mesh, viewMatrix, gain: number | [number, number, number] = 1.0, alpha = 1.0, vigA = 0, vigB = 0, toneMap = false) {
       gl.useProgram(warpProg);
 
       // Upload mesh data
@@ -290,6 +327,11 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
       }
 
       gl.uniform1f(wLoc.uAlpha, alpha);
+      // Vignetting correction coefficients (PTGui polynomial radial model)
+      gl.uniform1f(wLoc.uVigA, vigA);
+      gl.uniform1f(wLoc.uVigB, vigB);
+      // HDR tone mapping (Reinhard) for extreme exposure handling
+      gl.uniform1f(wLoc.uToneMap, toneMap ? 1.0 : 0.0);
 
       gl.drawElements(gl.TRIANGLES, mesh.indices.length, gl.UNSIGNED_INT, 0);
       gl.bindVertexArray(null);
