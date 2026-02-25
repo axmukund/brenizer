@@ -167,6 +167,20 @@ async function boot(): Promise<void> {
     });
   });
 
+  // Wire Full-Res Export button — temporarily enables maxResExport, then restores
+  document.getElementById('btn-export-fullres')!.addEventListener('click', () => {
+    const { settings } = getState();
+    if (!settings) return;
+    const prev = settings.maxResExport;
+    settings.maxResExport = true;
+    exportComposite().catch(err => {
+      console.error('Export error:', err);
+      setStatus(`Export error: ${err.message}`);
+    }).finally(() => {
+      settings.maxResExport = prev;
+    });
+  });
+
   // Wire Settings toggle
   document.getElementById('btn-settings')?.addEventListener('click', () => {
     document.getElementById('settings-panel')?.classList.toggle('open');
@@ -927,6 +941,7 @@ async function renderWarpedPreview(
 
   // Enable export button
   document.getElementById('btn-export')!.removeAttribute('disabled');
+  document.getElementById('btn-export-fullres')!.removeAttribute('disabled');
 }
 
 /**
@@ -950,10 +965,25 @@ async function exportComposite(): Promise<void> {
   }
 
   setStatus('Exporting…');
-  const exportScale = settings.exportScale;
   const exportFormat = settings.exportFormat;
   const jpegQuality = settings.exportJpegQuality;
   const mstParent = getLastMstParent();
+
+  // Max resolution export: compute effective export scale as 1/alignment-scale
+  // so each source pixel maps to ~1 output pixel (no downscale).
+  // For normal export, use the preset's exportScale.
+  let exportScale: number;
+  if (settings.maxResExport) {
+    // Find the alignment scale factor used during feature extraction.
+    // The alignment dimensions are alignScale (e.g. 1536) long-edge pixels.
+    // So sf = alignScale / max(origW, origH). Export at full res = 1/sf.
+    const refImg = active.find(i => i.id === refId) ?? active[0];
+    const refFeat = features.get(refImg.id);
+    const sf = refFeat?.scaleFactor ?? 1;
+    exportScale = 1 / sf;  // e.g. if sf=0.5, exportScale=2.0 → double alignment space
+  } else {
+    exportScale = settings.exportScale;
+  }
 
   // Determine connected images (reachable from reference in MST)
   const connectedIds = new Set<string>();
@@ -1031,7 +1061,9 @@ async function exportComposite(): Promise<void> {
     const clampScale = maxTexSize / Math.max(outW, outH);
     outW = Math.round(outW * clampScale);
     outH = Math.round(outH * clampScale);
-    setStatus(`Export clamped to ${outW}×${outH} (GPU max ${maxTexSize})`);
+    setStatus(`Export clamped to ${outW}×${outH} (GPU max ${maxTexSize}px)`);
+  } else if (settings.maxResExport) {
+    setStatus(`Exporting at full resolution: ${outW}×${outH}…`);
   }
   const compositeScale = outW / globalW;
 
@@ -1194,14 +1226,23 @@ async function exportComposite(): Promise<void> {
       mesh = baseMesh;
     }
 
-    // Decode image at alignment scale
+    // Decode image — full original resolution for maxRes, alignment scale otherwise
     const bmp = await createImageBitmap(img.file);
-    const off = new OffscreenCanvas(alignW, alignH);
+    let texW: number, texH: number;
+    if (settings.maxResExport) {
+      // Full resolution: use original image dimensions (no downscale)
+      texW = bmp.width;
+      texH = bmp.height;
+    } else {
+      texW = alignW;
+      texH = alignH;
+    }
+    const off = new OffscreenCanvas(texW, texH);
     const ctx2d = off.getContext('2d')!;
-    ctx2d.drawImage(bmp, 0, 0, alignW, alignH);
+    ctx2d.drawImage(bmp, 0, 0, texW, texH);
     bmp.close();
     const resizedBmp = await createImageBitmap(off);
-    const imgTex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
+    const imgTex = createTextureFromImage(gl, resizedBmp, texW, texH);
     resizedBmp.close();
 
     // Warp to newImageFBO
