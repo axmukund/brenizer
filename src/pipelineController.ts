@@ -4,7 +4,7 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg } from './workers/workerTypes';
+import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg, CVSaliencyMsg, CVVignettingMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus, startProgress, endProgress, updateProgress } from './ui';
@@ -115,6 +115,32 @@ let lastGains: Map<string, ExposureGain> = new Map();
 
 export function getLastGains(): Map<string, ExposureGain> {
   return lastGains;
+}
+
+/** Per-image saliency maps at alignment scale. */
+export interface SaliencyData {
+  imageId: string;
+  saliency: Float32Array;
+  width: number;
+  height: number;
+  blurScore: number;
+}
+let lastSaliency: Map<string, SaliencyData> = new Map();
+
+export function getLastSaliency(): Map<string, SaliencyData> {
+  return lastSaliency;
+}
+
+/** Per-image vignetting polynomial coefficients. */
+export interface VignetteParams {
+  imageId: string;
+  a: number;
+  b: number;
+}
+let lastVignette: Map<string, VignetteParams> = new Map();
+
+export function getLastVignette(): Map<string, VignetteParams> {
+  return lastVignette;
 }
 
 /** Per-image seam masks (Uint8 alpha mask at alignment scale). */
@@ -291,6 +317,8 @@ export async function runStitchPreview(): Promise<void> {
     { name: 'init', weight: 5 },
     { name: 'sendImages', weight: 2 },
     { name: 'features', weight: 15 },
+    { name: 'saliency', weight: 5 },
+    { name: 'vignetting', weight: 3 },
     { name: 'faces', weight: 3 },
     { name: 'matching', weight: 25 },
     { name: 'mst', weight: 2 },
@@ -432,6 +460,97 @@ export async function runStitchPreview(): Promise<void> {
 
   // Dispatch custom event so main.ts can draw keypoint overlay
   window.dispatchEvent(new CustomEvent('features-ready'));
+
+  // Step 3a: Saliency computation (AI object/texture/blur detection)
+  lastSaliency = new Map();
+  if (settings.saliencyEnabled) {
+    setStatus('Computing saliency maps…');
+    updateProgress('saliency', 0);
+
+    const saliencyPromises = new Map<string, Promise<CVSaliencyMsg>>();
+    for (const img of active) {
+      saliencyPromises.set(
+        img.id,
+        new Promise<CVSaliencyMsg>((resolve, reject) => {
+          let unsub: (() => void) | null = null;
+          const timer = setTimeout(() => {
+            if (unsub) unsub();
+            reject(new Error(`Timeout waiting for saliency of ${img.name}`));
+          }, 60000);
+          const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+            if (msg.type === 'saliency' && (msg as CVSaliencyMsg).imageId === img.id) {
+              clearTimeout(timer);
+              if (unsub) unsub();
+              resolve(msg as CVSaliencyMsg);
+            } else if (msg.type === 'error') {
+              clearTimeout(timer);
+              if (unsub) unsub();
+              reject(new Error((msg as any).message || 'Saliency computation failed'));
+            }
+          };
+          unsub = workerManager!.onCV(handler);
+        }),
+      );
+    }
+
+    workerManager!.sendCV({ type: 'computeSaliency' });
+
+    let salIdx = 0;
+    for (const img of active) {
+      try {
+        const salMsg = await saliencyPromises.get(img.id)!;
+        lastSaliency.set(img.id, {
+          imageId: img.id,
+          saliency: new Float32Array(salMsg.saliencyBuffer),
+          width: salMsg.width,
+          height: salMsg.height,
+          blurScore: salMsg.blurScore,
+        });
+      } catch {
+        // Non-fatal: continue without saliency for this image
+      }
+      salIdx++;
+      updateProgress('saliency', salIdx / active.length);
+    }
+    setStatus(`Saliency maps computed for ${lastSaliency.size}/${active.length} images.`);
+  }
+  updateProgress('saliency', 1);
+
+  // Step 3b-pre: Vignetting estimation (PTGui-style polynomial radial model)
+  lastVignette = new Map();
+  if (settings.vignetteCorrection) {
+    setStatus('Estimating vignetting…');
+    updateProgress('vignetting', 0);
+
+    const vignettePromises: Promise<void>[] = [];
+    const vignetteUnsub = workerManager!.onCV((msg) => {
+      if (msg.type === 'vignetting') {
+        const vmsg = msg as CVVignettingMsg;
+        lastVignette.set(vmsg.imageId, {
+          imageId: vmsg.imageId,
+          a: vmsg.vignetteParams.a,
+          b: vmsg.vignetteParams.b,
+        });
+      }
+    });
+
+    workerManager!.sendCV({ type: 'computeVignetting' });
+
+    // Wait for vignetting progress complete
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(), 30000);
+      const unsub = workerManager!.onCV((msg) => {
+        if (msg.type === 'progress' && msg.stage === 'vignetting' && msg.percent >= 100) {
+          clearTimeout(timer);
+          unsub();
+          resolve();
+        }
+      });
+    });
+    vignetteUnsub();
+    setStatus(`Vignetting estimated for ${lastVignette.size} images.`);
+  }
+  updateProgress('vignetting', 1);
 
   // Step 3b: Face detection (browser Shape Detection API)
   lastFaces = new Map();

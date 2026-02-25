@@ -132,6 +132,8 @@ export function computeBlockCosts(
   blockSize: number,
   depthBias: number = 0,
   faceRects: FaceRectComposite[] = [],
+  /** Optional saliency map (Float32 0–1) at composite resolution. */
+  saliencyMap?: Float32Array | null,
 ): {
   gridW: number;
   gridH: number;
@@ -234,7 +236,37 @@ export function computeBlockCosts(
 
         dataCosts[nodeIdx * 2]     = distWeight * (1.0 - cD) + colWeight * colorDiff;
         dataCosts[nodeIdx * 2 + 1] = distWeight * (1.0 - nD) + colWeight * colorDiff;
-
+        // ── Saliency-aware penalty ─────────────────────────────
+        // If a saliency map is provided, penalise seam cuts through highly
+        // salient regions (objects, people, detailed areas). This uses
+        // AI-computed saliency maps that combine gradient magnitude (Sobel),
+        // colour distinctness (Achanta frequency-tuned), and focus measure
+        // (Laplacian variance). The seam is pushed towards low-saliency
+        // (blurred/uniform) regions — ideal for Brenizer composites.
+        if (saliencyMap && saliencyMap.length >= compW * compH) {
+          // Average saliency within this block
+          let salSum = 0;
+          let salN = 0;
+          const bx0 = gx * blockSize;
+          const by0 = gy * blockSize;
+          const bx1 = Math.min(bx0 + blockSize, compW);
+          const by1 = Math.min(by0 + blockSize, compH);
+          const step = Math.max(1, Math.floor(blockSize / 4));
+          for (let sy = by0; sy < by1; sy += step) {
+            for (let sx = bx0; sx < bx1; sx += step) {
+              salSum += saliencyMap[sy * compW + sx];
+              salN++;
+            }
+          }
+          const avgSal = salN > 0 ? salSum / salN : 0;
+          // Penalty proportional to saliency: high saliency → expensive to place seam
+          const SALIENCY_PENALTY = 5.0;
+          const salPenalty = avgSal * SALIENCY_PENALTY;
+          // Add equal penalty to both labels — this makes the graph cut
+          // prefer to NOT place the seam boundary here at all.
+          dataCosts[nodeIdx * 2] += salPenalty;
+          dataCosts[nodeIdx * 2 + 1] += salPenalty;
+        }
         // ── Face-aware penalty ────────────────────────
         // If this block overlaps a face, massively penalise the label that
         // does NOT own the face — this keeps the seam away from face regions.

@@ -77,6 +77,14 @@ export interface CVComputeFeaturesMsg {
   orbParams: { nFeatures?: number };
 }
 
+export interface CVComputeSaliencyMsg {
+  type: 'computeSaliency';
+}
+
+export interface CVComputeVignettingMsg {
+  type: 'computeVignetting';
+}
+
 export interface CVMatchGraphMsg {
   type: 'matchGraph';
   windowW: number;
@@ -121,6 +129,8 @@ export type CVInMsg =
   | CVClearImagesMsg
   | CVAddImageMsg
   | CVComputeFeaturesMsg
+  | CVComputeSaliencyMsg
+  | CVComputeVignettingMsg
   | CVMatchGraphMsg
   | CVBuildGraphMsg
   | CVRefineMsg
@@ -141,6 +151,21 @@ export interface CVFeaturesMsg {
   keypointsBuffer: ArrayBuffer;
   descriptorsBuffer: ArrayBuffer;
   descCols: number;
+}
+
+export interface CVSaliencyMsg {
+  type: 'saliency';
+  imageId: string;
+  saliencyBuffer: ArrayBuffer;
+  width: number;
+  height: number;
+  blurScore: number;
+}
+
+export interface CVVignettingMsg {
+  type: 'vignetting';
+  imageId: string;
+  vignetteParams: { a: number; b: number };
 }
 
 export interface CVEdge {
@@ -194,6 +219,8 @@ export interface CVErrorMsg {
 export type CVOutMsg =
   | CVProgressMsg
   | CVFeaturesMsg
+  | CVSaliencyMsg
+  | CVVignettingMsg
   | CVEdgesMsg
   | CVTransformsMsg
   | CVExposureMsg

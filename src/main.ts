@@ -13,7 +13,7 @@ import {
 import {
   runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
   getLastGains, getLastMeshes, getLastMstOrder, getLastMstParent, getWorkerManager,
-  getLastFaces,
+  getLastFaces, getLastSaliency, getLastVignette,
 } from './pipelineController';
 import type { SeamResultMsg } from './workers/workerTypes';
 

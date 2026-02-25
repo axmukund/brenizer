@@ -20,9 +20,21 @@ export interface PipelineSettings {
   multibandEnabled: boolean;
   multibandLevels: number; // 0 = auto
   exposureComp: boolean;
-  exportScale: number;
+  exportScale: number;     // fraction of alignment scale; 'max' handled separately
   exportFormat: 'png' | 'jpeg';
   exportJpegQuality: number;
+  /** AI saliency-aware seam placement (Itti-Koch-Niebur + Achanta CVPR 2009) */
+  saliencyEnabled: boolean;
+  /** PTGui-style polynomial radial vignetting correction V(r) = 1 + ar² + br⁴ */
+  vignetteCorrection: boolean;
+  /** Export at maximum possible resolution (no downscale). */
+  maxResExport: boolean;
+  /** Blur-aware feature weighting for Brenizer method. */
+  blurAwareStitching: boolean;
+  /** Cylindrical projection for wide-FoV panoramas (PTGui-style). */
+  cylindricalProjection: boolean;
+  /** Lens distortion correction using Brown-Conrady model. */
+  lensDistortionCorrection: boolean;
 }
 
 export type ModeName = 'auto' | 'desktopHQ' | 'mobileQuality' | 'mobileSafe';
@@ -49,6 +61,12 @@ const DESKTOP_HQ: PipelineSettings = {
   exportScale: 0.5,
   exportFormat: 'png',
   exportJpegQuality: 0.92,
+  saliencyEnabled: true,
+  vignetteCorrection: true,
+  maxResExport: false,
+  blurAwareStitching: true,
+  cylindricalProjection: false,
+  lensDistortionCorrection: false,
 };
 
 const MOBILE_QUALITY: PipelineSettings = {
@@ -73,6 +91,12 @@ const MOBILE_QUALITY: PipelineSettings = {
   exportScale: 0.33,
   exportFormat: 'jpeg',
   exportJpegQuality: 0.90,
+  saliencyEnabled: true,
+  vignetteCorrection: true,
+  maxResExport: false,
+  blurAwareStitching: true,
+  cylindricalProjection: false,
+  lensDistortionCorrection: false,
 };
 
 const MOBILE_SAFE: PipelineSettings = {
@@ -97,6 +121,12 @@ const MOBILE_SAFE: PipelineSettings = {
   exportScale: 0.25,
   exportFormat: 'jpeg',
   exportJpegQuality: 0.85,
+  saliencyEnabled: false,
+  vignetteCorrection: false,
+  maxResExport: false,
+  blurAwareStitching: false,
+  cylindricalProjection: false,
+  lensDistortionCorrection: false,
 };
 
 const MOBILE_LITE: PipelineSettings = {
@@ -121,6 +151,12 @@ const MOBILE_LITE: PipelineSettings = {
   exportScale: 0.25,
   exportFormat: 'jpeg',
   exportJpegQuality: 0.80,
+  saliencyEnabled: false,
+  vignetteCorrection: false,
+  maxResExport: false,
+  blurAwareStitching: false,
+  cylindricalProjection: false,
+  lensDistortionCorrection: false,
 };
 
 export const PRESETS: Record<string, PipelineSettings> = {

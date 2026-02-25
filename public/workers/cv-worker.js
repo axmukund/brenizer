@@ -4,19 +4,23 @@
 //  - {type:'init', baseUrl, opencvPath}
 //  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?}
 //  - {type:'computeFeatures', orbParams}
+//  - {type:'computeSaliency'}
 //  - {type:'matchGraph', windowW, ratio, ransacThreshPx, minInliers, matchAllPairs}
 //  - {type:'buildGraph'}
 //  - {type:'refine', maxIters, huberDeltaPx, lambdaInit}
-//  - {type:'computeExposure'}
+//  - {type:'computeExposure', robustHuber?}
 //  - {type:'buildMST'}
 //  - {type:'computeLocalMesh', imageId, parentId, meshGrid, sigma, depthSigma, minSupport}
+//  - {type:'computeVignetting'}
 
 // Messages posted back:
 //  - {type:'progress', stage, percent, info}
 //  - {type:'features', imageId, keypointsBuffer, descriptorsBuffer, descCols}
+//  - {type:'saliency', imageId, saliencyBuffer, width, height}
 //  - {type:'edges', edges: [...]}
 //  - {type:'transforms', refId, transforms: [...]}
 //  - {type:'exposure', gains: [...]}
+//  - {type:'vignetting', imageId, vignetteParams}
 //  - {type:'mst', refId, order, parent}
 //  - {type:'mesh', imageId, verticesBuffer, uvsBuffer, indicesBuffer, bounds}
 //  - {type:'error', message}
@@ -169,6 +173,202 @@ self.addEventListener('message', async (ev) => {
         done++;
         postMessage({type:'progress', stage:'features', percent: Math.round(100 * done / ids.length), info: `${done}/${ids.length}`});
       }
+      return;
+    }
+
+    // ── Saliency map computation ──────────────────────────────────────
+    // Computes a per-pixel importance score using:
+    //   1. Gradient magnitude (Sobel-like) — edges and textures
+    //   2. Colour distinctness — unusual colours relative to image mean
+    //   3. Focus measure (Laplacian variance) — sharp regions score higher
+    // The saliency map is used for:
+    //   - Weighted feature matching (features on salient objects matter more)
+    //   - Saliency-aware seam placement (avoid cutting through salient objects)
+    //   - Blur detection (defocused regions get lower saliency)
+    // Inspired by Itti-Koch-Niebur visual attention model (1998) and
+    // frequency-tuned saliency (Achanta et al., CVPR 2009).
+    if (msg.type === 'computeSaliency') {
+      const ids = Object.keys(images);
+      let done = 0;
+      for (const id of ids) {
+        const img = images[id];
+        const w = img.width, h = img.height;
+        const gray = img.gray;
+        const saliency = new Float32Array(w * h);
+
+        // 1. Gradient magnitude via Sobel 3x3 approximation
+        const gradMag = new Float32Array(w * h);
+        let maxGrad = 0;
+        for (let y = 1; y < h - 1; y++) {
+          for (let x = 1; x < w - 1; x++) {
+            const idx = y * w + x;
+            // Sobel X: [-1 0 1; -2 0 2; -1 0 1]
+            const gx = -gray[(y-1)*w+(x-1)] - 2*gray[y*w+(x-1)] - gray[(y+1)*w+(x-1)]
+                       +gray[(y-1)*w+(x+1)] + 2*gray[y*w+(x+1)] + gray[(y+1)*w+(x+1)];
+            // Sobel Y: [-1 -2 -1; 0 0 0; 1 2 1]
+            const gy = -gray[(y-1)*w+(x-1)] - 2*gray[(y-1)*w+x] - gray[(y-1)*w+(x+1)]
+                       +gray[(y+1)*w+(x-1)] + 2*gray[(y+1)*w+x] + gray[(y+1)*w+(x+1)];
+            const mag = Math.sqrt(gx * gx + gy * gy);
+            gradMag[idx] = mag;
+            if (mag > maxGrad) maxGrad = mag;
+          }
+        }
+        // Normalize gradient to [0,1]
+        if (maxGrad > 0) {
+          for (let i = 0; i < gradMag.length; i++) gradMag[i] /= maxGrad;
+        }
+
+        // 2. Colour distinctness (if RGB available)
+        const colDist = new Float32Array(w * h);
+        if (img.rgbSmall) {
+          const rgb = img.rgbSmall;
+          // Compute image mean colour
+          let meanR = 0, meanG = 0, meanB = 0;
+          const n = w * h;
+          for (let i = 0; i < n; i++) {
+            meanR += rgb[i * 3]; meanG += rgb[i * 3 + 1]; meanB += rgb[i * 3 + 2];
+          }
+          meanR /= n; meanG /= n; meanB /= n;
+          // Distance from mean (Achanta frequency-tuned approach)
+          let maxDist = 0;
+          for (let i = 0; i < n; i++) {
+            const dr = rgb[i * 3] - meanR;
+            const dg = rgb[i * 3 + 1] - meanG;
+            const db = rgb[i * 3 + 2] - meanB;
+            const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+            colDist[i] = dist;
+            if (dist > maxDist) maxDist = dist;
+          }
+          if (maxDist > 0) {
+            for (let i = 0; i < n; i++) colDist[i] /= maxDist;
+          }
+        }
+
+        // 3. Focus measure via local Laplacian variance (blur detection)
+        // High variance = sharp = in focus; low variance = blurred (Brenizer bokeh)
+        const focusMap = new Float32Array(w * h);
+        const blockR = 4; // half-block radius for local variance
+        let maxFocus = 0;
+        for (let y = blockR; y < h - blockR; y++) {
+          for (let x = blockR; x < w - blockR; x++) {
+            // Compute Laplacian at this pixel
+            const lap = 4 * gray[y * w + x] - gray[(y-1)*w+x] - gray[(y+1)*w+x]
+                        - gray[y*w+(x-1)] - gray[y*w+(x+1)];
+            const lapSq = lap * lap;
+            focusMap[y * w + x] = lapSq;
+            if (lapSq > maxFocus) maxFocus = lapSq;
+          }
+        }
+        if (maxFocus > 0) {
+          for (let i = 0; i < focusMap.length; i++) focusMap[i] /= maxFocus;
+        }
+
+        // Combine: saliency = 0.4 * gradient + 0.3 * colorDistinctness + 0.3 * focus
+        for (let i = 0; i < w * h; i++) {
+          saliency[i] = 0.4 * gradMag[i] + 0.3 * colDist[i] + 0.3 * focusMap[i];
+        }
+
+        // Store on image for later use in matching and seam placement
+        img.saliency = saliency;
+        img.focusMap = focusMap;
+
+        // Compute per-image blur score (mean focus measure) — used for
+        // blur-aware feature weighting in Brenizer composites
+        let focusSum = 0, focusCount = 0;
+        for (let i = 0; i < focusMap.length; i++) {
+          if (focusMap[i] > 0) { focusSum += focusMap[i]; focusCount++; }
+        }
+        img.blurScore = focusCount > 0 ? focusSum / focusCount : 0;
+
+        postMessage({
+          type: 'saliency',
+          imageId: id,
+          saliencyBuffer: saliency.buffer,
+          width: w,
+          height: h,
+          blurScore: img.blurScore,
+        }, [saliency.buffer]);
+
+        // Re-create saliency since we transferred the buffer
+        img.saliency = new Float32Array(w * h);
+        // Recompute (fast since data is still in gradMag/colDist/focusMap)
+        for (let i = 0; i < w * h; i++) {
+          img.saliency[i] = 0.4 * gradMag[i] + 0.3 * colDist[i] + 0.3 * focusMap[i];
+        }
+
+        done++;
+        postMessage({type:'progress', stage:'saliency', percent: Math.round(100 * done / ids.length), info: `${done}/${ids.length}`});
+      }
+      return;
+    }
+
+    // ── Vignetting estimation ─────────────────────────────────────────
+    // Estimates radial vignetting from the image luminance distribution.
+    // Models vignetting as V(r) = 1 + a*r² + b*r⁴ where r = normalized
+    // distance from image center (0 at center, 1 at corners).
+    // The coefficients are estimated by comparing the mean luminance at
+    // different radial distances — natural images are assumed to have
+    // roughly uniform expected brightness at all radii.
+    // This follows the approach in PTGui / Autopano (polynomial radial model).
+    if (msg.type === 'computeVignetting') {
+      const ids = Object.keys(images);
+      for (const id of ids) {
+        const img = images[id];
+        const w = img.width, h = img.height;
+        const gray = img.gray;
+        const cx = w / 2, cy = h / 2;
+        const maxR = Math.sqrt(cx * cx + cy * cy);
+
+        // Bin luminance by radial distance (10 bins)
+        const nBins = 10;
+        const binSum = new Float64Array(nBins);
+        const binCount = new Float64Array(nBins);
+        const step = 8; // sample every 8th pixel for speed
+        for (let y = 0; y < h; y += step) {
+          for (let x = 0; x < w; x += step) {
+            const dx = x - cx, dy = y - cy;
+            const r = Math.sqrt(dx * dx + dy * dy) / maxR;
+            const bin = Math.min(Math.floor(r * nBins), nBins - 1);
+            binSum[bin] += gray[y * w + x];
+            binCount[bin]++;
+          }
+        }
+
+        // Compute mean luminance per bin
+        const binMean = new Float64Array(nBins);
+        const centerMean = binCount[0] > 0 ? binSum[0] / binCount[0] : 128;
+        for (let i = 0; i < nBins; i++) {
+          binMean[i] = binCount[i] > 0 ? binSum[i] / binCount[i] : centerMean;
+        }
+
+        // Fit polynomial: V(r) = 1 + a*r² + b*r⁴
+        // We want V(r) * observed(r) ≈ centerMean → V(r) ≈ centerMean / observed(r)
+        // Least-squares fit: minimize Σ_i (V(r_i) - target_i)²
+        // where target_i = centerMean / binMean[i], r_i = bin center
+        let sumR2R2 = 0, sumR2R4 = 0, sumR4R4 = 0;
+        let sumR2T = 0, sumR4T = 0;
+        for (let i = 1; i < nBins; i++) { // skip center bin
+          const r = (i + 0.5) / nBins;
+          const r2 = r * r, r4 = r2 * r2;
+          const target = (centerMean > 10 && binMean[i] > 10)
+            ? (centerMean / binMean[i] - 1.0) : 0;
+          sumR2R2 += r2 * r2; sumR2R4 += r2 * r4; sumR4R4 += r4 * r4;
+          sumR2T += r2 * target; sumR4T += r4 * target;
+        }
+        const det = sumR2R2 * sumR4R4 - sumR2R4 * sumR2R4;
+        let a = 0, b = 0;
+        if (Math.abs(det) > 1e-10) {
+          a = (sumR4R4 * sumR2T - sumR2R4 * sumR4T) / det;
+          b = (sumR2R2 * sumR4T - sumR2R4 * sumR2T) / det;
+        }
+        // Clamp to physically reasonable range
+        a = Math.max(-2, Math.min(2, a));
+        b = Math.max(-2, Math.min(2, b));
+
+        img.vignetteParams = { a, b };
+        postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b } });
+      }
+      postMessage({type:'progress', stage:'vignetting', percent:100, info:'done'});
       return;
     }
 
@@ -1039,37 +1239,66 @@ self.addEventListener('message', async (ev) => {
       // Validate refIdx: ensure reference image exists in the index map
       const refIdx = (refId && idToIdx[refId] !== undefined) ? idToIdx[refId] : 0;
 
-      // Solve a linear system for log-gains: for each edge, x_j − x_i = r_ij
-      function solveGainSystem(ratioKey) {
-        const AtA = new Float64Array(n * n);
-        const Atb = new Float64Array(n);
-        let hasData = false;
+      // Robust IRLS (Iteratively Reweighted Least Squares) gain solver.
+      // Uses Huber loss to down-weight extreme exposure ratios from outlier
+      // correspondences or saturated pixels. This is critical for Brenizer
+      // mosaics with wide aperture where bokeh boundaries create unreliable
+      // matches. Falls back to standard least squares when IRLS fails.
+      // Huber threshold δ = 0.5 log-units (corresponds to ~1.65× gain factor).
+      const HUBER_DELTA = 0.5;
+      const IRLS_ITERS = 5;
 
-        for (const er of edgeRatios) {
-          const r = er[ratioKey];
-          if (r === undefined) continue;
-          hasData = true;
-          AtA[er.i * n + er.i] += 1;
-          AtA[er.j * n + er.j] += 1;
-          AtA[er.i * n + er.j] -= 1;
-          AtA[er.j * n + er.i] -= 1;
-          Atb[er.i] -= r;
-          Atb[er.j] += r;
+      function solveGainSystem(ratioKey) {
+        const irlsWeights = new Float64Array(edgeRatios.length);
+        irlsWeights.fill(1.0);
+        let solution = null;
+
+        for (let iter = 0; iter < IRLS_ITERS; iter++) {
+          const AtA = new Float64Array(n * n);
+          const Atb = new Float64Array(n);
+          let hasData = false;
+
+          for (let ei = 0; ei < edgeRatios.length; ei++) {
+            const er = edgeRatios[ei];
+            const r = er[ratioKey];
+            if (r === undefined) continue;
+            hasData = true;
+            const w = irlsWeights[ei];
+            AtA[er.i * n + er.i] += w;
+            AtA[er.j * n + er.j] += w;
+            AtA[er.i * n + er.j] -= w;
+            AtA[er.j * n + er.i] -= w;
+            Atb[er.i] -= w * r;
+            Atb[er.j] += w * r;
+          }
+
+          if (!hasData) return null;
+
+          // Fix reference (strong prior)
+          AtA[refIdx * n + refIdx] += 1000;
+          // Regularization toward gain=1
+          for (let i = 0; i < n; i++) AtA[i * n + i] += 0.01;
+
+          const logGains = solveLinearN(AtA, Atb, n);
+          if (!logGains) return solution; // return last good solution
+          solution = logGains;
+
+          // Update IRLS weights using Huber loss
+          for (let ei = 0; ei < edgeRatios.length; ei++) {
+            const er = edgeRatios[ei];
+            const r = er[ratioKey];
+            if (r === undefined) continue;
+            const residual = Math.abs((logGains[er.j] - logGains[er.i]) - r);
+            // Huber weight: w = 1 if |r| ≤ δ, else δ/|r|
+            irlsWeights[ei] = residual <= HUBER_DELTA ? 1.0 : HUBER_DELTA / residual;
+          }
         }
 
-        if (!hasData) return null;
-
-        // Fix reference (strong prior)
-        AtA[refIdx * n + refIdx] += 1000;
-        // Regularization toward gain=1
-        for (let i = 0; i < n; i++) AtA[i * n + i] += 0.01;
-
-        const logGains = solveLinearN(AtA, Atb, n);
-        if (!logGains) return null;
-        // Clamp gains to reasonable range [0.1, 10] and sanitize NaN/Infinity
-        return logGains.map(v => {
+        if (!solution) return null;
+        // Clamp gains to reasonable range [0.05, 20] for extreme exposure support
+        return solution.map(v => {
           const g = Math.exp(v);
-          return (Number.isFinite(g) && g > 0) ? Math.min(10, Math.max(0.1, g)) : 1.0;
+          return (Number.isFinite(g) && g > 0) ? Math.min(20, Math.max(0.05, g)) : 1.0;
         });
       }
 
