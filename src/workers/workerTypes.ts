@@ -113,6 +113,7 @@ export interface CVComputeLocalMeshMsg {
   sigma: number;
   depthSigma: number;
   minSupport: number;
+  faceRects?: Array<{ x: number; y: number; width: number; height: number; confidence: number }>;
 }
 
 export type CVInMsg =
@@ -166,7 +167,7 @@ export interface CVTransformsMsg {
 
 export interface CVExposureMsg {
   type: 'exposure';
-  gains: { imageId: string; gain: number }[];
+  gains: { imageId: string; gain: number; gainR?: number; gainG?: number; gainB?: number }[];
 }
 
 export interface CVMSTMsg {

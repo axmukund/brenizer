@@ -19,7 +19,7 @@ export interface AppState {
   mobileSafeFlag: boolean;
   resolvedMode: string;
   settings: PipelineSettings | null;
-  pipelineStatus: string;
+  pipelineStatus: 'idle' | 'running' | 'error';
   degradations: string[];
 }
 

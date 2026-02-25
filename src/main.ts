@@ -8,11 +8,12 @@ import {
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
   makeViewMatrix, computeBlockCosts, labelsToMask, featherMask, createMaskTexture,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
-  type PyramidBlender, type ManagedTexture,
+  type PyramidBlender, type ManagedTexture, type FaceRectComposite,
 } from './gl';
 import {
   runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
   getLastGains, getLastMeshes, getLastMstOrder, getLastMstParent, getWorkerManager,
+  getLastFaces,
 } from './pipelineController';
 import type { SeamResultMsg } from './workers/workerTypes';
 
@@ -21,6 +22,11 @@ let warpRenderer: WarpRenderer | null = null;
 let kpRenderer: KeypointRenderer | null = null;
 let compositor: Compositor | null = null;
 let pyramidBlender: PyramidBlender | null = null;
+
+/** Sanitize a gain value: replace NaN/Infinity/non-positive with 1.0. */
+function safeGainVal(v: number): number {
+  return Number.isFinite(v) && v > 0 ? v : 1.0;
+}
 
 /** Expose for UI to trigger image preview via WebGL */
 export function getGLContext(): GLContext | null { return glCtx; }
@@ -124,7 +130,7 @@ async function boot(): Promise<void> {
     warpRenderer = createWarpRenderer(glCtx.gl);
     kpRenderer = createKeypointRenderer(glCtx.gl);
     compositor = createCompositor(glCtx.gl);
-    pyramidBlender = createPyramidBlender(glCtx.gl);
+    pyramidBlender = createPyramidBlender(glCtx.gl, glCtx.floatFBO);
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
   } catch (e) {
     console.warn('WebGL2 init failed:', e);
@@ -538,13 +544,21 @@ async function renderWarpedPreview(
 
   console.log(`Composite: ${compW}×${compH}, scale=${compositeScale.toFixed(4)}`);
 
-  // Create FBOs for composition
-  const compositeTexA = createEmptyTexture(gl, compW, compH);
-  const compositeTexB = createEmptyTexture(gl, compW, compH);
-  const compositeA = createFBO(gl, compositeTexA.texture);
-  const compositeB = createFBO(gl, compositeTexB.texture);
-  const newImageTex = createEmptyTexture(gl, compW, compH);
-  const newImageFBO = createFBO(gl, newImageTex.texture);
+  // Create FBOs for composition — inside try so finally always cleans up
+  let compositeTexA: import('./gl').ManagedTexture | null = null;
+  let compositeTexB: import('./gl').ManagedTexture | null = null;
+  let compositeA: import('./gl').ManagedFBO | null = null;
+  let compositeB: import('./gl').ManagedFBO | null = null;
+  let newImageTex: import('./gl').ManagedTexture | null = null;
+  let newImageFBO: import('./gl').ManagedFBO | null = null;
+
+  try {
+  compositeTexA = createEmptyTexture(gl, compW, compH);
+  compositeTexB = createEmptyTexture(gl, compW, compH);
+  compositeA = createFBO(gl, compositeTexA.texture);
+  compositeB = createFBO(gl, compositeTexB.texture);
+  newImageTex = createEmptyTexture(gl, compW, compH);
+  newImageFBO = createFBO(gl, newImageTex.texture);
 
   // View matrix for composite space: maps [0, compW] × [0, compH] → clip [-1, 1]
   const compViewMat = new Float32Array([
@@ -557,8 +571,6 @@ async function renderWarpedPreview(
   let currentCompFBO = compositeA;
   let altCompTex = compositeTexB;
   let altCompFBO = compositeB;
-
-  try {
 
   // Set up compositing progress
   startProgress([{ name: 'compositing', weight: 1 }]);
@@ -591,12 +603,98 @@ async function renderWarpedPreview(
   const mbLevels = (() => {
     const l = settings?.multibandLevels ?? 0;
     if (l > 0) return l;
-    // Auto: based on composite size
-    return Math.min(6, Math.max(3, Math.floor(Math.log2(Math.min(compW, compH))) - 3));
+    // ── Adaptive multi-band level selection ──────────────────
+    // Instead of basing pyramid levels purely on image size, we estimate
+    // the typical overlap width between adjacent images and choose levels
+    // so the lowest-frequency band roughly matches the overlap zone.
+    // This ensures the blend transition spans exactly the overlap region,
+    // avoiding both too-narrow blends (visible seams) and too-wide blends
+    // (ghosting from excessive smoothing across non-overlapping areas).
+    //
+    // The pyramid's coarsest level covers ~2^L pixels. We want 2^L ≈ overlapWidth.
+    // Fallback to size-based if we can't estimate overlap.
+    const sizeBasedLevels = Math.min(6, Math.max(3, Math.floor(Math.log2(Math.min(compW, compH))) - 3));
+
+    // Estimate overlap width from mesh bounds
+    if (meshes.size >= 2) {
+      const boundsArr = Array.from(meshes.values()).map(m => m.bounds);
+      let totalOverlap = 0;
+      let overlapCount = 0;
+      for (let a = 0; a < boundsArr.length; a++) {
+        for (let b = a + 1; b < boundsArr.length; b++) {
+          const oLeft = Math.max(boundsArr[a].minX, boundsArr[b].minX);
+          const oRight = Math.min(boundsArr[a].maxX, boundsArr[b].maxX);
+          const oTop = Math.max(boundsArr[a].minY, boundsArr[b].minY);
+          const oBottom = Math.min(boundsArr[a].maxY, boundsArr[b].maxY);
+          if (oRight > oLeft && oBottom > oTop) {
+            const overlapW = Math.min(oRight - oLeft, oBottom - oTop);
+            totalOverlap += overlapW;
+            overlapCount++;
+          }
+        }
+      }
+      if (overlapCount > 0) {
+        const avgOverlap = totalOverlap / overlapCount;
+        // Choose levels so 2^L ≈ avgOverlap (clamped to [3, 6])
+        const overlapLevels = Math.round(Math.log2(Math.max(8, avgOverlap)));
+        return Math.min(6, Math.max(3, overlapLevels));
+      }
+    }
+    return sizeBasedLevels;
   })();
 
   const gridN = 8;
   let imgIdx = 0;
+
+  // ── Project faces into composite coordinates for face-aware seam placement ──
+  const allFaces = getLastFaces();
+  // Build a per-image list of face rects in composite coords.
+  // compositeImages[imgId] = array of FaceRectComposite (in pixel coords on the composite).
+  // We accumulate "composite-side" vs "new-image-side" as we stitch in order.
+  const facesInCompositeCoords = new Map<string, FaceRectComposite[]>();
+  for (const [imgId, faceArr] of allFaces) {
+    if (!faceArr.length) continue;
+    const t = transforms.get(imgId);
+    if (!t) continue;
+    const T = t.T;
+    const projected: FaceRectComposite[] = [];
+    for (const face of faceArr) {
+      // Project face corners through the homography to global, then to composite
+      const corners = [
+        [face.x, face.y],
+        [face.x + face.width, face.y],
+        [face.x + face.width, face.y + face.height],
+        [face.x, face.y + face.height],
+      ];
+      let fMinX = Infinity, fMinY = Infinity, fMaxX = -Infinity, fMaxY = -Infinity;
+      let valid = true;
+      for (const [cx, cy] of corners) {
+        const d = T[6] * cx + T[7] * cy + T[8];
+        if (d < 1e-4) { valid = false; break; }
+        const gx = (T[0] * cx + T[1] * cy + T[2]) / d;
+        const gy = (T[3] * cx + T[4] * cy + T[5]) / d;
+        const px = (gx - minX) * compositeScale;
+        const py = (gy - minY) * compositeScale;
+        fMinX = Math.min(fMinX, px);
+        fMinY = Math.min(fMinY, py);
+        fMaxX = Math.max(fMaxX, px);
+        fMaxY = Math.max(fMaxY, py);
+      }
+      if (valid && isFinite(fMinX)) {
+        projected.push({
+          x: fMinX, y: fMinY,
+          width: fMaxX - fMinX,
+          height: fMaxY - fMinY,
+          imageLabel: 1, // will be set properly during compositing
+        });
+      }
+    }
+    if (projected.length > 0) facesInCompositeCoords.set(imgId, projected);
+  }
+
+  // Pre-allocate readback buffers for compositing (reused each iteration)
+  const _compPixels = new Uint8Array(compW * compH * 4);
+  const _newPixels = new Uint8Array(compW * compH * 4);
 
   for (const imgId of mstOrder) {
     const img = images.find(i => i.id === imgId);
@@ -608,7 +706,10 @@ async function renderWarpedPreview(
     const alignW = Math.round(img.width * sf);
     const alignH = Math.round(img.height * sf);
     const T = t.T;
-    const gain = gains.get(imgId) ?? 1.0;
+    const gainObj = gains.get(imgId);
+    const gain: [number, number, number] = gainObj
+      ? [safeGainVal(gainObj.gainR), safeGainVal(gainObj.gainG), safeGainVal(gainObj.gainB)]
+      : [1.0, 1.0, 1.0];
 
     // Build warped mesh (APAP if available, else global transform)
     let mesh: import('./gl').MeshData;
@@ -673,8 +774,8 @@ async function renderWarpedPreview(
     } else if (useGraphCut) {
       // Seam finding via graph cut
       // Read back composite and new image at full resolution
-      const compPixels = new Uint8Array(compW * compH * 4);
-      const newPixels = new Uint8Array(compW * compH * 4);
+      const compPixels = _compPixels;
+      const newPixels = _newPixels;
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
@@ -683,7 +784,21 @@ async function renderWarpedPreview(
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
       // Compute block costs
-      const costs = computeBlockCosts(compPixels, newPixels, compW, compH, blockSize);
+      // Collect face rects: faces in composite → label 0, faces in new image → label 1
+      const seamFaces: FaceRectComposite[] = [];
+      // Faces from previously composited images
+      for (const prevId of mstOrder.slice(0, imgIdx)) {
+        const pf = facesInCompositeCoords.get(prevId);
+        if (pf) {
+          for (const f of pf) seamFaces.push({ ...f, imageLabel: 0 });
+        }
+      }
+      // Faces from current new image
+      const curFaces = facesInCompositeCoords.get(imgId);
+      if (curFaces) {
+        for (const f of curFaces) seamFaces.push({ ...f, imageLabel: 1 });
+      }
+      const costs = computeBlockCosts(compPixels, newPixels, compW, compH, blockSize, 0, seamFaces);
 
       // Send to seam worker
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
@@ -734,7 +849,7 @@ async function renderWarpedPreview(
     } else {
       // Feather-only fallback: simple alpha blend
       // Create a mask where new image has alpha
-      const newPixels = new Uint8Array(compW * compH * 4);
+      const newPixels = _newPixels;
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -793,9 +908,9 @@ async function renderWarpedPreview(
     endProgress();
     return;
   } finally {
-  compositeA.dispose(); compositeTexA.dispose();
-  compositeB.dispose(); compositeTexB.dispose();
-  newImageFBO.dispose(); newImageTex.dispose();
+  compositeA?.dispose(); compositeTexA?.dispose();
+  compositeB?.dispose(); compositeTexB?.dispose();
+  newImageFBO?.dispose(); newImageTex?.dispose();
   }
 
   endProgress();
@@ -862,12 +977,18 @@ async function exportComposite(): Promise<void> {
     const t = transforms.get(img.id);
     if (!t) continue;
 
-    // Prefer APAP mesh bounds
+    // Prefer APAP mesh bounds (clamped to reasonable extent)
     const apap = meshes.get(img.id);
     if (apap) {
       const b = apap.bounds;
-      minX = Math.min(minX, b.minX); minY = Math.min(minY, b.minY);
-      maxX = Math.max(maxX, b.maxX); maxY = Math.max(maxY, b.maxY);
+      const clampedMinX = Math.max(b.minX, -maxReasonableExtent);
+      const clampedMinY = Math.max(b.minY, -maxReasonableExtent);
+      const clampedMaxX = Math.min(b.maxX, maxReasonableExtent);
+      const clampedMaxY = Math.min(b.maxY, maxReasonableExtent);
+      if (clampedMaxX > clampedMinX && clampedMaxY > clampedMinY) {
+        minX = Math.min(minX, clampedMinX); minY = Math.min(minY, clampedMinY);
+        maxX = Math.max(maxX, clampedMaxX); maxY = Math.max(maxY, clampedMaxY);
+      }
       continue;
     }
 
@@ -905,13 +1026,21 @@ async function exportComposite(): Promise<void> {
   }
   const compositeScale = outW / globalW;
 
-  // Create FBOs for export rendering
-  const compositeTexA = createEmptyTexture(gl, outW, outH);
-  const compositeTexB = createEmptyTexture(gl, outW, outH);
-  const compositeA = createFBO(gl, compositeTexA.texture);
-  const compositeB = createFBO(gl, compositeTexB.texture);
-  const newImageTex = createEmptyTexture(gl, outW, outH);
-  const newImageFBO = createFBO(gl, newImageTex.texture);
+  // Create FBOs for export rendering — inside try so finally always cleans up
+  let compositeTexA: import('./gl').ManagedTexture | null = null;
+  let compositeTexB: import('./gl').ManagedTexture | null = null;
+  let compositeA: import('./gl').ManagedFBO | null = null;
+  let compositeB: import('./gl').ManagedFBO | null = null;
+  let newImageTex: import('./gl').ManagedTexture | null = null;
+  let newImageFBO: import('./gl').ManagedFBO | null = null;
+
+  try {
+  compositeTexA = createEmptyTexture(gl, outW, outH);
+  compositeTexB = createEmptyTexture(gl, outW, outH);
+  compositeA = createFBO(gl, compositeTexA.texture);
+  compositeB = createFBO(gl, compositeTexB.texture);
+  newImageTex = createEmptyTexture(gl, outW, outH);
+  newImageFBO = createFBO(gl, newImageTex.texture);
 
   const compViewMat = new Float32Array([2 / outW, 0, 0, 0, -2 / outH, 0, -1, 1, 1]);
 
@@ -919,8 +1048,6 @@ async function exportComposite(): Promise<void> {
   let currentCompFBO = compositeA;
   let altCompTex = compositeTexB;
   let altCompFBO = compositeB;
-
-  try {
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.viewport(0, 0, outW, outH);
@@ -939,14 +1066,81 @@ async function exportComposite(): Promise<void> {
   const blockSize = settings.seamBlockSize;
   const featherWidth = settings.featherWidth;
   const useMultiband = settings.multibandEnabled && pyramidBlender !== null;
-  const mbLevels = settings.multibandLevels > 0
-    ? settings.multibandLevels
-    : Math.min(6, Math.max(3, Math.floor(Math.log2(Math.min(outW, outH))) - 3));
+  const mbLevels = (() => {
+    if (settings.multibandLevels > 0) return settings.multibandLevels;
+    // Adaptive: estimate overlap width from mesh bounds (same logic as preview)
+    const sizeBasedLevels = Math.min(6, Math.max(3, Math.floor(Math.log2(Math.min(outW, outH))) - 3));
+    if (meshes.size >= 2) {
+      const boundsArr = Array.from(meshes.values()).map(m => m.bounds);
+      let totalOverlap = 0, overlapCount = 0;
+      for (let a = 0; a < boundsArr.length; a++) {
+        for (let b = a + 1; b < boundsArr.length; b++) {
+          const oLeft = Math.max(boundsArr[a].minX, boundsArr[b].minX);
+          const oRight = Math.min(boundsArr[a].maxX, boundsArr[b].maxX);
+          const oTop = Math.max(boundsArr[a].minY, boundsArr[b].minY);
+          const oBottom = Math.min(boundsArr[a].maxY, boundsArr[b].maxY);
+          if (oRight > oLeft && oBottom > oTop) {
+            // Use export scale to adjust overlap to output pixel space
+            const overlapW = Math.min(oRight - oLeft, oBottom - oTop) * exportScale;
+            totalOverlap += overlapW;
+            overlapCount++;
+          }
+        }
+      }
+      if (overlapCount > 0) {
+        const avgOverlap = totalOverlap / overlapCount;
+        return Math.min(6, Math.max(3, Math.round(Math.log2(Math.max(8, avgOverlap)))));
+      }
+    }
+    return sizeBasedLevels;
+  })();
   const wm = getWorkerManager();
   const useGraphCut = settings.seamMethod === 'graphcut' && wm !== null;
 
   let imgIdx = 0;
   const gridN = 8;
+
+  // ── Project faces into export composite coordinates ──
+  const allFacesExport = getLastFaces();
+  const facesInExportCoords = new Map<string, FaceRectComposite[]>();
+  for (const [imgId, faceArr] of allFacesExport) {
+    if (!faceArr.length) continue;
+    const t = transforms.get(imgId);
+    if (!t) continue;
+    const T = t.T;
+    const projected: FaceRectComposite[] = [];
+    for (const face of faceArr) {
+      const corners = [
+        [face.x, face.y],
+        [face.x + face.width, face.y],
+        [face.x + face.width, face.y + face.height],
+        [face.x, face.y + face.height],
+      ];
+      let fMinX = Infinity, fMinY = Infinity, fMaxX = -Infinity, fMaxY = -Infinity;
+      let valid = true;
+      for (const [cx, cy] of corners) {
+        const d = T[6] * cx + T[7] * cy + T[8];
+        if (d < 1e-4) { valid = false; break; }
+        const gx = (T[0] * cx + T[1] * cy + T[2]) / d;
+        const gy = (T[3] * cx + T[4] * cy + T[5]) / d;
+        const px = (gx - minX) * compositeScale;
+        const py = (gy - minY) * compositeScale;
+        fMinX = Math.min(fMinX, px);
+        fMinY = Math.min(fMinY, py);
+        fMaxX = Math.max(fMaxX, px);
+        fMaxY = Math.max(fMaxY, py);
+      }
+      if (valid && isFinite(fMinX)) {
+        projected.push({
+          x: fMinX, y: fMinY,
+          width: fMaxX - fMinX,
+          height: fMaxY - fMinY,
+          imageLabel: 1,
+        });
+      }
+    }
+    if (projected.length > 0) facesInExportCoords.set(imgId, projected);
+  }
 
   for (const imgId of mstOrder) {
     const img = active.find(i => i.id === imgId);
@@ -958,7 +1152,10 @@ async function exportComposite(): Promise<void> {
     const alignW = Math.round(img.width * sf);
     const alignH = Math.round(img.height * sf);
     const T = t.T;
-    const gain = gains.get(imgId) ?? 1.0;
+    const gainObj = gains.get(imgId);
+    const gain: [number, number, number] = gainObj
+      ? [safeGainVal(gainObj.gainR), safeGainVal(gainObj.gainG), safeGainVal(gainObj.gainB)]
+      : [1.0, 1.0, 1.0];
 
     // Build warped mesh
     let mesh: import('./gl').MeshData;
@@ -1025,7 +1222,18 @@ async function exportComposite(): Promise<void> {
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize);
+      const seamFacesExport: FaceRectComposite[] = [];
+      for (const prevId of mstOrder.slice(0, imgIdx)) {
+        const pf = facesInExportCoords.get(prevId);
+        if (pf) {
+          for (const f of pf) seamFacesExport.push({ ...f, imageLabel: 0 });
+        }
+      }
+      const curFacesExport = facesInExportCoords.get(imgId);
+      if (curFacesExport) {
+        for (const f of curFacesExport) seamFacesExport.push({ ...f, imageLabel: 1 });
+      }
+      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize, 0, seamFacesExport);
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
       const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
@@ -1139,9 +1347,9 @@ async function exportComposite(): Promise<void> {
 
   // Cleanup
   } finally {
-  compositeA.dispose(); compositeTexA.dispose();
-  compositeB.dispose(); compositeTexB.dispose();
-  newImageFBO.dispose(); newImageTex.dispose();
+  compositeA?.dispose(); compositeTexA?.dispose();
+  compositeB?.dispose(); compositeTexB?.dispose();
+  newImageFBO?.dispose(); newImageTex?.dispose();
   }
 }
 

@@ -25,12 +25,12 @@ const WARP_FRAG = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_texture;
-uniform float u_gain;  // exposure gain
+uniform vec3 u_gainRGB;  // per-channel RGB exposure gain
 uniform float u_alpha;
 out vec4 fragColor;
 void main() {
   vec4 c = texture(u_texture, v_uv);
-  c.rgb *= u_gain;
+  c.rgb *= u_gainRGB;
   c.a *= u_alpha;
   fragColor = c;
 }
@@ -98,11 +98,17 @@ export interface MeshData {
 
 export interface WarpRenderer {
   drawTexture(texture: WebGLTexture, width: number, height: number): void;
+  /**
+   * Draw a warped mesh with per-channel exposure compensation.
+   * @param gain Exposure gain — scalar (applied uniformly to RGB) or
+   *             [R, G, B] tuple for per-channel correction. Defaults to 1.0.
+   * @param alpha Opacity [0-1] for blending. Defaults to 1.0.
+   */
   drawMesh(
     texture: WebGLTexture,
     mesh: MeshData,
     viewMatrix: Float32Array, // 3x3 col-major
-    gain?: number,
+    gain?: number | [number, number, number],  // scalar or per-channel [R,G,B]
     alpha?: number,
   ): void;
   dispose(): void;
@@ -187,7 +193,7 @@ export function makeViewMatrix(
   // Fit content into canvas maintaining aspect ratio
   const scale = Math.min(canvasW / cw, canvasH / ch) * zoom;
   const sx = (2 * scale) / canvasW;
-  const sy = -(2 * scale) / canvasH; // flip y
+  const sy = -(2 * scale) / canvasH; // flip y: canvas y-down → GL clip-space y-up
   const tx = -cw * scale / canvasW + panX * 2 / canvasW;
   const ty = ch * scale / canvasH + panY * 2 / canvasH;
   // Column-major 3×3
@@ -210,7 +216,7 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
     aTex: gl.getAttribLocation(warpProg, 'a_texcoord'),
     uView: gl.getUniformLocation(warpProg, 'u_viewMatrix'),
     uTex: gl.getUniformLocation(warpProg, 'u_texture'),
-    uGain: gl.getUniformLocation(warpProg, 'u_gain'),
+    uGainRGB: gl.getUniformLocation(warpProg, 'u_gainRGB'),
     uAlpha: gl.getUniformLocation(warpProg, 'u_alpha'),
   };
 
@@ -252,7 +258,7 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
       gl.bindVertexArray(null);
     },
 
-    drawMesh(texture, mesh, viewMatrix, gain = 1.0, alpha = 1.0) {
+    drawMesh(texture, mesh, viewMatrix, gain: number | [number, number, number] = 1.0, alpha = 1.0) {
       gl.useProgram(warpProg);
 
       // Upload mesh data
@@ -276,7 +282,13 @@ export function createWarpRenderer(gl: WebGL2RenderingContext): WarpRenderer {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.uniform1i(wLoc.uTex, 0);
-      gl.uniform1f(wLoc.uGain, gain);
+      // Per-channel RGB gain: accept scalar or [R,G,B] tuple
+      if (typeof gain === 'number') {
+        gl.uniform3f(wLoc.uGainRGB, gain, gain, gain);
+      } else {
+        gl.uniform3f(wLoc.uGainRGB, gain[0], gain[1], gain[2]);
+      }
+
       gl.uniform1f(wLoc.uAlpha, alpha);
 
       gl.drawElements(gl.TRIANGLES, mesh.indices.length, gl.UNSIGNED_INT, 0);

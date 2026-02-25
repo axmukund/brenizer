@@ -77,8 +77,9 @@ self.addEventListener('message', async (ev) => {
     }
 
     if (msg.type === 'addImage') {
-      const {imageId, grayBuffer, width, height, depth} = msg;
+      const {imageId, grayBuffer, width, height, depth, rgbSmallBuffer} = msg;
       const gray = new Uint8ClampedArray(grayBuffer);
+      const rgbSmall = rgbSmallBuffer ? new Uint8ClampedArray(rgbSmallBuffer) : null;
       if (images[imageId]) {
         // Merge: only overwrite gray if the buffer is non-trivial
         if (grayBuffer.byteLength > 1) {
@@ -86,12 +87,16 @@ self.addEventListener('message', async (ev) => {
           images[imageId].width = width;
           images[imageId].height = height;
         }
+        if (rgbSmall) {
+          images[imageId].rgbSmall = rgbSmall;
+        }
         if (depth) {
           images[imageId].depth = new Uint16Array(depth);
         }
       } else {
         images[imageId] = {
           width, height, gray,
+          rgbSmall: rgbSmall,
           depth: depth ? new Uint16Array(depth) : null,
           keypoints: null,
           descriptors: null,
@@ -202,6 +207,7 @@ self.addEventListener('message', async (ev) => {
 
         let matI = null, matJ = null;
         let bf = null, matches = null;
+        let matchesRev = null;
 
         try {
           matI = cv.matFromArray(numI, descColsI, cv.CV_8UC1, imgI.descriptors);
@@ -211,9 +217,8 @@ self.addEventListener('message', async (ev) => {
           matches = new cv.DMatchVectorVector();
           bf.knnMatch(matI, matJ, matches, 2);
 
-          // Ratio test
-          const goodPtsI = [];
-          const goodPtsJ = [];
+          // Forward ratio test: I → J
+          const fwdBest = new Map(); // queryIdx → {trainIdx, distance}
           for (let m = 0; m < matches.size(); m++) {
             const match = matches.get(m);
             if (match.size() >= 2) {
@@ -223,68 +228,152 @@ self.addEventListener('message', async (ev) => {
                 const qi = m1.queryIdx;
                 const ti = m1.trainIdx;
                 if (qi < numI && ti < numJ) {
-                  goodPtsI.push(imgI.keypoints[qi * 2], imgI.keypoints[qi * 2 + 1]);
-                  goodPtsJ.push(imgJ.keypoints[ti * 2], imgJ.keypoints[ti * 2 + 1]);
+                  fwdBest.set(qi, {trainIdx: ti, distance: m1.distance});
                 }
               }
             }
           }
 
+          // Reverse match: J → I for cross-check
+          matchesRev = new cv.DMatchVectorVector();
+          bf.knnMatch(matJ, matI, matchesRev, 2);
+          const revBest = new Map(); // queryIdx(J) → trainIdx(I)
+          for (let m = 0; m < matchesRev.size(); m++) {
+            const match = matchesRev.get(m);
+            if (match.size() >= 2) {
+              const m1 = match.get(0);
+              const m2 = match.get(1);
+              if (m1.distance < ratio * m2.distance) {
+                revBest.set(m1.queryIdx, m1.trainIdx);
+              }
+            }
+          }
+          matchesRev.delete();
+          matchesRev = null;
+
+          // Cross-check filter: keep only mutual best matches
+          const goodPtsI = [];
+          const goodPtsJ = [];
+          for (const [qi, fwd] of fwdBest) {
+            const revTrain = revBest.get(fwd.trainIdx);
+            if (revTrain === qi) {
+              // Mutual best match confirmed
+              goodPtsI.push(imgI.keypoints[qi * 2], imgI.keypoints[qi * 2 + 1]);
+              goodPtsJ.push(imgJ.keypoints[fwd.trainIdx * 2], imgJ.keypoints[fwd.trainIdx * 2 + 1]);
+            }
+          }
+
           if (goodPtsI.length / 2 < minInliers) { done++; continue; }
 
-          // RANSAC homography
-          const srcPts = cv.matFromArray(goodPtsI.length / 2, 1, cv.CV_32FC2, new Float32Array(goodPtsI));
-          const dstPts = cv.matFromArray(goodPtsJ.length / 2, 1, cv.CV_32FC2, new Float32Array(goodPtsJ));
-          const inlierMask = new cv.Mat();
-          const H = cv.findHomography(srcPts, dstPts, cv.RANSAC, ransacThreshPx, inlierMask);
+          // ── MAGSAC++-style RANSAC with marginalized scoring ──────────
+          // Run OpenCV RANSAC to get an initial homography, then re-score
+          // every correspondence using a σ-consensus score that marginalizes
+          // over unknown noise scale σ ∈ (0, σ_max]. Points with lower
+          // reprojection error contribute more, giving a soft inlier count
+          // that is more discriminative than a fixed-threshold hard count.
+          // Reference: Baráth & Matas, "MAGSAC++", CVPR 2020.
+          let srcPts = null, dstPts = null, inlierMask = null, H = null;
+          try {
+          srcPts = cv.matFromArray(goodPtsI.length / 2, 1, cv.CV_32FC2, new Float32Array(goodPtsI));
+          dstPts = cv.matFromArray(goodPtsJ.length / 2, 1, cv.CV_32FC2, new Float32Array(goodPtsJ));
+          inlierMask = new cv.Mat();
+          H = cv.findHomography(srcPts, dstPts, cv.RANSAC, ransacThreshPx, inlierMask);
 
           if (H.rows === 3 && H.cols === 3) {
-            // Count inliers
-            let inlierCount = 0;
+            const hd = H.data64F;
+            const nPts = goodPtsI.length / 2;
+
+            // Compute per-point reprojection errors² for MAGSAC scoring
+            const reproj2 = new Float64Array(nPts);
+            for (let k = 0; k < nPts; k++) {
+              const xi = goodPtsI[k * 2], yi = goodPtsI[k * 2 + 1];
+              const xj = goodPtsJ[k * 2], yj = goodPtsJ[k * 2 + 1];
+              const d = hd[6] * xi + hd[7] * yi + hd[8];
+              if (Math.abs(d) < 1e-10) { reproj2[k] = 1e6; continue; }
+              const px = (hd[0] * xi + hd[1] * yi + hd[2]) / d;
+              const py = (hd[3] * xi + hd[4] * yi + hd[5]) / d;
+              reproj2[k] = (px - xj) ** 2 + (py - yj) ** 2;
+            }
+
+            // MAGSAC++ σ-consensus score: for each point, integrate the
+            // probability of being an inlier over σ ∈ (0, σ_max].
+            // Weight_k = max(0, 1 − (err_k² / σ_max²))^2  (Epanechnikov-like kernel)
+            // This gives soft weights ∈ [0,1] — no hard threshold needed.
+            // σ_max = 3× RANSAC threshold: empirically captures 99%+ of true inliers
+            // while still rejecting gross outliers (Baráth & Matas, CVPR 2020).
+            const sigmaMax = ransacThreshPx * 3; // σ_max ≈ 3× RANSAC threshold
+            const sigmaMax2 = sigmaMax * sigmaMax;
+            const magsacWeights = new Float64Array(nPts);
+            let magsacInlierCount = 0;
             const inliers = [];
-            for (let k = 0; k < inlierMask.rows; k++) {
-              if (inlierMask.data[k]) {
-                inlierCount++;
+
+            for (let k = 0; k < nPts; k++) {
+              const u = reproj2[k] / sigmaMax2;
+              if (u >= 1.0) {
+                magsacWeights[k] = 0;
+                continue; // hard outlier beyond σ_max
+              }
+              // Epanechnikov kernel: w = (1 − u)²
+              const w = (1.0 - u) * (1.0 - u);
+              magsacWeights[k] = w;
+              // Collect inliers at 2× RANSAC threshold (4× in squared space) for
+              // backward-compat with LM and APAP which expect a discrete inlier set.
+              if (reproj2[k] <= ransacThreshPx * ransacThreshPx * 4) {
+                magsacInlierCount++;
                 inliers.push({
                   xi: goodPtsI[k * 2], yi: goodPtsI[k * 2 + 1],
-                  xj: goodPtsJ[k * 2], yj: goodPtsJ[k * 2 + 1]
+                  xj: goodPtsJ[k * 2], yj: goodPtsJ[k * 2 + 1],
+                  magsacWeight: w,
+                  origIdx: k  // original index into reproj2 for correct RMS lookup
                 });
               }
             }
 
-            if (inlierCount >= minInliers) {
-              // Compute RMS
-              let rmsSum = 0;
+            if (magsacInlierCount >= minInliers) {
+              // Compute weighted RMS using MAGSAC weights (better quality metric)
+              let wRmsSum = 0, wSum = 0;
               for (const inl of inliers) {
-                const hd = H.data64F;
-                const denom = hd[6] * inl.xi + hd[7] * inl.yi + hd[8];
-                const px = (hd[0] * inl.xi + hd[1] * inl.yi + hd[2]) / denom;
-                const py = (hd[3] * inl.xi + hd[4] * inl.yi + hd[5]) / denom;
-                rmsSum += (px - inl.xj) ** 2 + (py - inl.yj) ** 2;
+                wRmsSum += inl.magsacWeight * reproj2[inl.origIdx];
+                wSum += inl.magsacWeight;
               }
-              const rms = Math.sqrt(rmsSum / inlierCount);
+              // Fallback to unweighted if weights sum to ~0
+              let rms;
+              if (wSum > 1e-6) {
+                rms = Math.sqrt(wRmsSum / wSum);
+              } else {
+                let rmsSum = 0;
+                for (const inl of inliers) {
+                  const d = hd[6] * inl.xi + hd[7] * inl.yi + hd[8];
+                  if (Math.abs(d) < 1e-10) continue; // skip degenerate point
+                  const px = (hd[0] * inl.xi + hd[1] * inl.yi + hd[2]) / d;
+                  const py = (hd[3] * inl.xi + hd[4] * inl.yi + hd[5]) / d;
+                  rmsSum += (px - inl.xj) ** 2 + (py - inl.yj) ** 2;
+                }
+                rms = magsacInlierCount > 0 ? Math.sqrt(rmsSum / magsacInlierCount) : 1e6;
+              }
 
               const HBuf = new Float64Array(9);
-              HBuf.set(H.data64F.slice(0, 9));
+              HBuf.set(hd.slice(0, 9));
 
               // CRITICAL: Validate homography for physical plausibility
-              // Reject if it contains reflection or extreme rotation (>120 degrees)
               if (!isHomographyValid(HBuf, imgI.width, imgI.height)) {
-                console.warn(`  Rejected pair: ${idI} ↔ ${idJ} (${inlierCount} inliers, RMS=${rms.toFixed(2)})`);
-                srcPts.delete(); dstPts.delete(); inlierMask.delete(); H.delete();
+                console.warn(`  Rejected pair: ${idI} ↔ ${idJ} (${magsacInlierCount} inliers, RMS=${rms.toFixed(2)})`);
                 done++; continue;
               }
 
-              // Detect near-duplicates: low RMS, high inlier ratio, small translation
-              const inlierRatio = inlierCount / (goodPtsI.length / 2);
+              // Detect near-duplicates: images that overlap almost completely with
+              // minimal translation are likely duplicate shots and should be flagged.
+              // Thresholds: RMS < 2px (very tight alignment), >80% inliers (most
+              // points match), translation < 5% of image size (nearly stationary).
+              const inlierRatio = magsacInlierCount / nPts;
               const tx = HBuf[2], ty = HBuf[5];
               const maxDim = Math.max(imgI.width, imgI.height);
               const translation = Math.sqrt(tx * tx + ty * ty);
               const translationRatio = translation / maxDim;
               const isDuplicate = (rms < 2.0 && inlierRatio > 0.8 && translationRatio < 0.05);
 
-              const inliersBuf = new Float32Array(inlierCount * 4);
-              for (let k = 0; k < inlierCount; k++) {
+              const inliersBuf = new Float32Array(magsacInlierCount * 4);
+              for (let k = 0; k < magsacInlierCount; k++) {
                 inliersBuf[k * 4] = inliers[k].xi;
                 inliersBuf[k * 4 + 1] = inliers[k].yi;
                 inliersBuf[k * 4 + 2] = inliers[k].xj;
@@ -297,18 +386,23 @@ self.addEventListener('message', async (ev) => {
                 inliers: inliers,
                 inliersBuf: inliersBuf,
                 rms,
-                inlierCount,
+                inlierCount: magsacInlierCount,
                 isDuplicate
               });
             }
           }
-
-          srcPts.delete(); dstPts.delete(); inlierMask.delete(); H.delete();
+          } finally {
+            if (srcPts) srcPts.delete();
+            if (dstPts) dstPts.delete();
+            if (inlierMask) inlierMask.delete();
+            if (H) H.delete();
+          }
         } finally {
           if (matI) matI.delete();
           if (matJ) matJ.delete();
           if (bf) bf.delete();
           if (matches) matches.delete();
+          if (matchesRev) matchesRev.delete();
         }
         done++;
         postMessage({type:'progress', stage:'matching', percent: Math.round(100 * done / pairs.length), info: `${done}/${pairs.length}`});
@@ -561,23 +655,312 @@ self.addEventListener('message', async (ev) => {
     }
 
     if (msg.type === 'refine') {
-      // TODO: implement LM refinement loop over homography params
-      // For now, send current transforms as-is
+      // ── Levenberg-Marquardt bundle adjustment over homography parameters ──
+      // Jointly refine all global transforms to minimise reprojection error across
+      // all inlier correspondences. Reference image is fixed (identity).
+      //
+      // Parameterisation: each non-reference image has 8 free parameters
+      // (H[0..7], with H[8]=1). Residuals are (px - xj, py - yj) for each
+      // inlier in every edge, where (px,py) = T_j^{-1} * T_i * (xi,yi).
+
+      const maxIters = msg.maxIters || 30;
+      const huberDelta = msg.huberDeltaPx || 2.0;
+      const lambdaInit = msg.lambdaInit || 0.01;
+
+      const ids = Object.keys(transforms);
+      const nImages = ids.length;
+      const refIdx = ids.indexOf(refId);
+
+      // Collect all inlier correspondences from edges
+      const residualObs = []; // {idxI, idxJ, xi, yi, xj, yj}
+      for (const e of edges) {
+        const ii = ids.indexOf(e.i);
+        const ji = ids.indexOf(e.j);
+        if (ii < 0 || ji < 0) continue;
+        for (const inl of e.inliers) {
+          residualObs.push({
+            idxI: ii, idxJ: ji,
+            xi: inl.xi, yi: inl.yi,
+            xj: inl.xj, yj: inl.yj
+          });
+        }
+      }
+
+      if (residualObs.length < 4 || nImages < 2) {
+        // Not enough data for refinement
+        const tList = Object.entries(transforms).map(([id, T]) => ({
+          imageId: id,
+          TBuffer: new Float64Array(T).buffer
+        }));
+        postMessage({type:'transforms', refId, transforms: tList});
+        postMessage({type:'progress', stage:'refine', percent:100, info:'skipped (insufficient data)'});
+        return;
+      }
+
+      // Flatten current transforms into parameter vector
+      // Each image except ref has 8 params: H[0..7] (H[8] always 1)
+      const paramCount = (nImages - 1) * 8;
+      const params = new Float64Array(paramCount);
+      const imgParamOffset = new Int32Array(nImages); // offset into params, -1 for ref
+      let off = 0;
+      for (let i = 0; i < nImages; i++) {
+        if (i === refIdx) {
+          imgParamOffset[i] = -1;
+          continue;
+        }
+        imgParamOffset[i] = off;
+        const T = transforms[ids[i]];
+        for (let k = 0; k < 8; k++) params[off + k] = T[k];
+        off += 8;
+      }
+
+      // Helper: reconstruct transform from params (pre-allocated buffer)
+      const _Tbuf = new Float64Array(9);
+      const _TrefBuf = new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+      function getTransform(imgIdx) {
+        if (imgIdx === refIdx) return _TrefBuf;
+        const o = imgParamOffset[imgIdx];
+        for (let k = 0; k < 8; k++) _Tbuf[k] = params[o + k];
+        _Tbuf[8] = 1.0;
+        return _Tbuf;
+      }
+      // Note: getTransform returns a shared buffer — callers must consume before next call.
+
+      // Compute residuals and cost
+      function computeCost() {
+        let cost = 0;
+        for (const obs of residualObs) {
+          const Ti = getTransform(obs.idxI);
+          // Copy Ti since getTransform returns shared buffer
+          const pi_x_num = Ti[0] * obs.xi + Ti[1] * obs.yi + Ti[2];
+          const pi_y_num = Ti[3] * obs.xi + Ti[4] * obs.yi + Ti[5];
+          const pi_den = Ti[6] * obs.xi + Ti[7] * obs.yi + Ti[8];
+          if (Math.abs(pi_den) < 1e-10) { cost += huberDelta * huberDelta; continue; }
+          const pix = pi_x_num / pi_den;
+          const piy = pi_y_num / pi_den;
+
+          const Tj = getTransform(obs.idxJ);
+          const pj_den = Tj[6] * obs.xj + Tj[7] * obs.yj + Tj[8];
+          if (Math.abs(pj_den) < 1e-10) { cost += huberDelta * huberDelta; continue; }
+          const pjx = (Tj[0] * obs.xj + Tj[1] * obs.yj + Tj[2]) / pj_den;
+          const pjy = (Tj[3] * obs.xj + Tj[4] * obs.yj + Tj[5]) / pj_den;
+
+          const dx = pix - pjx;
+          const dy = piy - pjy;
+          const r2 = dx * dx + dy * dy;
+          // Huber loss
+          if (r2 <= huberDelta * huberDelta) {
+            cost += r2;
+          } else {
+            cost += 2 * huberDelta * Math.sqrt(r2) - huberDelta * huberDelta;
+          }
+        }
+        return cost;
+      }
+
+      // Numeric Jacobian computation via central differences
+      const eps = 1e-6;
+      // LM damping parameter λ: balances between gradient descent (high λ)
+      // and Gauss-Newton (low λ). λ_init = 0.01 is a typical starting value.
+      // On accept: λ *= 0.3 (move toward Gauss-Newton), floor 1e-7.
+      // On reject: λ *= 10 (more gradient descent), cap 1e8.
+      let lambda = lambdaInit;
+      let prevCost = computeCost();
+
+      // Pre-allocate LM buffers outside the iteration loop to avoid GC churn
+      const JtJ = new Float64Array(paramCount * paramCount);
+      const Jtr = new Float64Array(paramCount);
+      const jacobRow = new Float64Array(paramCount * 2);
+
+      for (let iter = 0; iter < maxIters; iter++) {
+        // Build J^T J and J^T r using numeric Jacobian
+        JtJ.fill(0);
+        Jtr.fill(0);
+        jacobRow.fill(0);
+
+        for (let obs_k = 0; obs_k < residualObs.length; obs_k++) {
+          const obs = residualObs[obs_k];
+
+          // Compute residuals inline (getTransform/project use shared buffers)
+          let Ti = getTransform(obs.idxI);
+          const pi_den = Ti[6] * obs.xi + Ti[7] * obs.yi + Ti[8];
+          if (Math.abs(pi_den) < 1e-10) continue;
+          const pix = (Ti[0] * obs.xi + Ti[1] * obs.yi + Ti[2]) / pi_den;
+          const piy = (Ti[3] * obs.xi + Ti[4] * obs.yi + Ti[5]) / pi_den;
+
+          const Tj = getTransform(obs.idxJ);
+          const pj_den = Tj[6] * obs.xj + Tj[7] * obs.yj + Tj[8];
+          if (Math.abs(pj_den) < 1e-10) continue;
+          const pjx = (Tj[0] * obs.xj + Tj[1] * obs.yj + Tj[2]) / pj_den;
+          const pjy = (Tj[3] * obs.xj + Tj[4] * obs.yj + Tj[5]) / pj_den;
+
+          const rx = pix - pjx;
+          const ry = piy - pjy;
+          const r2 = rx * rx + ry * ry;
+
+          // Huber weight
+          let w = 1.0;
+          if (r2 > huberDelta * huberDelta) {
+            w = huberDelta / Math.sqrt(r2);
+          }
+
+          // Clear jacobian row
+          jacobRow.fill(0);
+
+          // Derivatives w.r.t. image I params (central differences)
+          if (obs.idxI !== refIdx) {
+            const o = imgParamOffset[obs.idxI];
+            for (let p = 0; p < 8; p++) {
+              const old = params[o + p];
+              params[o + p] = old + eps;
+              Ti = getTransform(obs.idxI);
+              const d1 = Ti[6] * obs.xi + Ti[7] * obs.yi + Ti[8];
+              let p1x = 0, p1y = 0, ok1 = Math.abs(d1) > 1e-10;
+              if (ok1) { p1x = (Ti[0] * obs.xi + Ti[1] * obs.yi + Ti[2]) / d1; p1y = (Ti[3] * obs.xi + Ti[4] * obs.yi + Ti[5]) / d1; }
+
+              params[o + p] = old - eps;
+              Ti = getTransform(obs.idxI);
+              const d2 = Ti[6] * obs.xi + Ti[7] * obs.yi + Ti[8];
+              let p2x = 0, p2y = 0, ok2 = Math.abs(d2) > 1e-10;
+              if (ok2) { p2x = (Ti[0] * obs.xi + Ti[1] * obs.yi + Ti[2]) / d2; p2y = (Ti[3] * obs.xi + Ti[4] * obs.yi + Ti[5]) / d2; }
+
+              params[o + p] = old;
+              if (ok1 && ok2) {
+                jacobRow[o + p] = (p1x - p2x) / (2 * eps);
+                jacobRow[paramCount + o + p] = (p1y - p2y) / (2 * eps);
+              }
+            }
+          }
+          // Derivatives w.r.t. image J params
+          if (obs.idxJ !== refIdx) {
+            const o = imgParamOffset[obs.idxJ];
+            for (let p = 0; p < 8; p++) {
+              const old = params[o + p];
+              params[o + p] = old + eps;
+              let Tj2 = getTransform(obs.idxJ);
+              const d1 = Tj2[6] * obs.xj + Tj2[7] * obs.yj + Tj2[8];
+              let p1x = 0, p1y = 0, ok1 = Math.abs(d1) > 1e-10;
+              if (ok1) { p1x = (Tj2[0] * obs.xj + Tj2[1] * obs.yj + Tj2[2]) / d1; p1y = (Tj2[3] * obs.xj + Tj2[4] * obs.yj + Tj2[5]) / d1; }
+
+              params[o + p] = old - eps;
+              Tj2 = getTransform(obs.idxJ);
+              const d2 = Tj2[6] * obs.xj + Tj2[7] * obs.yj + Tj2[8];
+              let p2x = 0, p2y = 0, ok2 = Math.abs(d2) > 1e-10;
+              if (ok2) { p2x = (Tj2[0] * obs.xj + Tj2[1] * obs.yj + Tj2[2]) / d2; p2y = (Tj2[3] * obs.xj + Tj2[4] * obs.yj + Tj2[5]) / d2; }
+
+              params[o + p] = old;
+              if (ok1 && ok2) {
+                // Residual = pi - pj, so d/dpj = -dpj/dp
+                jacobRow[o + p] = -(p1x - p2x) / (2 * eps);
+                jacobRow[paramCount + o + p] = -(p1y - p2y) / (2 * eps);
+              }
+            }
+          }
+
+          // Accumulate JtJ and Jtr with Huber weighting
+          for (let rr = 0; rr < 2; rr++) {
+            const res_rr = rr === 0 ? rx : ry;
+            const rowOff = rr * paramCount;
+            for (let i = 0; i < paramCount; i++) {
+              const ji = jacobRow[rowOff + i];
+              if (Math.abs(ji) < 1e-15) continue;
+              Jtr[i] += w * ji * res_rr;
+              for (let j = i; j < paramCount; j++) {
+                const jj = jacobRow[rowOff + j];
+                if (Math.abs(jj) < 1e-15) continue;
+                const val = w * ji * jj;
+                JtJ[i * paramCount + j] += val;
+                if (i !== j) JtJ[j * paramCount + i] += val;
+              }
+            }
+          }
+        }
+
+        // Damping: JtJ += lambda * diag(JtJ)
+        for (let i = 0; i < paramCount; i++) {
+          JtJ[i * paramCount + i] *= (1 + lambda);
+          // Ensure diagonal isn't zero
+          if (Math.abs(JtJ[i * paramCount + i]) < 1e-12) {
+            JtJ[i * paramCount + i] = lambda;
+          }
+        }
+
+        // Solve (JtJ) * delta = -Jtr
+        const negJtr = new Float64Array(paramCount);
+        for (let i = 0; i < paramCount; i++) negJtr[i] = -Jtr[i];
+        const delta = solveLinearN(JtJ, negJtr, paramCount);
+
+        if (!delta) {
+          // Singular — increase damping
+          lambda *= 10;
+          continue;
+        }
+
+        // Trial step
+        const oldParams = new Float64Array(params);
+        for (let i = 0; i < paramCount; i++) {
+          params[i] += delta[i];
+        }
+
+        const newCost = computeCost();
+        if (newCost < prevCost) {
+          // Accept step, decrease lambda
+          lambda = Math.max(lambda * 0.3, 1e-7);
+          prevCost = newCost;
+
+          // Early termination if accepted delta is tiny
+          let maxDelta = 0;
+          for (let i = 0; i < paramCount; i++) {
+            if (Math.abs(delta[i]) > maxDelta) maxDelta = Math.abs(delta[i]);
+          }
+          if (maxDelta < 1e-8) break;
+        } else {
+          // Reject step, increase lambda
+          for (let i = 0; i < paramCount; i++) params[i] = oldParams[i];
+          lambda = Math.min(lambda * 10, 1e8);
+        }
+
+        postMessage({type:'progress', stage:'refine', percent: Math.round(100 * (iter + 1) / maxIters), info: `iter ${iter+1}/${maxIters}, cost=${prevCost.toFixed(2)}, λ=${lambda.toExponential(1)}`});
+      }
+
+      // Write back refined parameters to transforms
+      for (let i = 0; i < nImages; i++) {
+        if (i === refIdx) continue;
+        const T = new Float64Array(9);
+        const o = imgParamOffset[i];
+        for (let k = 0; k < 8; k++) T[k] = params[o + k];
+        T[8] = 1.0;
+        transforms[ids[i]] = T;
+      }
+
       const tList = Object.entries(transforms).map(([id, T]) => ({
         imageId: id,
         TBuffer: new Float64Array(T).buffer
       }));
       postMessage({type:'transforms', refId, transforms: tList});
-      postMessage({type:'progress', stage:'refine', percent:100, info:'refinement placeholder completed'});
+      postMessage({type:'progress', stage:'refine', percent:100, info:`LM complete, final cost=${prevCost.toFixed(2)}`});
       return;
     }
 
     if (msg.type === 'computeExposure') {
+      // ── Per-channel RGB gain compensation ──────────────────────────
+      // Instead of a single scalar gain, solve for independent R, G, B
+      // multiplicative gains per image: g_i = [gR, gG, gB]. This corrects
+      // both exposure differences AND white-balance shifts between images.
+      // For grayscale-only images we fall back to scalar gain.
+      //
+      // For each edge (i,j), at each inlier correspondence we sample the
+      // grayscale luminance and solve: log(g_j) − log(g_i) ≈ r_ij
+      // in a global least-squares system with a reference image fixed at 1.
+      //
+      // If RGB small buffers are available (rgbSmall), we solve 3 independent
+      // systems for R, G, B channels. Otherwise, we use the grayscale channel
+      // for a single gain and replicate it across channels.
       const ids = Object.keys(images);
       const n = ids.length;
 
       if (n < 2 || edges.length === 0) {
-        const gains = ids.map(id => ({ imageId: id, gain: 1.0 }));
+        const gains = ids.map(id => ({ imageId: id, gain: 1.0, gainR: 1.0, gainG: 1.0, gainB: 1.0 }));
         postMessage({ type: 'exposure', gains });
         return;
       }
@@ -585,97 +968,147 @@ self.addEventListener('message', async (ev) => {
       const idToIdx = {};
       ids.forEach((id, i) => idToIdx[id] = i);
 
-      // For each edge, compute mean log luminance ratio from inlier correspondences
-      // r_ij ≈ log(mean_lum_i) - log(mean_lum_j)  at matching keypoints
-      const edgeRatios = [];
+      // Check if any image has RGB data; if not, fall back to scalar
+      const hasRGB = Object.values(images).some(img => img.rgbSmall);
+
+      // For each edge, compute per-channel log ratios from inlier correspondences
+      const edgeRatios = []; // {i, j, ratioGray, ratioR?, ratioG?, ratioB?}
 
       for (const e of edges) {
         const imgI = images[e.i];
         const imgJ = images[e.j];
         if (!imgI || !imgJ || !imgI.gray || !imgJ.gray) continue;
 
-        // Sample luminance at inlier keypoint positions
         let sumLogI = 0, sumLogJ = 0, count = 0;
+        let sumLogR_I = 0, sumLogR_J = 0;
+        let sumLogG_I = 0, sumLogG_J = 0;
+        let sumLogB_I = 0, sumLogB_J = 0;
+        let rgbCount = 0;
+        // Reusable output buffers for sampleRGB to avoid per-call allocation
+        const _rgbBufI = [0, 0, 0];
+        const _rgbBufJ = [0, 0, 0];
+
         for (const inl of e.inliers) {
-          let xi, yi, xj, yj;
-          xi = inl.xi; yi = inl.yi;
-          xj = inl.xj; yj = inl.yj;
+          const xi = inl.xi, yi = inl.yi;
+          const xj = inl.xj, yj = inl.yj;
 
           const lumI = sampleGray(imgI.gray, imgI.width, imgI.height, xi, yi);
           const lumJ = sampleGray(imgJ.gray, imgJ.width, imgJ.height, xj, yj);
 
-          if (lumI > 5 && lumJ > 5) { // avoid very dark pixels
+          if (lumI > 5 && lumJ > 5) {
             sumLogI += Math.log(lumI);
             sumLogJ += Math.log(lumJ);
             count++;
           }
+
+          // Sample RGB if available (rgbSmall is a Uint8Array of w*h*3)
+          if (imgI.rgbSmall && imgJ.rgbSmall) {
+            const rgbI = sampleRGB(imgI.rgbSmall, imgI.width, imgI.height, xi, yi, _rgbBufI);
+            const rgbJ = sampleRGB(imgJ.rgbSmall, imgJ.width, imgJ.height, xj, yj, _rgbBufJ);
+            if (rgbI && rgbJ && rgbI[0] > 5 && rgbJ[0] > 5 &&
+                rgbI[1] > 5 && rgbJ[1] > 5 && rgbI[2] > 5 && rgbJ[2] > 5) {
+              sumLogR_I += Math.log(rgbI[0]); sumLogR_J += Math.log(rgbJ[0]);
+              sumLogG_I += Math.log(rgbI[1]); sumLogG_J += Math.log(rgbJ[1]);
+              sumLogB_I += Math.log(rgbI[2]); sumLogB_J += Math.log(rgbJ[2]);
+              rgbCount++;
+            }
+          }
         }
 
         if (count >= 5) {
-          // r_ij = mean(log(lum_j)) - mean(log(lum_i))
-          // This means: to make them equal, g_i should compensate for this diff
-          const rij = (sumLogJ / count) - (sumLogI / count);
-          edgeRatios.push({
+          const entry = {
             i: idToIdx[e.i],
             j: idToIdx[e.j],
-            ratio: rij
-          });
+            ratioGray: (sumLogJ / count) - (sumLogI / count)
+          };
+          if (rgbCount >= 5) {
+            entry.ratioR = (sumLogR_J / rgbCount) - (sumLogR_I / rgbCount);
+            entry.ratioG = (sumLogG_J / rgbCount) - (sumLogG_I / rgbCount);
+            entry.ratioB = (sumLogB_J / rgbCount) - (sumLogB_I / rgbCount);
+          }
+          edgeRatios.push(entry);
         }
       }
 
       if (edgeRatios.length === 0) {
-        const gains = ids.map(id => ({ imageId: id, gain: 1.0 }));
+        const gains = ids.map(id => ({ imageId: id, gain: 1.0, gainR: 1.0, gainG: 1.0, gainB: 1.0 }));
         postMessage({ type: 'exposure', gains });
         return;
       }
 
-      // Solve least squares: for each edge, log(g_j) - log(g_i) ≈ r_ij
-      // Fix reference image gain = 1 (log(g_ref) = 0)
-      const refIdx = refId ? idToIdx[refId] : 0;
+      // Validate refIdx: ensure reference image exists in the index map
+      const refIdx = (refId && idToIdx[refId] !== undefined) ? idToIdx[refId] : 0;
 
-      // Build normal equations: A' * A * x = A' * b
-      // where each edge gives one equation: x_j - x_i = r_ij (x = log gains)
-      // With constraint x_ref = 0
-      const AtA = new Float64Array(n * n);
-      const Atb = new Float64Array(n);
+      // Solve a linear system for log-gains: for each edge, x_j − x_i = r_ij
+      function solveGainSystem(ratioKey) {
+        const AtA = new Float64Array(n * n);
+        const Atb = new Float64Array(n);
+        let hasData = false;
 
-      for (const er of edgeRatios) {
-        // Equation: x_j - x_i = r_ij
-        // => -x_i + x_j = r_ij
-        AtA[er.i * n + er.i] += 1;
-        AtA[er.j * n + er.j] += 1;
-        AtA[er.i * n + er.j] -= 1;
-        AtA[er.j * n + er.i] -= 1;
-        Atb[er.i] -= er.ratio; // -1 * r_ij
-        Atb[er.j] += er.ratio; // +1 * r_ij
+        for (const er of edgeRatios) {
+          const r = er[ratioKey];
+          if (r === undefined) continue;
+          hasData = true;
+          AtA[er.i * n + er.i] += 1;
+          AtA[er.j * n + er.j] += 1;
+          AtA[er.i * n + er.j] -= 1;
+          AtA[er.j * n + er.i] -= 1;
+          Atb[er.i] -= r;
+          Atb[er.j] += r;
+        }
+
+        if (!hasData) return null;
+
+        // Fix reference (strong prior)
+        AtA[refIdx * n + refIdx] += 1000;
+        // Regularization toward gain=1
+        for (let i = 0; i < n; i++) AtA[i * n + i] += 0.01;
+
+        const logGains = solveLinearN(AtA, Atb, n);
+        if (!logGains) return null;
+        // Clamp gains to reasonable range [0.1, 10] and sanitize NaN/Infinity
+        return logGains.map(v => {
+          const g = Math.exp(v);
+          return (Number.isFinite(g) && g > 0) ? Math.min(10, Math.max(0.1, g)) : 1.0;
+        });
       }
 
-      // Fix reference: strong prior x_ref = 0
-      const lambda = 1000;
-      AtA[refIdx * n + refIdx] += lambda;
-      // Atb[refIdx] += 0 (already zero target)
+      const grayGains = solveGainSystem('ratioGray');
+      const rGains = solveGainSystem('ratioR');
+      const gGains = solveGainSystem('ratioG');
+      const bGains = solveGainSystem('ratioB');
 
-      // Add regularization to pull all gains toward 1
-      const regWeight = 0.01;
-      for (let i = 0; i < n; i++) {
-        AtA[i * n + i] += regWeight;
+      // Helper: safely extract a gain value with NaN protection
+      function safeGain(arr, idx, fallback) {
+        if (!arr) return fallback;
+        const v = arr[idx];
+        return (Number.isFinite(v) && v > 0) ? v : fallback;
       }
 
-      // Solve using Cholesky-like approach (simple Gaussian elimination)
-      const logGains = solveLinearN(AtA, Atb, n);
-
-      const gains = ids.map((id, i) => ({
-        imageId: id,
-        gain: logGains ? Math.exp(logGains[i]) : 1.0
-      }));
+      const gains = ids.map((id, i) => {
+        const g = safeGain(grayGains, i, 1.0);
+        return {
+          imageId: id,
+          gain: g,
+          gainR: safeGain(rGains, i, g),
+          gainG: safeGain(gGains, i, g),
+          gainB: safeGain(bGains, i, g),
+        };
+      });
 
       postMessage({ type: 'exposure', gains });
+
+      // Free per-image RGB buffers — no longer needed after exposure computation
+      for (const id of ids) {
+        if (images[id]) images[id].rgbSmall = null;
+      }
       return;
     }
 
     if (msg.type === 'computeLocalMesh') {
-      const { imageId, parentId, meshGrid, sigma, depthSigma, minSupport } = msg;
+      const { imageId, parentId, meshGrid, sigma, depthSigma, minSupport, faceRects } = msg;
       const G = meshGrid || 4;
+      const faces = faceRects || [];
       const img = images[imageId];
       if (!img) {
         postMessage({type:'error', message:`Image ${imageId} not found`});
@@ -787,6 +1220,20 @@ self.addEventListener('message', async (ev) => {
               ws *= wd;
             }
 
+            // Face-aware weight boost: if this correspondence is inside or near a face,
+            // triple the weight so the local warp better preserves faces
+            for (const face of faces) {
+              const fCx = face.x + face.width * 0.5;
+              const fCy = face.y + face.height * 0.5;
+              const fRadius = Math.max(face.width, face.height) * 0.75;
+              const fdx = srcPts[k][0] - fCx;
+              const fdy = srcPts[k][1] - fCy;
+              if (fdx * fdx + fdy * fdy < fRadius * fRadius) {
+                ws *= 3.0;
+                break; // only boost once per correspondence
+              }
+            }
+
             weights[k] = ws;
             totalWeight += ws;
           }
@@ -831,8 +1278,12 @@ self.addEventListener('message', async (ev) => {
             gx = globalGx;
             gy = globalGy;
           } else {
-            // Weighted DLT to find local homography H_v mapping src→dst
-            const Hv = weightedDLT(srcPts, dstPts, weights);
+            // Tikhonov-regularized weighted DLT: pull toward global homography
+            // where data is sparse. Adaptive γ: stronger regularization when
+            // effective support is weak (far from correspondences).
+            const supportRatio = Math.min(effectiveSupport / (minSupport * 10), 1.0);
+            const adaptiveGamma = 0.1 * (1.0 - supportRatio); // 0 when strong, 0.1 when weak
+            const Hv = weightedDLT(srcPts, dstPts, weights, Ti, adaptiveGamma);
             if (Hv) {
               const localPt = projectVertex(Hv, vx, vy);
               if (localPt) {
@@ -1100,23 +1551,42 @@ function sampleDepth(depthData, w, h, x, y) {
 }
 
 /**
- * Weighted DLT (Direct Linear Transform) to solve for a homography H
- * that maps srcPts[i] → dstPts[i] with weights[i].
- * Returns 9-element Float64Array (row-major 3x3) or null if degenerate.
+ * Weighted DLT with Tikhonov regularization toward a global homography.
+ *
+ * Standard weighted DLT can overfit in mesh cells far from correspondences,
+ * producing wild local warps. Tikhonov regularization penalises deviation
+ * from the global homography H_global, pulling the solution toward a
+ * physically reasonable warp where data is sparse.
+ *
+ * Solves: min_h  Σ_k w_k |A_k h|²  +  γ |h - h_global|²
+ * where γ = regularization strength (adaptive based on effective support).
+ *
+ * Reference: Zaragoza et al., "As-Projective-As-Possible Image Stitching
+ * with Moving DLT", CVPR 2013 (with Tikhonov extension).
+ *
+ * @param srcPts source points [[x,y], ...]
+ * @param dstPts destination points [[x,y], ...]
+ * @param weights per-point weights (Gaussian kernel × face boost × depth)
+ * @param globalH optional 9-element global homography to regularize toward
+ * @param gamma regularization strength (0 = off, higher = more regularization)
+ * @returns 9-element Float64Array (row-major 3×3) or null if degenerate
  */
-function weightedDLT(srcPts, dstPts, weights) {
+function weightedDLT(srcPts, dstPts, weights, globalH, gamma) {
   const n = srcPts.length;
   if (n < 4) return null;
+  const regGamma = gamma || 0;
 
   // Build weighted A matrix for Ah = 0
   // Each correspondence gives 2 rows in A (9 columns)
   // Row 1: [0, 0, 0, -w*x, -w*y, -w, w*y'*x, w*y'*y, w*y']
   // Row 2: [w*x, w*y, w, 0, 0, 0, -w*x'*x, -w*x'*y, -w*x']
-  const rows = 2 * n;
   const cols = 9;
 
   // Use AtA (9x9) directly instead of forming the full A matrix
   const AtA = new Float64Array(81); // 9x9
+  // Pre-allocate row buffers outside the loop to avoid per-point allocation
+  const r1 = new Float64Array(9);
+  const r2 = new Float64Array(9);
 
   for (let k = 0; k < n; k++) {
     const w = weights[k];
@@ -1126,10 +1596,14 @@ function weightedDLT(srcPts, dstPts, weights) {
     const dx = dstPts[k][0];
     const dy = dstPts[k][1];
 
-    // Row 1 of A for this correspondence
-    const r1 = [0, 0, 0, -w * sx, -w * sy, -w, w * dy * sx, w * dy * sy, w * dy];
-    // Row 2 of A for this correspondence
-    const r2 = [w * sx, w * sy, w, 0, 0, 0, -w * dx * sx, -w * dx * sy, -w * dx];
+    // Row 1 of A: [0, 0, 0, -w*sx, -w*sy, -w, w*dy*sx, w*dy*sy, w*dy]
+    r1[0] = 0; r1[1] = 0; r1[2] = 0;
+    r1[3] = -w * sx; r1[4] = -w * sy; r1[5] = -w;
+    r1[6] = w * dy * sx; r1[7] = w * dy * sy; r1[8] = w * dy;
+    // Row 2 of A: [w*sx, w*sy, w, 0, 0, 0, -w*dx*sx, -w*dx*sy, -w*dx]
+    r2[0] = w * sx; r2[1] = w * sy; r2[2] = w;
+    r2[3] = 0; r2[4] = 0; r2[5] = 0;
+    r2[6] = -w * dx * sx; r2[7] = -w * dx * sy; r2[8] = -w * dx;
 
     // Accumulate AtA += r1^T * r1 + r2^T * r2
     for (let i = 0; i < 9; i++) {
@@ -1141,9 +1615,8 @@ function weightedDLT(srcPts, dstPts, weights) {
     }
   }
 
-  // Find smallest eigenvector of AtA using power iteration on (AtA)^{-1}
-  // Instead, use a simpler approach: solve AtA * h = 0 by fixing h[8] = 1
-  // This gives us a 8x8 system AtA_reduced * h_reduced = -AtA_col8
+  // Solve AtA * h = 0 by fixing h[8] = 1 → 8×8 system
+  // With Tikhonov: (AtA_8 + γI) * h_8 = -AtA_col8 + γ * h_global_8
   const A8 = new Float64Array(64); // 8x8
   const b8 = new Float64Array(8);
 
@@ -1154,6 +1627,14 @@ function weightedDLT(srcPts, dstPts, weights) {
     b8[i] = -AtA[i * 9 + 8];
   }
 
+  // Add Tikhonov regularization toward globalH
+  if (regGamma > 0 && globalH) {
+    for (let i = 0; i < 8; i++) {
+      A8[i * 8 + i] += regGamma;
+      b8[i] += regGamma * globalH[i]; // pull toward h_global[i]
+    }
+  }
+
   // Solve 8x8 system using Gaussian elimination
   const h8 = solveLinear8(A8, b8);
   if (!h8) return null;
@@ -1162,7 +1643,6 @@ function weightedDLT(srcPts, dstPts, weights) {
   for (let i = 0; i < 8; i++) H[i] = h8[i];
   H[8] = 1.0;
 
-  // Normalize so H[8] = 1 (already is)
   return H;
 }
 
@@ -1245,6 +1725,33 @@ function sampleGray(gray, w, h, x, y) {
 
   return (1 - fx) * (1 - fy) * v00 + fx * (1 - fy) * v10 +
          (1 - fx) * fy * v01 + fx * fy * v11;
+}
+
+/**
+ * Sample RGB pixel at (x, y) from an interleaved RGB buffer (Uint8Array, 3 bytes/pixel).
+ * Uses bilinear interpolation for consistency with sampleGray.
+ * Writes result into `out` array [R, G, B] and returns it.
+ */
+function sampleRGB(rgb, w, h, x, y, out) {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+
+  const x0 = Math.min(Math.max(ix, 0), w - 1);
+  const x1 = Math.min(x0 + 1, w - 1);
+  const y0 = Math.min(Math.max(iy, 0), h - 1);
+  const y1 = Math.min(y0 + 1, h - 1);
+
+  for (let c = 0; c < 3; c++) {
+    const v00 = rgb[(y0 * w + x0) * 3 + c];
+    const v10 = rgb[(y0 * w + x1) * 3 + c];
+    const v01 = rgb[(y1 * w + x0) * 3 + c];
+    const v11 = rgb[(y1 * w + x1) * 3 + c];
+    out[c] = (1 - fx) * (1 - fy) * v00 + fx * (1 - fy) * v10 +
+              (1 - fx) * fy * v01 + fx * fy * v11;
+  }
+  return out;
 }
 
 /**

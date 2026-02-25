@@ -18,6 +18,7 @@ export {
   featherMask,
   createMaskTexture,
   type Compositor,
+  type FaceRectComposite,
 } from './composition';
 export {
   createPyramidBlender,

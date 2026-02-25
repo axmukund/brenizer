@@ -73,6 +73,21 @@ void main() {
 }
 `;
 
+// ── Laplacian float: no bias needed for RGBA16F ──────
+
+const LAPLACIAN_FLOAT_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_current;
+uniform sampler2D u_upsampled;
+out vec4 fragColor;
+void main() {
+  vec4 cur = texture(u_current, v_uv);
+  vec4 up = texture(u_upsampled, v_uv);
+  fragColor = vec4(cur.rgb - up.rgb, cur.a);
+}
+`;
+
 // ── Blend Laplacian levels ───────────────────────────────
 
 const BLEND_LAP_FRAG = `#version 300 es
@@ -109,6 +124,21 @@ void main() {
 }
 `;
 
+// ── Reconstruct float: no bias undo for RGBA16F ─────
+
+const RECONSTRUCT_FLOAT_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_laplacian;
+uniform sampler2D u_upsampled;
+out vec4 fragColor;
+void main() {
+  vec4 lap = texture(u_laplacian, v_uv);
+  vec4 up = texture(u_upsampled, v_uv);
+  fragColor = vec4(up.rgb + lap.rgb, lap.a);
+}
+`;
+
 // ── Types ────────────────────────────────────────────────
 
 interface PyramidLevel {
@@ -137,13 +167,20 @@ export interface PyramidBlender {
   dispose(): void;
 }
 
-export function createPyramidBlender(gl: WebGL2RenderingContext): PyramidBlender {
-  // Compile all shaders
+/**
+ * Create a GPU-accelerated Laplacian pyramid blender.
+ * @param useFloat When true, intermediate Laplacian levels use RGBA16F textures.
+ *                 This avoids 8-bit clamping artefacts in the detail bands,
+ *                 producing smoother transitions at the cost of more VRAM.
+ *                 Falls back to RGBA8 if the extension is unavailable.
+ */
+export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boolean = false): PyramidBlender {
+  // Compile all shaders — pick float variants when available
   const downsampleProg = createProgram(gl, FS_VERT, DOWNSAMPLE_FRAG);
   const upsampleProg = createProgram(gl, FS_VERT, UPSAMPLE_FRAG);
-  const laplacianProg = createProgram(gl, FS_VERT, LAPLACIAN_FRAG);
+  const laplacianProg = createProgram(gl, FS_VERT, useFloat ? LAPLACIAN_FLOAT_FRAG : LAPLACIAN_FRAG);
   const blendLapProg = createProgram(gl, FS_VERT, BLEND_LAP_FRAG);
-  const reconstructProg = createProgram(gl, FS_VERT, RECONSTRUCT_FRAG);
+  const reconstructProg = createProgram(gl, FS_VERT, useFloat ? RECONSTRUCT_FLOAT_FRAG : RECONSTRUCT_FRAG);
 
   // Uniform locations
   const dsLoc = {
@@ -182,6 +219,15 @@ export function createPyramidBlender(gl: WebGL2RenderingContext): PyramidBlender
     const tex = createEmptyTexture(gl, w, h);
     const fbo = createFBO(gl, tex.texture);
     return { tex, fbo, w, h };
+  }
+
+  function createLapLevel(w: number, h: number): PyramidLevel {
+    if (useFloat) {
+      const tex = createEmptyTexture(gl, w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT);
+      const fbo = createFBO(gl, tex.texture);
+      return { tex, fbo, w, h };
+    }
+    return createLevel(w, h);
   }
 
   function freeLevel(level: PyramidLevel) {
@@ -264,7 +310,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext): PyramidBlender
       upsample(next.tex.texture, upsampled.fbo.fbo, cur.w, cur.h);
 
       // Compute Laplacian: current - upsampled
-      const lapLevel = createLevel(cur.w, cur.h);
+      const lapLevel = createLapLevel(cur.w, cur.h);
       gl.bindFramebuffer(gl.FRAMEBUFFER, lapLevel.fbo.fbo);
       gl.viewport(0, 0, cur.w, cur.h);
       gl.useProgram(laplacianProg);
@@ -297,22 +343,22 @@ export function createPyramidBlender(gl: WebGL2RenderingContext): PyramidBlender
       numLevels = Math.max(2, Math.min(numLevels, 7));
       gl.disable(gl.BLEND);
 
-      // Build Gaussian pyramids
+      // ── Phase 1: Build Gaussian pyramids for both images and mask ──
       const gaussComp = buildGaussianPyramid(compositeTex, width, height, numLevels);
       const gaussNew = buildGaussianPyramid(newImageTex, width, height, numLevels);
       const gaussMask = buildGaussianPyramid(maskTex, width, height, numLevels);
 
-      // Build Laplacian pyramids
+      // ── Phase 2: Build Laplacian pyramids (band-pass detail) ──
       const lapComp = buildLaplacianPyramid(gaussComp);
       const lapNew = buildLaplacianPyramid(gaussNew);
 
-      // Blend Laplacian levels using mask
+      // ── Phase 3: Blend Laplacian levels using downsampled mask ──
       const lapBlended: PyramidLevel[] = [];
       for (let i = 0; i < numLevels; i++) {
         const lc = lapComp[i];
         const ln = lapNew[i];
         const m = gaussMask[i];
-        const blended = createLevel(lc.w, lc.h);
+        const blended = createLapLevel(lc.w, lc.h);
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, blended.fbo.fbo);
         gl.viewport(0, 0, lc.w, lc.h);
@@ -334,7 +380,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext): PyramidBlender
         lapBlended.push(blended);
       }
 
-      // Reconstruct from blended Laplacian pyramid
+      // ── Phase 4: Reconstruct from blended Laplacian pyramid ──
       // Start from lowest level (residual) and work up
       let current = lapBlended[numLevels - 1]; // residual is already a full image
       for (let i = numLevels - 2; i >= 0; i--) {
@@ -343,11 +389,12 @@ export function createPyramidBlender(gl: WebGL2RenderingContext): PyramidBlender
         const targetH = lapLevel.h;
 
         // Upsample current to lapLevel size
-        const upsampled = createLevel(targetW, targetH);
+        const upsampled = createLapLevel(targetW, targetH);
         upsample(current.tex.texture, upsampled.fbo.fbo, targetW, targetH);
 
         // Reconstruct: upsampled + laplacian_detail
-        const result = createLevel(targetW, targetH);
+        // Use float for intermediate levels; final level (i==0) writes to RGBA8 output
+        const result = (i > 0) ? createLapLevel(targetW, targetH) : createLevel(targetW, targetH);
         gl.bindFramebuffer(gl.FRAMEBUFFER, result.fbo.fbo);
         gl.viewport(0, 0, targetW, targetH);
         gl.useProgram(reconstructProg);

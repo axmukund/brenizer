@@ -11,6 +11,15 @@ import { setStatus, startProgress, endProgress, updateProgress } from './ui';
 
 let workerManager: WorkerManager | null = null;
 
+/** A detected face rectangle in alignment-scale image coordinates. */
+export interface FaceRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  confidence: number;
+}
+
 /** Per-image feature data received from cv-worker. */
 export interface ImageFeatures {
   imageId: string;
@@ -32,6 +41,7 @@ export interface MatchEdge {
   inliers: Float32Array; // [xi, yi, xj, yj, ...]
   rms: number;
   inlierCount: number;
+  isDuplicate: boolean;
 }
 let lastEdges: MatchEdge[] = [];
 
@@ -94,10 +104,16 @@ export function getLastMeshes(): Map<string, APAPMesh> {
   return lastMeshes;
 }
 
-/** Per-image exposure gains (scalar multiplier applied to RGB). */
-let lastGains: Map<string, number> = new Map();
+/** Per-image exposure gains — scalar fallback plus optional per-channel RGB. */
+export interface ExposureGain {
+  gain: number;
+  gainR: number;
+  gainG: number;
+  gainB: number;
+}
+let lastGains: Map<string, ExposureGain> = new Map();
 
-export function getLastGains(): Map<string, number> {
+export function getLastGains(): Map<string, ExposureGain> {
   return lastGains;
 }
 
@@ -128,6 +144,13 @@ export function getLastCompositeBounds(): CompositeBounds | null {
   return lastCompositeBounds;
 }
 
+/** Per-image face detection results. */
+let lastFaces: Map<string, FaceRect[]> = new Map();
+
+export function getLastFaces(): Map<string, FaceRect[]> {
+  return lastFaces;
+}
+
 export function getWorkerManager(): WorkerManager | null {
   return workerManager;
 }
@@ -155,13 +178,13 @@ export async function initWorkers(): Promise<{ cv: boolean; depth: boolean; seam
 }
 
 /**
- * Decode an image file to grayscale at the alignment scale.
- * Returns { gray, width, height, scaleFactor }.
+ * Decode an image file to grayscale (and small RGB) at the alignment scale.
+ * Returns { gray, rgbSmall, width, height, scaleFactor }.
  */
 async function imageToGray(
   entry: ImageEntry,
   alignScale: number,
-): Promise<{ gray: Uint8ClampedArray; width: number; height: number; scaleFactor: number }> {
+): Promise<{ gray: Uint8ClampedArray; rgbSmall: Uint8ClampedArray; width: number; height: number; scaleFactor: number }> {
   const bmp = await createImageBitmap(entry.file);
   const origW = bmp.width;
   const origH = bmp.height;
@@ -181,22 +204,68 @@ async function imageToGray(
   const imgData = ctx.getImageData(0, 0, w, h);
   const rgba = imgData.data;
 
+  // Extract RGB (3-channel) for per-channel exposure compensation
+  const rgbSmall = new Uint8ClampedArray(w * h * 3);
   // Convert to grayscale (luminance)
   const gray = new Uint8ClampedArray(w * h);
   for (let i = 0; i < w * h; i++) {
     const r = rgba[i * 4];
     const g = rgba[i * 4 + 1];
     const b = rgba[i * 4 + 2];
+    rgbSmall[i * 3] = r;
+    rgbSmall[i * 3 + 1] = g;
+    rgbSmall[i * 3 + 2] = b;
     gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
   }
 
-  return { gray, width: w, height: h, scaleFactor };
+  return { gray, rgbSmall, width: w, height: h, scaleFactor };
+}
+
+/**
+ * Detect faces in an image at alignment scale using the Shape Detection API
+ * (Chrome 70+). Falls back gracefully to empty array on unsupported browsers.
+ */
+async function detectFaces(
+  entry: ImageEntry,
+  scaleFactor: number,
+): Promise<FaceRect[]> {
+  try {
+    // @ts-ignore — FaceDetector is a Chrome Shape Detection API not in TS lib
+    if (typeof FaceDetector === 'undefined') return [];
+    // @ts-ignore — same; TS lacks FaceDetector constructor typings
+    const detector = new FaceDetector({ fastMode: true, maxDetectedFaces: 20 });
+    const bmp = await createImageBitmap(entry.file);
+    const origW = bmp.width;
+    const origH = bmp.height;
+    const w = Math.round(origW * scaleFactor);
+    const h = Math.round(origH * scaleFactor);
+    // Resize for faster detection
+    const offscreen = new OffscreenCanvas(w, h);
+    const ctx = offscreen.getContext('2d')!;
+    ctx.drawImage(bmp, 0, 0, w, h);
+    bmp.close();
+    // Race detect against a timeout — FaceDetector can hang in headless/SW-rendered Chrome
+    const timeoutMs = 10000;
+    const faces = await Promise.race([
+      detector.detect(offscreen),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('FaceDetector timeout')), timeoutMs)),
+    ]);
+    return faces.map((f: any) => ({
+      x: f.boundingBox.x,
+      y: f.boundingBox.y,
+      width: f.boundingBox.width,
+      height: f.boundingBox.height,
+      confidence: 1.0,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /** Run the full stitch preview pipeline. */
 export async function runStitchPreview(): Promise<void> {
   const { images, settings } = getState();
-  const active = images.filter(i => !i.excluded);
+  let active = images.filter(i => !i.excluded);
 
   if (active.length < 2) {
     setStatus('Need at least 2 images to stitch.');
@@ -222,9 +291,10 @@ export async function runStitchPreview(): Promise<void> {
     { name: 'init', weight: 5 },
     { name: 'sendImages', weight: 2 },
     { name: 'features', weight: 15 },
+    { name: 'faces', weight: 3 },
     { name: 'matching', weight: 25 },
     { name: 'mst', weight: 2 },
-    { name: 'refine', weight: 2 },
+    { name: 'refine', weight: 5 },
     { name: 'exposure', weight: 3 },
     { name: 'apap', weight: 10 },
   ]);
@@ -247,11 +317,17 @@ export async function runStitchPreview(): Promise<void> {
   updateProgress('sendImages', 0);
 
   // Clear old images from worker state
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => { unsub(); reject(new Error('Timeout waiting for clearImages')); }, 15000);
     const unsub = workerManager!.onCV((msg) => {
       if (msg.type === 'progress' && msg.stage === 'clearImages') {
+        clearTimeout(timer);
         unsub();
         resolve();
+      } else if (msg.type === 'error') {
+        clearTimeout(timer);
+        unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
       }
     });
     workerManager!.sendCV({ type: 'clearImages' });
@@ -262,15 +338,22 @@ export async function runStitchPreview(): Promise<void> {
   for (let i = 0; i < active.length; i++) {
     const img = active[i];
     setStatus(`Preparing image ${i + 1}/${active.length}: ${img.name}`);
-    const { gray, width, height, scaleFactor } = await imageToGray(img, settings.alignScale);
+    const { gray, rgbSmall, width, height, scaleFactor } = await imageToGray(img, settings.alignScale);
     scaleFactors[img.id] = scaleFactor;
     const buf = gray.buffer as ArrayBuffer;
+    const rgbBuf = rgbSmall.buffer as ArrayBuffer;
     // Send and wait for ack
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { unsub(); reject(new Error(`Timeout waiting for addImage ack: ${img.name}`)); }, 30000);
       const unsub = workerManager!.onCV((msg) => {
         if (msg.type === 'progress' && msg.stage === 'addImage' && msg.info?.includes(img.id)) {
+          clearTimeout(timer);
           unsub();
           resolve();
+        } else if (msg.type === 'error') {
+          clearTimeout(timer);
+          unsub();
+          reject(new Error((msg as any).message || 'Worker error'));
         }
       });
       workerManager!.sendCV(
@@ -278,10 +361,11 @@ export async function runStitchPreview(): Promise<void> {
           type: 'addImage',
           imageId: img.id,
           grayBuffer: buf,
+          rgbSmallBuffer: rgbBuf,
           width,
           height,
         },
-        [buf],
+        [buf, rgbBuf],
       );
     });
     updateProgress('sendImages', (i + 1) / active.length);
@@ -296,12 +380,21 @@ export async function runStitchPreview(): Promise<void> {
   for (const img of active) {
     featurePromises.set(
       img.id,
-      new Promise<CVFeaturesMsg>((resolve) => {
+      new Promise<CVFeaturesMsg>((resolve, reject) => {
         let unsub: (() => void) | null = null;
+        const timer = setTimeout(() => {
+          if (unsub) unsub();
+          reject(new Error(`Timeout waiting for features of ${img.name}`));
+        }, 60000);
         const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
           if (msg.type === 'features' && msg.imageId === img.id) {
+            clearTimeout(timer);
             if (unsub) unsub();
             resolve(msg as CVFeaturesMsg);
+          } else if (msg.type === 'error') {
+            clearTimeout(timer);
+            if (unsub) unsub();
+            reject(new Error((msg as any).message || 'Feature extraction failed'));
           }
         };
         unsub = workerManager!.onCV(handler);
@@ -340,6 +433,25 @@ export async function runStitchPreview(): Promise<void> {
   // Dispatch custom event so main.ts can draw keypoint overlay
   window.dispatchEvent(new CustomEvent('features-ready'));
 
+  // Step 3b: Face detection (browser Shape Detection API)
+  lastFaces = new Map();
+  setStatus('Detecting faces…');
+  updateProgress('faces', 0);
+  for (let i = 0; i < active.length; i++) {
+    const img = active[i];
+    const sf = scaleFactors[img.id];
+    const faces = await detectFaces(img, sf);
+    if (faces.length > 0) {
+      lastFaces.set(img.id, faces);
+    }
+    updateProgress('faces', (i + 1) / active.length);
+  }
+  const totalFaces = Array.from(lastFaces.values()).reduce((s, f) => s + f.length, 0);
+  if (totalFaces > 0) {
+    setStatus(`Detected ${totalFaces} face(s) across ${lastFaces.size} image(s).`);
+  }
+  updateProgress('faces', 1);
+
   // Step 4: Match pairs — knnMatch + ratio test + RANSAC homography
   setStatus('Matching image pairs (0%)…');
   updateProgress('matching', 0);
@@ -355,11 +467,14 @@ export async function runStitchPreview(): Promise<void> {
 
   const edgesPromise = new Promise<CVEdgesMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for matchGraph edges')); }, 120000);
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'edges') {
+        clearTimeout(timer);
         if (unsub) unsub();
         resolve(msg as CVEdgesMsg);
       } else if (msg.type === 'error') {
+        clearTimeout(timer);
         if (unsub) unsub();
         reject(new Error((msg as any).message || 'Worker error'));
       }
@@ -376,8 +491,12 @@ export async function runStitchPreview(): Promise<void> {
     matchAllPairs: settings.matchAllPairs,
   });
 
-  const edgesMsg = await edgesPromise;
-  matchProgressUnsub(); // stop listening for matching progress
+  let edgesMsg: CVEdgesMsg;
+  try {
+    edgesMsg = await edgesPromise;
+  } finally {
+    matchProgressUnsub(); // always clean up the progress listener
+  }
   updateProgress('matching', 1);
   lastEdges = edgesMsg.edges.map((e: CVEdge) => ({
     i: e.i,
@@ -410,7 +529,11 @@ export async function runStitchPreview(): Promise<void> {
         toExclude.has(img.id) ? { ...img, excluded: true } : img
       );
       setState({ images: updated });
-      setStatus(`Excluded ${toExclude.size} near-duplicate image(s). ${active.length - toExclude.size} remain.`);
+      // Recompute active array to exclude duplicates from subsequent pipeline stages
+      active = updated.filter(i => !i.excluded);
+      // Also remove excluded edges
+      lastEdges = lastEdges.filter(e => !toExclude.has(e.i) && !toExclude.has(e.j));
+      setStatus(`Excluded ${toExclude.size} near-duplicate image(s). ${active.length} remain.`);
     }
   }
 
@@ -435,11 +558,14 @@ export async function runStitchPreview(): Promise<void> {
   // We also need the follow-up transforms message
   const transformsPromise = new Promise<CVTransformsMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for initial transforms')); }, 30000);
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'transforms') {
+        clearTimeout(timer);
         if (unsub) unsub();
         resolve(msg as CVTransformsMsg);
       } else if (msg.type === 'error') {
+        clearTimeout(timer);
         if (unsub) unsub();
         reject(new Error((msg as any).message || 'Worker error'));
       }
@@ -466,17 +592,20 @@ export async function runStitchPreview(): Promise<void> {
   }
   updateProgress('mst', 1);
 
-  // Step 6: Refine transforms (LM — placeholder for now, sends back same transforms)
+  // Step 6: Refine transforms via Levenberg-Marquardt bundle adjustment
   setStatus('Refining transforms…');
   updateProgress('refine', 0);
 
   const refineTransformPromise = new Promise<CVTransformsMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for refine transforms')); }, 60000);
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'transforms') {
+        clearTimeout(timer);
         if (unsub) unsub();
         resolve(msg as CVTransformsMsg);
       } else if (msg.type === 'error') {
+        clearTimeout(timer);
         if (unsub) unsub();
         reject(new Error((msg as any).message || 'Worker error'));
       }
@@ -508,11 +637,14 @@ export async function runStitchPreview(): Promise<void> {
 
     const exposurePromise = new Promise<CVExposureMsg>((resolve, reject) => {
       let unsub: (() => void) | null = null;
+      const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for exposure gains')); }, 30000);
       const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
         if (msg.type === 'exposure') {
+          clearTimeout(timer);
           if (unsub) unsub();
           resolve(msg as CVExposureMsg);
         } else if (msg.type === 'error') {
+          clearTimeout(timer);
           if (unsub) unsub();
           reject(new Error((msg as any).message || 'Worker error'));
         }
@@ -524,11 +656,16 @@ export async function runStitchPreview(): Promise<void> {
 
     const exposureMsg = await exposurePromise;
     for (const g of exposureMsg.gains) {
-      lastGains.set(g.imageId, g.gain);
+      lastGains.set(g.imageId, {
+        gain: g.gain,
+        gainR: g.gainR ?? g.gain,
+        gainG: g.gainG ?? g.gain,
+        gainB: g.gainB ?? g.gain,
+      });
     }
 
     const gainStr = exposureMsg.gains.map(g => `${g.gain.toFixed(3)}`).join(', ');
-    setStatus(`Exposure gains computed.`);
+    setStatus(`Exposure gains: [${gainStr}]`);
   }
   updateProgress('exposure', 1);
 
@@ -616,11 +753,14 @@ export async function runStitchPreview(): Promise<void> {
 
       const meshPromise = new Promise<CVMeshMsg>((resolve, reject) => {
         let unsub: (() => void) | null = null;
+        const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error(`Timeout waiting for mesh: ${nodeId}`)); }, 30000);
         const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
           if (msg.type === 'mesh' && msg.imageId === nodeId) {
+            clearTimeout(timer);
             if (unsub) unsub();
             resolve(msg as CVMeshMsg);
           } else if (msg.type === 'error') {
+            clearTimeout(timer);
             if (unsub) unsub();
             reject(new Error((msg as any).message || 'Worker error'));
           }
@@ -636,6 +776,7 @@ export async function runStitchPreview(): Promise<void> {
         sigma: 100,       // spatial sigma in alignment pixels
         depthSigma: 0.1,  // depth sigma (normalized)
         minSupport: 4,
+        faceRects: lastFaces.get(nodeId) || [],
       });
 
       const meshMsg = await meshPromise;
@@ -669,6 +810,9 @@ export async function runStitchPreview(): Promise<void> {
     setState({ pipelineStatus: 'error' });
     endProgress();
   } finally {
-    setState({ pipelineStatus: 'idle' });
+    // Only reset to idle if still running (don't override 'error' state)
+    if (getState().pipelineStatus === 'running') {
+      setState({ pipelineStatus: 'idle' });
+    }
   }
 }
