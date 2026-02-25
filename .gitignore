@@ -1,3 +1,3 @@
 dist/
 public/opencv/opencv.js
-node_modules/.vite/
+node_modules/

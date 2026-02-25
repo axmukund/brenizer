@@ -1,5 +1,7 @@
 import { getState, setState, subscribe, type ImageEntry } from './appState';
 import { capsSummary, type Capabilities } from './capabilities';
+import heic2any from 'heic2any';
+import UTIF from 'utif';
 
 // Lazy import to avoid circular dep — set by main.ts
 let _renderImagePreview: ((entry: ImageEntry) => Promise<void>) | null = null;
@@ -14,15 +16,88 @@ let nextId = 1;
 function genId(): string { return `img-${nextId++}`; }
 
 // ── file import ──────────────────────────────────────────
-const VALID_TYPES = new Set(['image/jpeg', 'image/png']);
+const VALID_TYPES = new Set(['image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/x-adobe-dng', 'image/dng']);
+
+/**
+ * Convert HEIC/HEIF/DNG files to JPEG.
+ * Returns a Blob suitable for createImageBitmap, or null if conversion fails.
+ */
+async function convertToJpeg(file: File): Promise<Blob | null> {
+  const type = file.type.toLowerCase();
+  const name = file.name.toLowerCase();
+
+  // HEIC/HEIF conversion using heic2any
+  if (type === 'image/heic' || type === 'image/heif' || name.endsWith('.heic') || name.endsWith('.heif')) {
+    try {
+      const result = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.95 });
+      return Array.isArray(result) ? result[0] : result;
+    } catch (err) {
+      console.error('HEIC conversion failed:', err);
+      return null;
+    }
+  }
+
+  // DNG conversion: extract embedded JPEG preview
+  if (type === 'image/x-adobe-dng' || type === 'image/dng' || name.endsWith('.dng')) {
+    try {
+      const buffer = await file.arrayBuffer();
+      const ifds = UTIF.decode(buffer);
+      
+      // Find the largest JPEG preview (usually IFD with compression 7)
+      let bestIfd = null;
+      let bestSize = 0;
+      
+      for (const ifd of ifds) {
+        // Compression 7 = JPEG
+        const compression = ifd.t259;
+        if (compression && Array.isArray(compression) && compression[0] === 7) {
+          const size = (ifd.width || 0) * (ifd.height || 0);
+          if (size > bestSize) {
+            bestSize = size;
+            bestIfd = ifd;
+          }
+        }
+      }
+
+      if (bestIfd) {
+        // Extract JPEG data from the IFD
+        const offsetTag = bestIfd.t513;  // StripOffsets or JPEGInterchangeFormat
+        const lengthTag = bestIfd.t514;  // StripByteCounts or JPEGInterchangeFormatLength
+        const offset = (offsetTag && Array.isArray(offsetTag)) ? Number(offsetTag[0]) : 0;
+        const length = (lengthTag && Array.isArray(lengthTag)) ? Number(lengthTag[0]) : 0;
+        
+        if (offset && length) {
+          const jpegData = buffer.slice(offset, offset + length);
+          return new Blob([jpegData], { type: 'image/jpeg' });
+        }
+      }
+      
+      console.error('No JPEG preview found in DNG file');
+      return null;
+    } catch (err) {
+      console.error('DNG conversion failed:', err);
+      return null;
+    }
+  }
+
+  return null;
+}
 
 async function importFiles(files: FileList | File[]): Promise<void> {
   const st = getState();
   const maxImages = st.settings?.maxImages ?? 25;
-  const arr = Array.from(files).filter(f => VALID_TYPES.has(f.type));
+  
+  // Accept files if they have valid MIME type OR valid extension
+  const arr = Array.from(files).filter(f => {
+    const hasValidType = VALID_TYPES.has(f.type);
+    const name = f.name.toLowerCase();
+    const hasValidExt = name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.png') || 
+                        name.endsWith('.heic') || name.endsWith('.heif') || name.endsWith('.dng');
+    return hasValidType || hasValidExt;
+  });
 
   if (arr.length === 0) {
-    setStatus('No valid JPG/PNG files selected.');
+    setStatus('No valid image files selected (JPG/PNG/HEIC/DNG).');
     return;
   }
 
@@ -33,14 +108,28 @@ async function importFiles(files: FileList | File[]): Promise<void> {
 
   const toAdd = arr.slice(0, maxImages - st.images.length);
   const newEntries: ImageEntry[] = [];
+  let convertedCount = 0;
 
   for (const file of toAdd) {
     try {
-      const bmp = await createImageBitmap(file);
+      let sourceBlob: Blob | File = file;
+      
+      // Try to convert HEIC/DNG files to JPEG
+      const converted = await convertToJpeg(file);
+      if (converted) {
+        sourceBlob = converted;
+        convertedCount++;
+      }
+      
+      const bmp = await createImageBitmap(sourceBlob);
       const thumbUrl = makeThumb(bmp, 96);
+      
+      // Store original file for reference, but use converted blob if available
+      const storedFile = converted ? new File([converted], file.name.replace(/\.(heic|heif|dng)$/i, '.jpg'), { type: 'image/jpeg' }) : file;
+      
       newEntries.push({
         id: genId(),
-        file,
+        file: storedFile,
         name: file.name,
         width: bmp.width,
         height: bmp.height,
@@ -48,13 +137,16 @@ async function importFiles(files: FileList | File[]): Promise<void> {
         excluded: false,
       });
       bmp.close();
-    } catch {
-      console.warn('Failed to decode', file.name);
+    } catch (err) {
+      console.warn('Failed to decode', file.name, err);
     }
   }
 
   setState({ images: [...st.images, ...newEntries] });
-  setStatus(`${newEntries.length} image(s) added.`);
+  const msg = convertedCount > 0 
+    ? `${newEntries.length} image(s) added (${convertedCount} converted from HEIC/DNG).`
+    : `${newEntries.length} image(s) added.`;
+  setStatus(msg);
 }
 
 function makeThumb(bmp: ImageBitmap, maxDim: number): string {
@@ -82,7 +174,7 @@ function renderImageList(): void {
     const el = document.createElement('div');
     el.className = 'empty-state';
     el.id = 'empty-state';
-    el.textContent = 'Drop or upload JPG/PNG images to begin';
+    el.innerHTML = 'Drop or upload images to begin<br/><span style="font-size:11px; color:var(--text-dim);">JPG, PNG, HEIC, DNG</span>';
     list.appendChild(el);
     return;
   }
