@@ -7,7 +7,7 @@ import { createWorkerManager, type WorkerManager } from './workers/workerManager
 import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
-import { setStatus } from './ui';
+import { setStatus, startProgress, endProgress, updateProgress } from './ui';
 
 let workerManager: WorkerManager | null = null;
 
@@ -217,17 +217,34 @@ export async function runStitchPreview(): Promise<void> {
   setState({ pipelineStatus: 'running' });
   setStatus('Starting pipeline…');
 
+  // Set up progress tracking with weighted stages
+  startProgress([
+    { name: 'init', weight: 5 },
+    { name: 'sendImages', weight: 2 },
+    { name: 'features', weight: 15 },
+    { name: 'matching', weight: 25 },
+    { name: 'mst', weight: 2 },
+    { name: 'refine', weight: 2 },
+    { name: 'exposure', weight: 3 },
+    { name: 'apap', weight: 10 },
+  ]);
+
   try {
 
   // Step 1: Init workers
+  setStatus('Initializing OpenCV worker…');
+  updateProgress('init', 0);
   const ready = await initWorkers();
+  updateProgress('init', 1);
   if (!ready.cv) {
     setStatus('CV worker failed to initialize. Cannot stitch.');
     setState({ pipelineStatus: 'error' });
+    endProgress();
     return;
   }
 
-  setStatus('Extracting features…');
+  setStatus('Preparing images…');
+  updateProgress('sendImages', 0);
 
   // Clear old images from worker state
   await new Promise<void>((resolve) => {
@@ -242,7 +259,9 @@ export async function runStitchPreview(): Promise<void> {
 
   // Step 2: Convert images to grayscale and send to cv-worker
   const scaleFactors: Record<string, number> = {};
-  for (const img of active) {
+  for (let i = 0; i < active.length; i++) {
+    const img = active[i];
+    setStatus(`Preparing image ${i + 1}/${active.length}: ${img.name}`);
     const { gray, width, height, scaleFactor } = await imageToGray(img, settings.alignScale);
     scaleFactors[img.id] = scaleFactor;
     const buf = gray.buffer as ArrayBuffer;
@@ -265,9 +284,13 @@ export async function runStitchPreview(): Promise<void> {
         [buf],
       );
     });
+    updateProgress('sendImages', (i + 1) / active.length);
   }
 
   // Step 3: Compute features (ORB)
+  setStatus(`Extracting features (0/${active.length})…`);
+  updateProgress('features', 0);
+
   // Collect features messages as they arrive
   const featurePromises = new Map<string, Promise<CVFeaturesMsg>>();
   for (const img of active) {
@@ -293,6 +316,7 @@ export async function runStitchPreview(): Promise<void> {
 
   // Wait for all features
   lastFeatures = new Map();
+  let featIdx = 0;
   for (const img of active) {
     const featMsg = await featurePromises.get(img.id)!;
     lastFeatures.set(img.id, {
@@ -302,8 +326,10 @@ export async function runStitchPreview(): Promise<void> {
       descCols: featMsg.descCols,
       scaleFactor: scaleFactors[img.id],
     });
+    featIdx++;
     const numKp = new Float32Array(featMsg.keypointsBuffer).length / 2;
-    setStatus(`Features: ${img.name} — ${numKp} keypoints`);
+    setStatus(`Features: ${img.name} — ${numKp} keypoints (${featIdx}/${active.length})`);
+    updateProgress('features', featIdx / active.length);
   }
 
   const totalKp = Array.from(lastFeatures.values()).reduce(
@@ -315,7 +341,17 @@ export async function runStitchPreview(): Promise<void> {
   window.dispatchEvent(new CustomEvent('features-ready'));
 
   // Step 4: Match pairs — knnMatch + ratio test + RANSAC homography
-  setStatus('Matching image pairs…');
+  setStatus('Matching image pairs (0%)…');
+  updateProgress('matching', 0);
+
+  // Listen for matching progress from worker
+  const matchProgressUnsub = workerManager!.onCV((msg) => {
+    if (msg.type === 'progress' && msg.stage === 'matching' && msg.percent !== undefined) {
+      const pct = msg.percent;
+      setStatus(`Matching image pairs (${pct}%)…`);
+      updateProgress('matching', pct / 100);
+    }
+  });
 
   const edgesPromise = new Promise<CVEdgesMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
@@ -341,6 +377,8 @@ export async function runStitchPreview(): Promise<void> {
   });
 
   const edgesMsg = await edgesPromise;
+  matchProgressUnsub(); // stop listening for matching progress
+  updateProgress('matching', 1);
   lastEdges = edgesMsg.edges.map((e: CVEdge) => ({
     i: e.i,
     j: e.j,
@@ -379,6 +417,7 @@ export async function runStitchPreview(): Promise<void> {
   if (lastEdges.length === 0) {
     setStatus('No matching pairs found. Try adding more overlapping images.');
     setState({ pipelineStatus: 'idle' });
+    endProgress();
     return;
   }
 
@@ -389,7 +428,8 @@ export async function runStitchPreview(): Promise<void> {
   window.dispatchEvent(new CustomEvent('edges-ready'));
 
   // Step 5: Build MST and compute initial global transforms
-  setStatus('Building MST and initial transforms…');
+  setStatus('Building alignment graph…');
+  updateProgress('mst', 0);
 
   const mstPromise = workerManager!.waitCV('mst', 15000);
   // We also need the follow-up transforms message
@@ -413,7 +453,8 @@ export async function runStitchPreview(): Promise<void> {
   lastRefId = mstMsg.refId;
   lastMstOrder = mstMsg.order;
   lastMstParent = mstMsg.parent;
-  setStatus(`MST built — ref: ${active.find(i => i.id === lastRefId)?.name ?? lastRefId}, order: ${lastMstOrder.length} images`);
+  setStatus(`Alignment graph built — ref: ${active.find(i => i.id === lastRefId)?.name ?? lastRefId}, ${lastMstOrder.length} images`);
+  updateProgress('mst', 0.5);
 
   const transformsMsg = await transformsPromise;
   lastTransforms = new Map();
@@ -423,9 +464,11 @@ export async function runStitchPreview(): Promise<void> {
       T: new Float64Array(t.TBuffer),
     });
   }
+  updateProgress('mst', 1);
 
   // Step 6: Refine transforms (LM — placeholder for now, sends back same transforms)
   setStatus('Refining transforms…');
+  updateProgress('refine', 0);
 
   const refineTransformPromise = new Promise<CVTransformsMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
@@ -455,11 +498,13 @@ export async function runStitchPreview(): Promise<void> {
       T: new Float64Array(t.TBuffer),
     });
   }
+  updateProgress('refine', 1);
 
   // Step 6b: Exposure compensation (per-image scalar gain)
   lastGains = new Map();
   if (settings.exposureComp) {
     setStatus('Computing exposure gains…');
+    updateProgress('exposure', 0);
 
     const exposurePromise = new Promise<CVExposureMsg>((resolve, reject) => {
       let unsub: (() => void) | null = null;
@@ -483,8 +528,9 @@ export async function runStitchPreview(): Promise<void> {
     }
 
     const gainStr = exposureMsg.gains.map(g => `${g.gain.toFixed(3)}`).join(', ');
-    setStatus(`Exposure gains: [${gainStr}]`);
+    setStatus(`Exposure gains computed.`);
   }
+  updateProgress('exposure', 1);
 
   // Step 7: Depth inference (optional, best-effort)
   lastDepthMaps = new Map();
@@ -534,7 +580,8 @@ export async function runStitchPreview(): Promise<void> {
   // Step 8: APAP local mesh computation (if meshGrid > 0)
   lastMeshes = new Map();
   if (settings.meshGrid > 0 && lastMstOrder.length > 0) {
-    setStatus('Computing APAP local meshes…');
+    setStatus('Computing adaptive meshes (0%)…');
+    updateProgress('apap', 0);
 
     // Send depth data to cv-worker for mesh weighting (via addImage with depth)
     // The depth data was already ingested can be passed as part of computeLocalMesh msg depth field
@@ -600,12 +647,17 @@ export async function runStitchPreview(): Promise<void> {
         bounds: meshMsg.bounds,
       });
 
-      setStatus(`APAP mesh: ${idx + 1}/${lastMstOrder.length - 1}`);
+      const meshTotal = lastMstOrder.length - 1;
+      const meshPct = Math.round(((idx + 1) / meshTotal) * 100);
+      setStatus(`Computing adaptive meshes (${meshPct}%) — ${idx + 1}/${meshTotal}`);
+      updateProgress('apap', (idx + 1) / meshTotal);
     }
 
-    setStatus(`APAP meshes computed for ${lastMeshes.size} images.`);
+    setStatus(`Adaptive meshes computed for ${lastMeshes.size} images.`);
   }
+  updateProgress('apap', 1);
 
+  endProgress();
   setStatus(`Pipeline complete — ${active.length} images aligned.`);
 
   // Dispatch event so main.ts can render warped preview
@@ -615,6 +667,7 @@ export async function runStitchPreview(): Promise<void> {
     console.error('Pipeline error:', err);
     setStatus(`Pipeline error: ${err instanceof Error ? err.message : String(err)}`);
     setState({ pipelineStatus: 'error' });
+    endProgress();
   } finally {
     setState({ pipelineStatus: 'idle' });
   }

@@ -286,9 +286,94 @@ function renderCapabilities(caps: Capabilities): void {
   });
 }
 
-// ── status ───────────────────────────────────────────────
+// ── status & progress ────────────────────────────────────
+let _pipelineStart = 0;
+let _stageWeights: Record<string, number> = {};
+let _stageOrder: string[] = [];
+let _stageProgress: Record<string, number> = {};
+let _currentStage = '';
+
+/**
+ * Begin tracking pipeline progress. Call at pipeline start.
+ * Stages: array of { name, weight } where weight is relative time estimate.
+ */
+function startProgress(stages: { name: string; weight: number }[]): void {
+  _pipelineStart = performance.now();
+  _stageWeights = {};
+  _stageOrder = [];
+  _stageProgress = {};
+  _currentStage = '';
+  for (const s of stages) {
+    _stageWeights[s.name] = s.weight;
+    _stageOrder.push(s.name);
+    _stageProgress[s.name] = 0;
+  }
+  const bar = $('status-bar');
+  bar.classList.add('has-progress');
+  (bar.querySelector('.progress-fill') as HTMLElement).style.width = '0%';
+  (bar.querySelector('.status-eta') as HTMLElement).textContent = '';
+}
+
+/** End progress tracking. */
+function endProgress(): void {
+  _pipelineStart = 0;
+  _currentStage = '';
+  const bar = $('status-bar');
+  bar.classList.remove('has-progress');
+  (bar.querySelector('.progress-fill') as HTMLElement).style.width = '0%';
+  (bar.querySelector('.status-eta') as HTMLElement).textContent = '';
+}
+
+/** Update progress within a stage (0-1). */
+function updateProgress(stage: string, fraction: number): void {
+  _stageProgress[stage] = Math.max(_stageProgress[stage] ?? 0, Math.min(1, fraction));
+  _currentStage = stage;
+
+  // Compute overall weighted progress
+  let totalWeight = 0;
+  let completedWeight = 0;
+  for (const name of _stageOrder) {
+    const w = _stageWeights[name] ?? 0;
+    totalWeight += w;
+    completedWeight += w * (_stageProgress[name] ?? 0);
+  }
+  const overall = totalWeight > 0 ? completedWeight / totalWeight : 0;
+
+  // Update progress bar
+  const fill = $('status-bar').querySelector('.progress-fill') as HTMLElement;
+  fill.style.width = `${Math.round(overall * 100)}%`;
+
+  // Calculate ETA
+  const elapsed = performance.now() - _pipelineStart;
+  const etaEl = $('status-bar').querySelector('.status-eta') as HTMLElement;
+  if (overall > 0.02 && elapsed > 1000) {
+    const totalEstMs = elapsed / overall;
+    const remainMs = totalEstMs - elapsed;
+    const remainSec = Math.ceil(remainMs / 1000);
+    if (remainSec > 0 && remainSec < 600) {
+      if (remainSec >= 60) {
+        const m = Math.floor(remainSec / 60);
+        const s = remainSec % 60;
+        etaEl.textContent = `~${m}m ${s}s remaining`;
+      } else {
+        etaEl.textContent = `~${remainSec}s remaining`;
+      }
+    } else {
+      etaEl.textContent = '';
+    }
+  } else {
+    etaEl.textContent = _pipelineStart ? 'Estimating…' : '';
+  }
+}
+
 function setStatus(msg: string): void {
-  $('status-bar').textContent = msg;
+  const msgEl = $('status-bar').querySelector('.status-msg') as HTMLElement;
+  if (msgEl) {
+    msgEl.textContent = msg;
+  } else {
+    // Fallback if HTML not yet upgraded
+    $('status-bar').textContent = msg;
+  }
   $('status-chip').textContent = msg.slice(0, 40);
 }
 
@@ -363,4 +448,4 @@ export function initUI(): void {
   updateStitchButton();
 }
 
-export { renderCapabilities, setStatus };
+export { renderCapabilities, setStatus, startProgress, endProgress, updateProgress };

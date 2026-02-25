@@ -12,7 +12,10 @@ async function runTest() {
   page.on('console', msg => console.log('PAGE LOG:', msg.text()));
   page.on('pageerror', err => console.error('PAGE ERROR:', err));
 
-  await page.goto('http://localhost:5175');
+  await page.goto('http://localhost:5175', { waitUntil: 'networkidle0', timeout: 60000 });
+
+  // Wait briefly for scripts to initialize
+  await new Promise(r => setTimeout(r, 1000));
 
   // Upload images
   const fileInput = await page.$('#file-input');
@@ -24,7 +27,7 @@ async function runTest() {
   await fileInput.uploadFile(...images);
 
   // Wait for images to load
-  await page.waitForSelector('#btn-stitch:not([disabled])');
+  await page.waitForSelector('#btn-stitch:not([disabled])', { timeout: 30000 });
 
   // Click stitch
   await page.click('#btn-stitch');
@@ -32,7 +35,8 @@ async function runTest() {
   // Wait for pipeline to finish
   try {
     await page.waitForFunction(() => {
-      const status = document.getElementById('status-bar').textContent;
+      const el = document.querySelector('#status-bar .status-msg');
+      const status = el ? el.textContent : document.getElementById('status-bar').textContent;
       return status.includes('Pipeline complete') || status.includes('Composite complete') || status.includes('failed') || status.includes('error');
     }, { timeout: 60000 });
     

@@ -1,7 +1,7 @@
 import { detectCapabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
-import { initUI, renderCapabilities, setStatus, setRenderImagePreview } from './ui';
+import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress } from './ui';
 import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
   createPyramidBlender,
@@ -560,6 +560,10 @@ async function renderWarpedPreview(
 
   try {
 
+  // Set up compositing progress
+  startProgress([{ name: 'compositing', weight: 1 }]);
+  setStatus('Compositing (0%)…');
+
   // Clear composite
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.viewport(0, 0, compW, compH);
@@ -761,7 +765,9 @@ async function renderWarpedPreview(
     }
 
     imgIdx++;
-    setStatus(`Compositing: ${imgIdx}/${mstOrder.length}`);
+    const compPct = Math.round((imgIdx / mstOrder.length) * 100);
+    setStatus(`Compositing (${compPct}%) — ${imgIdx}/${mstOrder.length}`);
+    updateProgress('compositing', imgIdx / mstOrder.length);
   }
 
   // Display final composite on screen
@@ -772,14 +778,19 @@ async function renderWarpedPreview(
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.BLEND);
 
-  // Draw composite as fullscreen quad
+  // Draw composite as fullscreen quad.
+  // FBO textures have v=0 at bottom (GL convention), so flip V to display right-side up.
   const screenMesh = createIdentityMesh(compW, compH, 1, 1);
+  for (let i = 1; i < screenMesh.uvs.length; i += 2) {
+    screenMesh.uvs[i] = 1 - screenMesh.uvs[i];
+  }
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
 
   // Cleanup FBOs
   } catch (err) {
     console.error('renderWarpedPreview error:', err);
     setStatus(`Pipeline error: ${err instanceof Error ? err.message : String(err)}`);
+    endProgress();
     return;
   } finally {
   compositeA.dispose(); compositeTexA.dispose();
@@ -787,6 +798,7 @@ async function renderWarpedPreview(
   newImageFBO.dispose(); newImageTex.dispose();
   }
 
+  endProgress();
   setStatus(`Composite complete — ${images.length} images blended.`);
 
   // Enable export button
