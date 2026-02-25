@@ -257,6 +257,13 @@ self.addEventListener('message', async (ev) => {
               const HBuf = new Float64Array(9);
               HBuf.set(H.data64F.slice(0, 9));
 
+              // CRITICAL: Validate homography for physical plausibility
+              // Reject if it contains reflection or extreme rotation (>120 degrees)
+              if (!isHomographyValid(HBuf)) {
+                srcPts.delete(); dstPts.delete(); inlierMask.delete(); H.delete();
+                done++; continue;
+              }
+
               const inliersBuf = new Float32Array(inlierCount * 4);
               for (let k = 0; k < inlierCount; k++) {
                 inliersBuf[k * 4] = inliers[k].xi;
@@ -780,6 +787,43 @@ function checkConnectivity(ids, edges) {
     }
   }
   return visited.size === ids.length;
+}
+
+/**
+ * Validate that a homography is physically plausible for panorama stitching.
+ * Rejects if:
+ * - Top-left 2x2 submatrix has negative determinant (reflection)
+ * - Rotation angle > 120 degrees (likely spurious match)
+ * - Extreme scale change (>4x or <0.25x)
+ */
+function isHomographyValid(H) {
+  // Extract top-left 2x2 affine part
+  const a = H[0], b = H[1];
+  const c = H[3], d = H[4];
+  
+  // Determinant of 2x2 affine part — negative means reflection
+  const det2x2 = a * d - b * c;
+  if (det2x2 < 0) {
+    console.warn('Homography rejected: reflection detected (det < 0)');
+    return false;
+  }
+  
+  // Compute rotation angle from atan2(c, a) — should be small for panoramas
+  const rotationRad = Math.atan2(c, a);
+  const rotationDeg = Math.abs(rotationRad * 180 / Math.PI);
+  if (rotationDeg > 120) {
+    console.warn(`Homography rejected: extreme rotation ${rotationDeg.toFixed(1)}°`);
+    return false;
+  }
+  
+  // Compute scale from sqrt(det2x2) — should be near 1 for same-camera images
+  const scale = Math.sqrt(Math.abs(det2x2));
+  if (scale > 4.0 || scale < 0.25) {
+    console.warn(`Homography rejected: extreme scale ${scale.toFixed(2)}x`);
+    return false;
+  }
+  
+  return true;
 }
 
 // Multiply two 3x3 matrices stored as row-major Float64Array(9)
