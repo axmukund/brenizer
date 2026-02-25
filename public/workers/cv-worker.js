@@ -66,6 +66,16 @@ self.addEventListener('message', async (ev) => {
 
     if (!cvReady) throw new Error('cv-worker not initialized');
 
+    if (msg.type === 'clearImages') {
+      images = {};
+      edges = [];
+      mstOrder = [];
+      mstParent = {};
+      transforms = {};
+      postMessage({type:'progress', stage:'clearImages', percent:100, info:'cleared'});
+      return;
+    }
+
     if (msg.type === 'addImage') {
       const {imageId, grayBuffer, width, height, depth} = msg;
       const gray = new Uint8ClampedArray(grayBuffer);
@@ -259,7 +269,8 @@ self.addEventListener('message', async (ev) => {
 
               // CRITICAL: Validate homography for physical plausibility
               // Reject if it contains reflection or extreme rotation (>120 degrees)
-              if (!isHomographyValid(HBuf)) {
+              if (!isHomographyValid(HBuf, imgI.width, imgI.height)) {
+                console.warn(`  Rejected pair: ${idI} ↔ ${idJ} (${inlierCount} inliers, RMS=${rms.toFixed(2)})`);
                 srcPts.delete(); dstPts.delete(); inlierMask.delete(); H.delete();
                 done++; continue;
               }
@@ -392,6 +403,14 @@ self.addEventListener('message', async (ev) => {
         adj[e.j].push({to: e.i, edge: e});
       }
 
+      // Also build a full adjacency from all edges (for fallback path searches)
+      const fullAdj = {};
+      for (const id of ids) fullAdj[id] = [];
+      for (const e of edges) {
+        fullAdj[e.i].push({to: e.j, edge: e});
+        fullAdj[e.j].push({to: e.i, edge: e});
+      }
+
       mstOrder = [];
       mstParent = {};
       const visited = new Set();
@@ -468,6 +487,62 @@ self.addEventListener('message', async (ev) => {
             T_node = mulMat3(transforms[par], Hinv);
           } else {
             T_node = new Float64Array(transforms[par]);
+          }
+        }
+
+        // Normalize so T[8] = 1 to keep perspective terms well-scaled
+        if (Math.abs(T_node[8]) > 1e-10) {
+          const inv = 1.0 / T_node[8];
+          for (let k = 0; k < 9; k++) T_node[k] *= inv;
+        }
+
+        // Validate: check that all 4 corners of the image project with positive denom.
+        // If any corner is behind the camera, the transform has extreme perspective.
+        const nodeImg = images[node];
+        if (nodeImg) {
+          const nw = nodeImg.width, nh = nodeImg.height;
+          const corners = [[0,0], [nw,0], [nw,nh], [0,nh]];
+          let hasExtremePerspective = false;
+          for (const [cx, cy] of corners) {
+            const denom = T_node[6] * cx + T_node[7] * cy + T_node[8];
+            if (denom < 0.05) { hasExtremePerspective = true; break; }
+          }
+          if (hasExtremePerspective) {
+            console.warn(`Transform for ${node} has extreme perspective (corner behind camera)`);
+            // Try to find a better path: look for alternative parent edges
+            let found = false;
+            for (const altAdj of (fullAdj[node] || [])) {
+              const altPar = altAdj.to;
+              if (altPar === par || !transforms[altPar]) continue;
+              const altEdge = altAdj.edge;
+              let T_alt;
+              if (altEdge.i === node && altEdge.j === altPar) {
+                T_alt = mulMat3(transforms[altPar], altEdge.H);
+              } else {
+                const Hinv2 = invertH(altEdge.H);
+                if (!Hinv2) continue;
+                T_alt = mulMat3(transforms[altPar], Hinv2);
+              }
+              if (Math.abs(T_alt[8]) > 1e-10) {
+                const inv2 = 1.0 / T_alt[8];
+                for (let k = 0; k < 9; k++) T_alt[k] *= inv2;
+              }
+              // Re-check perspective
+              let altOk = true;
+              for (const [cx, cy] of corners) {
+                const denom = T_alt[6] * cx + T_alt[7] * cy + T_alt[8];
+                if (denom < 0.05) { altOk = false; break; }
+              }
+              if (altOk) {
+                console.warn(`  → Using alternative parent ${altPar} for ${node}`);
+                T_node = T_alt;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              console.warn(`  → No alternative path found; keeping original transform`);
+            }
           }
         }
 
@@ -670,6 +745,15 @@ self.addEventListener('message', async (ev) => {
       const vertices = new Float32Array(cols * rows * 2);
       const uvs = new Float32Array(cols * rows * 2);
 
+      // Compute affine fallback for vertices that can't be projected via the
+      // full perspective transform (i.e. vertices near or behind the camera).
+      // Use the affine part of T: gx = (T[0]*x + T[1]*y + T[2]) / T[8]
+      // This ignores perspective but gives a reasonable position.
+      function affineProject(T, px, py) {
+        const s = Math.abs(T[8]) > 1e-10 ? T[8] : 1;
+        return [(T[0] * px + T[1] * py + T[2]) / s, (T[3] * px + T[4] * py + T[5]) / s];
+      }
+
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
       for (let r = 0; r < rows; r++) {
@@ -711,35 +795,66 @@ self.addEventListener('message', async (ev) => {
           const effectiveSupport = totalWeight;
           let gx, gy;
 
+          // Maximum reasonable global coordinate: images shouldn't project
+          // far beyond a few image-widths from the origin
+          const maxGlobalExtent = Math.max(w, h) * 5;
+
+          // Helper: project vertex through a homography with safety checks
+          function projectVertex(H, px, py) {
+            const denom = H[6] * px + H[7] * py + H[8];
+            if (denom < 1e-4) return null; // behind camera or near-singular
+            const gx = (H[0] * px + H[1] * py + H[2]) / denom;
+            const gy = (H[3] * px + H[4] * py + H[5]) / denom;
+            // Reject if projected too far (strong perspective artifact)
+            if (Math.abs(gx) > maxGlobalExtent || Math.abs(gy) > maxGlobalExtent) return null;
+            return [gx, gy];
+          }
+
+          // Compute global transform prediction as a reference for sanity checking
+          const globalPt = projectVertex(Ti, vx, vy);
+          // If perspective projection fails (vertex behind camera), use affine approx
+          let globalGx, globalGy;
+          if (globalPt) {
+            globalGx = globalPt[0];
+            globalGy = globalPt[1];
+          } else {
+            const affinePt = affineProject(Ti, vx, vy);
+            globalGx = affinePt[0];
+            globalGy = affinePt[1];
+          }
+
+          // Maximum acceptable deviation from global transform (in pixels)
+          const maxDeviation = Math.max(w, h) * 0.5;
+
           if (effectiveSupport < minSupport || srcPts.length < 4) {
             // Fallback to global transform
-            const denom = Ti[6] * vx + Ti[7] * vy + Ti[8];
-            if (Math.abs(denom) < 1e-10) {
-              gx = vx; gy = vy;
-            } else {
-              gx = (Ti[0] * vx + Ti[1] * vy + Ti[2]) / denom;
-              gy = (Ti[3] * vx + Ti[4] * vy + Ti[5]) / denom;
-            }
+            gx = globalGx;
+            gy = globalGy;
           } else {
             // Weighted DLT to find local homography H_v mapping src→dst
             const Hv = weightedDLT(srcPts, dstPts, weights);
             if (Hv) {
-              const denom = Hv[6] * vx + Hv[7] * vy + Hv[8];
-              if (Math.abs(denom) < 1e-10) {
-                gx = vx; gy = vy;
+              const localPt = projectVertex(Hv, vx, vy);
+              if (localPt) {
+                // Validate: local result shouldn't deviate too far from global
+                const dx = localPt[0] - globalGx;
+                const dy = localPt[1] - globalGy;
+                if (dx * dx + dy * dy < maxDeviation * maxDeviation) {
+                  gx = localPt[0];
+                  gy = localPt[1];
+                } else {
+                  // DLT result too extreme — fallback to global
+                  gx = globalGx;
+                  gy = globalGy;
+                }
               } else {
-                gx = (Hv[0] * vx + Hv[1] * vy + Hv[2]) / denom;
-                gy = (Hv[3] * vx + Hv[4] * vy + Hv[5]) / denom;
+                gx = globalGx;
+                gy = globalGy;
               }
             } else {
               // DLT failed, fallback
-              const denom = Ti[6] * vx + Ti[7] * vy + Ti[8];
-              if (Math.abs(denom) < 1e-10) {
-                gx = vx; gy = vy;
-              } else {
-                gx = (Ti[0] * vx + Ti[1] * vy + Ti[2]) / denom;
-                gy = (Ti[3] * vx + Ti[4] * vy + Ti[5]) / denom;
-              }
+              gx = globalGx;
+              gy = globalGy;
             }
           }
 
@@ -812,7 +927,13 @@ function checkConnectivity(ids, edges) {
  * - Rotation angle > 120 degrees (likely spurious match)
  * - Extreme scale change (>4x or <0.25x)
  */
-function isHomographyValid(H) {
+function isHomographyValid(H, srcW, srcH) {
+  // Normalize H so H[8] = 1 before checking
+  if (Math.abs(H[8]) > 1e-10) {
+    const inv = 1.0 / H[8];
+    for (let i = 0; i < 9; i++) H[i] *= inv;
+  }
+
   // Extract top-left 2x2 affine part
   const a = H[0], b = H[1];
   const c = H[3], d = H[4];
@@ -837,6 +958,20 @@ function isHomographyValid(H) {
   if (scale > 4.0 || scale < 0.25) {
     console.warn(`Homography rejected: extreme scale ${scale.toFixed(2)}x`);
     return false;
+  }
+
+  // Check that all 4 corners of the source image project with positive denom
+  // through both H (forward) and H_inv (backward).
+  // This rejects homographies where the perspective vanishing line intersects the image.
+  if (srcW && srcH) {
+    const corners = [[0,0], [srcW,0], [srcW,srcH], [0,srcH]];
+    for (const [x, y] of corners) {
+      const denom = H[6] * x + H[7] * y + H[8];
+      if (denom < 0.1) {
+        console.warn(`Homography rejected: source corner (${x},${y}) has denom=${denom.toFixed(4)} (behind camera)`);
+        return false;
+      }
+    }
   }
   
   return true;
@@ -889,7 +1024,7 @@ function buildGlobalMesh(imageId, G, T, img) {
 
       if (T) {
         const denom = T[6] * vx + T[7] * vy + T[8];
-        if (Math.abs(denom) > 1e-10) {
+        if (denom > 1e-4) {
           const gx = (T[0] * vx + T[1] * vy + T[2]) / denom;
           const gy = (T[3] * vx + T[4] * vy + T[5]) / denom;
           vertices[vi] = gx;

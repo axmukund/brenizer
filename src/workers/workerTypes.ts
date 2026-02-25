@@ -58,6 +58,10 @@ export interface CVInitMsg {
   opencvPath?: string;
 }
 
+export interface CVClearImagesMsg {
+  type: 'clearImages';
+}
+
 export interface CVAddImageMsg {
   type: 'addImage';
   imageId: string;
@@ -113,6 +117,7 @@ export interface CVComputeLocalMeshMsg {
 
 export type CVInMsg =
   | CVInitMsg
+  | CVClearImagesMsg
   | CVAddImageMsg
   | CVComputeFeaturesMsg
   | CVMatchGraphMsg

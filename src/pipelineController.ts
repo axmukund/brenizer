@@ -62,6 +62,9 @@ export function getLastRefId(): string | null {
 export function getLastMstOrder(): string[] {
   return lastMstOrder;
 }
+export function getLastMstParent(): Record<string, string | null> {
+  return lastMstParent;
+}
 
 /** Per-image depth map data. */
 export interface DepthMap {
@@ -226,24 +229,42 @@ export async function runStitchPreview(): Promise<void> {
 
   setStatus('Extracting features…');
 
+  // Clear old images from worker state
+  await new Promise<void>((resolve) => {
+    const unsub = workerManager!.onCV((msg) => {
+      if (msg.type === 'progress' && msg.stage === 'clearImages') {
+        unsub();
+        resolve();
+      }
+    });
+    workerManager!.sendCV({ type: 'clearImages' });
+  });
+
   // Step 2: Convert images to grayscale and send to cv-worker
   const scaleFactors: Record<string, number> = {};
   for (const img of active) {
     const { gray, width, height, scaleFactor } = await imageToGray(img, settings.alignScale);
     scaleFactors[img.id] = scaleFactor;
     const buf = gray.buffer as ArrayBuffer;
-    workerManager!.sendCV(
-      {
-        type: 'addImage',
-        imageId: img.id,
-        grayBuffer: buf,
-        width,
-        height,
-      },
-      [buf],
-    );
-    // Wait for ack
-    await workerManager!.waitCV('progress', 5000);
+    // Send and wait for ack
+    await new Promise<void>((resolve) => {
+      const unsub = workerManager!.onCV((msg) => {
+        if (msg.type === 'progress' && msg.stage === 'addImage' && msg.info?.includes(img.id)) {
+          unsub();
+          resolve();
+        }
+      });
+      workerManager!.sendCV(
+        {
+          type: 'addImage',
+          imageId: img.id,
+          grayBuffer: buf,
+          width,
+          height,
+        },
+        [buf],
+      );
+    });
   }
 
   // Step 3: Compute features (ORB)
@@ -296,12 +317,15 @@ export async function runStitchPreview(): Promise<void> {
   // Step 4: Match pairs — knnMatch + ratio test + RANSAC homography
   setStatus('Matching image pairs…');
 
-  const edgesPromise = new Promise<CVEdgesMsg>((resolve) => {
+  const edgesPromise = new Promise<CVEdgesMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'edges') {
         if (unsub) unsub();
         resolve(msg as CVEdgesMsg);
+      } else if (msg.type === 'error') {
+        if (unsub) unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
       }
     };
     unsub = workerManager!.onCV(handler);
@@ -369,12 +393,15 @@ export async function runStitchPreview(): Promise<void> {
 
   const mstPromise = workerManager!.waitCV('mst', 15000);
   // We also need the follow-up transforms message
-  const transformsPromise = new Promise<CVTransformsMsg>((resolve) => {
+  const transformsPromise = new Promise<CVTransformsMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'transforms') {
         if (unsub) unsub();
         resolve(msg as CVTransformsMsg);
+      } else if (msg.type === 'error') {
+        if (unsub) unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
       }
     };
     unsub = workerManager!.onCV(handler);
@@ -400,12 +427,15 @@ export async function runStitchPreview(): Promise<void> {
   // Step 6: Refine transforms (LM — placeholder for now, sends back same transforms)
   setStatus('Refining transforms…');
 
-  const refineTransformPromise = new Promise<CVTransformsMsg>((resolve) => {
+  const refineTransformPromise = new Promise<CVTransformsMsg>((resolve, reject) => {
     let unsub: (() => void) | null = null;
     const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
       if (msg.type === 'transforms') {
         if (unsub) unsub();
         resolve(msg as CVTransformsMsg);
+      } else if (msg.type === 'error') {
+        if (unsub) unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
       }
     };
     unsub = workerManager!.onCV(handler);
@@ -431,12 +461,15 @@ export async function runStitchPreview(): Promise<void> {
   if (settings.exposureComp) {
     setStatus('Computing exposure gains…');
 
-    const exposurePromise = new Promise<CVExposureMsg>((resolve) => {
+    const exposurePromise = new Promise<CVExposureMsg>((resolve, reject) => {
       let unsub: (() => void) | null = null;
       const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
         if (msg.type === 'exposure') {
           if (unsub) unsub();
           resolve(msg as CVExposureMsg);
+        } else if (msg.type === 'error') {
+          if (unsub) unsub();
+          reject(new Error((msg as any).message || 'Worker error'));
         }
       };
       unsub = workerManager!.onCV(handler);
@@ -534,12 +567,15 @@ export async function runStitchPreview(): Promise<void> {
       const parentId = lastMstParent[nodeId];
       if (!parentId) continue; // skip reference image
 
-      const meshPromise = new Promise<CVMeshMsg>((resolve) => {
+      const meshPromise = new Promise<CVMeshMsg>((resolve, reject) => {
         let unsub: (() => void) | null = null;
         const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
           if (msg.type === 'mesh' && msg.imageId === nodeId) {
             if (unsub) unsub();
             resolve(msg as CVMeshMsg);
+          } else if (msg.type === 'error') {
+            if (unsub) unsub();
+            reject(new Error((msg as any).message || 'Worker error'));
           }
         };
         unsub = workerManager!.onCV(handler);
@@ -575,6 +611,10 @@ export async function runStitchPreview(): Promise<void> {
   // Dispatch event so main.ts can render warped preview
   window.dispatchEvent(new CustomEvent('transforms-ready'));
 
+  } catch (err) {
+    console.error('Pipeline error:', err);
+    setStatus(`Pipeline error: ${err instanceof Error ? err.message : String(err)}`);
+    setState({ pipelineStatus: 'error' });
   } finally {
     setState({ pipelineStatus: 'idle' });
   }

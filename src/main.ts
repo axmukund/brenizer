@@ -12,7 +12,7 @@ import {
 } from './gl';
 import {
   runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
-  getLastGains, getLastMeshes, getLastMstOrder, getWorkerManager,
+  getLastGains, getLastMeshes, getLastMstOrder, getLastMstParent, getWorkerManager,
 } from './pipelineController';
 import type { SeamResultMsg } from './workers/workerTypes';
 
@@ -427,6 +427,7 @@ async function renderWarpedPreview(
   const { settings } = getState();
   const refId = getLastRefId();
   const wm = getWorkerManager();
+  const mstParent = getLastMstParent();
 
   // Size canvas to container
   const container = document.getElementById('canvas-container')!;
@@ -435,29 +436,96 @@ async function renderWarpedPreview(
   canvas.style.display = 'block';
   document.getElementById('canvas-placeholder')!.style.display = 'none';
 
-  // Compute bounding box across all warped image corners in global coords
+  // Determine which images are reachable from the reference in the MST.
+  // Disconnected images (no parent AND not the reference) get identity transforms
+  // and would overlap the reference — exclude them.
+  const connectedIds = new Set<string>();
+  if (refId) connectedIds.add(refId);
+  for (const [id, parentId] of Object.entries(mstParent)) {
+    if (parentId !== null) connectedIds.add(id);
+  }
+  // If no MST data at all, treat all images with transforms as connected
+  if (connectedIds.size === 0) {
+    for (const img of images) {
+      if (transforms.has(img.id)) connectedIds.add(img.id);
+    }
+  }
+
+  // Compute bounding box across all warped image corners in global coords.
+  // Prefer APAP mesh bounds when available; fall back to projecting corners
+  // via the global homography, but skip points that project behind the camera
+  // (negative denominator) to avoid extreme coordinates from perspective wrap.
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
+  // Compute a reasonable max extent for sanity clamping
+  let refDim = 1536; // fallback
   for (const img of images) {
+    if (img.id === refId) {
+      const feat = features.get(img.id);
+      const sf = feat?.scaleFactor ?? 1;
+      refDim = Math.max(img.width * sf, img.height * sf);
+      break;
+    }
+  }
+  const maxReasonableExtent = refDim * images.length * 2;
+
+  for (const img of images) {
+    if (!connectedIds.has(img.id)) {
+      console.log(`Skipping disconnected image: ${img.name}`);
+      continue;
+    }
     const t = transforms.get(img.id);
     if (!t) continue;
+
+    // If this image has an APAP mesh, use its pre-computed bounds
+    const apap = meshes.get(img.id);
+    if (apap) {
+      const b = apap.bounds;
+      // Clamp APAP bounds to reasonable extent (some vertices may still be extreme)
+      const clampedMinX = Math.max(b.minX, -maxReasonableExtent);
+      const clampedMinY = Math.max(b.minY, -maxReasonableExtent);
+      const clampedMaxX = Math.min(b.maxX, maxReasonableExtent);
+      const clampedMaxY = Math.min(b.maxY, maxReasonableExtent);
+      console.log(`Image ${img.name}: APAP bounds=[${clampedMinX.toFixed(1)},${clampedMinY.toFixed(1)},${clampedMaxX.toFixed(1)},${clampedMaxY.toFixed(1)}]`);
+      minX = Math.min(minX, clampedMinX); minY = Math.min(minY, clampedMinY);
+      maxX = Math.max(maxX, clampedMaxX); maxY = Math.max(maxY, clampedMaxY);
+      continue;
+    }
+
+    // Fall back to projecting 4 corners + edge midpoints via global T
     const feat = features.get(img.id);
     const sf = feat?.scaleFactor ?? 1;
     const w = img.width * sf;
     const h = img.height * sf;
     const T = t.T;
-    const corners = [[0, 0], [w, 0], [w, h], [0, h]];
-    for (const [cx, cy] of corners) {
+    // Sample corners and edge midpoints for better coverage
+    const samples = [
+      [0, 0], [w, 0], [w, h], [0, h],
+      [w / 2, 0], [w, h / 2], [w / 2, h], [0, h / 2], [w / 2, h / 2],
+    ];
+    let imgMinX = Infinity, imgMinY = Infinity, imgMaxX = -Infinity, imgMaxY = -Infinity;
+    for (const [cx, cy] of samples) {
       const denom = T[6] * cx + T[7] * cy + T[8];
-      if (Math.abs(denom) < 1e-10) continue;
+      // Skip if behind camera (denom <= 0) or near-singular
+      if (denom < 1e-4) continue;
       const gx = (T[0] * cx + T[1] * cy + T[2]) / denom;
       const gy = (T[3] * cx + T[4] * cy + T[5]) / denom;
-      minX = Math.min(minX, gx);
-      minY = Math.min(minY, gy);
-      maxX = Math.max(maxX, gx);
-      maxY = Math.max(maxY, gy);
+      // Sanity clamp: skip if projected too far from origin
+      if (Math.abs(gx) > maxReasonableExtent || Math.abs(gy) > maxReasonableExtent) continue;
+      imgMinX = Math.min(imgMinX, gx); imgMinY = Math.min(imgMinY, gy);
+      imgMaxX = Math.max(imgMaxX, gx); imgMaxY = Math.max(imgMaxY, gy);
+    }
+    if (isFinite(imgMinX)) {
+      console.log(`Image ${img.name}: T-bounds=[${imgMinX.toFixed(1)},${imgMinY.toFixed(1)},${imgMaxX.toFixed(1)},${imgMaxY.toFixed(1)}]`);
+      minX = Math.min(minX, imgMinX); minY = Math.min(minY, imgMinY);
+      maxX = Math.max(maxX, imgMaxX); maxY = Math.max(maxY, imgMaxY);
+    } else {
+      console.warn(`Image ${img.name}: all corners project behind camera or out of range, skipping from bounds`);
     }
   }
   if (!isFinite(minX)) return;
+
+  console.log(`Global bounds: [${minX.toFixed(1)},${minY.toFixed(1)}] → [${maxX.toFixed(1)},${maxY.toFixed(1)}]`);
 
   const globalW = maxX - minX;
   const globalH = maxY - minY;
@@ -467,6 +535,8 @@ async function renderWarpedPreview(
   const compositeScale = Math.min(1, maxTexSize / Math.max(globalW, globalH));
   const compW = Math.round(globalW * compositeScale);
   const compH = Math.round(globalH * compositeScale);
+
+  console.log(`Composite: ${compW}×${compH}, scale=${compositeScale.toFixed(4)}`);
 
   // Create FBOs for composition
   const compositeTexA = createEmptyTexture(gl, compW, compH);
@@ -497,12 +567,13 @@ async function renderWarpedPreview(
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  // Determine MST order, falling back to image order with ref first
+  // Determine MST order, falling back to image order with ref first.
+  // Filter to only connected images.
   const mstOrder = (() => {
     const order: string[] = getLastMstOrder();
-    if (order.length > 0) return order;
+    if (order.length > 0) return order.filter(id => connectedIds.has(id));
     // Fallback: ref first, then rest
-    const ids = images.map(i => i.id);
+    const ids = images.map(i => i.id).filter(id => connectedIds.has(id));
     if (refId && ids.includes(refId)) {
       return [refId, ...ids.filter(id => id !== refId)];
     }
@@ -547,16 +618,17 @@ async function renderWarpedPreview(
       }
       mesh = { positions: warpedPos, uvs: new Float32Array(apap.uvs), indices: new Uint32Array(apap.indices) };
     } else {
-      // Global homography mesh
+      // Global homography mesh — use dense grid and clamp vertices behind camera
       const baseMesh = createIdentityMesh(alignW, alignH, gridN, gridN);
       const warpedPositions = new Float32Array(baseMesh.positions.length);
       for (let i = 0; i < baseMesh.positions.length; i += 2) {
         const x = baseMesh.positions[i];
         const y = baseMesh.positions[i + 1];
         const denom = T[6] * x + T[7] * y + T[8];
-        if (Math.abs(denom) < 1e-10) {
-          warpedPositions[i] = (x - minX) * compositeScale;
-          warpedPositions[i + 1] = (y - minY) * compositeScale;
+        if (denom < 1e-4) {
+          // Behind camera or near-singular — clamp to nearest valid position
+          warpedPositions[i] = 0;
+          warpedPositions[i + 1] = 0;
         } else {
           warpedPositions[i] = ((T[0] * x + T[1] * y + T[2]) / denom - minX) * compositeScale;
           warpedPositions[i + 1] = ((T[3] * x + T[4] * y + T[5]) / denom - minY) * compositeScale;
@@ -705,6 +777,10 @@ async function renderWarpedPreview(
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
 
   // Cleanup FBOs
+  } catch (err) {
+    console.error('renderWarpedPreview error:', err);
+    setStatus(`Pipeline error: ${err instanceof Error ? err.message : String(err)}`);
+    return;
   } finally {
   compositeA.dispose(); compositeTexA.dispose();
   compositeB.dispose(); compositeTexB.dispose();
@@ -741,24 +817,65 @@ async function exportComposite(): Promise<void> {
   const exportScale = settings.exportScale;
   const exportFormat = settings.exportFormat;
   const jpegQuality = settings.exportJpegQuality;
+  const mstParent = getLastMstParent();
+
+  // Determine connected images (reachable from reference in MST)
+  const connectedIds = new Set<string>();
+  if (refId) connectedIds.add(refId);
+  for (const [id, parentId] of Object.entries(mstParent)) {
+    if (parentId !== null) connectedIds.add(id);
+  }
+  if (connectedIds.size === 0) {
+    for (const img of active) {
+      if (transforms.has(img.id)) connectedIds.add(img.id);
+    }
+  }
+
+  // Compute reasonable max extent for sanity clamping
+  let refDim = 1536;
+  for (const img of active) {
+    if (img.id === refId) {
+      const feat = features.get(img.id);
+      const sf = feat?.scaleFactor ?? 1;
+      refDim = Math.max(img.width * sf, img.height * sf);
+      break;
+    }
+  }
+  const maxReasonableExtent = refDim * active.length * 2;
 
   // Compute global bounding box at alignment scale
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const img of active) {
+    if (!connectedIds.has(img.id)) continue;
     const t = transforms.get(img.id);
     if (!t) continue;
+
+    // Prefer APAP mesh bounds
+    const apap = meshes.get(img.id);
+    if (apap) {
+      const b = apap.bounds;
+      minX = Math.min(minX, b.minX); minY = Math.min(minY, b.minY);
+      maxX = Math.max(maxX, b.maxX); maxY = Math.max(maxY, b.maxY);
+      continue;
+    }
+
     const feat = features.get(img.id);
     const sf = feat?.scaleFactor ?? 1;
     const w = img.width * sf;
     const h = img.height * sf;
     const T = t.T;
-    for (const [cx, cy] of [[0, 0], [w, 0], [w, h], [0, h]]) {
+    const samples = [
+      [0, 0], [w, 0], [w, h], [0, h],
+      [w / 2, 0], [w, h / 2], [w / 2, h], [0, h / 2], [w / 2, h / 2],
+    ];
+    for (const [cx, cy] of samples) {
       const denom = T[6] * cx + T[7] * cy + T[8];
-      if (Math.abs(denom) < 1e-10) continue;
-      minX = Math.min(minX, (T[0] * cx + T[1] * cy + T[2]) / denom);
-      minY = Math.min(minY, (T[3] * cx + T[4] * cy + T[5]) / denom);
-      maxX = Math.max(maxX, (T[0] * cx + T[1] * cy + T[2]) / denom);
-      maxY = Math.max(maxY, (T[3] * cx + T[4] * cy + T[5]) / denom);
+      if (denom < 1e-4) continue;
+      const gx = (T[0] * cx + T[1] * cy + T[2]) / denom;
+      const gy = (T[3] * cx + T[4] * cy + T[5]) / denom;
+      if (Math.abs(gx) > maxReasonableExtent || Math.abs(gy) > maxReasonableExtent) continue;
+      minX = Math.min(minX, gx); minY = Math.min(minY, gy);
+      maxX = Math.max(maxX, gx); maxY = Math.max(maxY, gy);
     }
   }
   if (!isFinite(minX)) return;
@@ -801,8 +918,8 @@ async function exportComposite(): Promise<void> {
 
   const mstOrder = (() => {
     const order = getLastMstOrder();
-    if (order.length > 0) return order;
-    const ids = active.map(i => i.id);
+    if (order.length > 0) return order.filter(id => connectedIds.has(id));
+    const ids = active.map(i => i.id).filter(id => connectedIds.has(id));
     if (refId && ids.includes(refId)) return [refId, ...ids.filter(id => id !== refId)];
     return ids;
   })();
@@ -847,9 +964,9 @@ async function exportComposite(): Promise<void> {
       for (let i = 0; i < baseMesh.positions.length; i += 2) {
         const x = baseMesh.positions[i], y = baseMesh.positions[i + 1];
         const denom = T[6] * x + T[7] * y + T[8];
-        if (Math.abs(denom) < 1e-10) {
-          warpedPositions[i] = (x - minX) * compositeScale;
-          warpedPositions[i + 1] = (y - minY) * compositeScale;
+        if (denom < 1e-4) {
+          warpedPositions[i] = 0;
+          warpedPositions[i + 1] = 0;
         } else {
           warpedPositions[i] = ((T[0] * x + T[1] * y + T[2]) / denom - minX) * compositeScale;
           warpedPositions[i + 1] = ((T[3] * x + T[4] * y + T[5]) / denom - minY) * compositeScale;
