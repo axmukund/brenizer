@@ -144,11 +144,13 @@ export interface CVEdge {
   inliersBuffer: ArrayBuffer;
   rms: number;
   inlierCount: number;
+  isDuplicate?: boolean;
 }
 
 export interface CVEdgesMsg {
   type: 'edges';
   edges: CVEdge[];
+  duplicatePairs?: [string, string][];
 }
 
 export interface CVTransformsMsg {

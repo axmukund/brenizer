@@ -264,6 +264,14 @@ self.addEventListener('message', async (ev) => {
                 done++; continue;
               }
 
+              // Detect near-duplicates: low RMS, high inlier ratio, small translation
+              const inlierRatio = inlierCount / (goodPtsI.length / 2);
+              const tx = HBuf[2], ty = HBuf[5];
+              const maxDim = Math.max(imgI.width, imgI.height);
+              const translation = Math.sqrt(tx * tx + ty * ty);
+              const translationRatio = translation / maxDim;
+              const isDuplicate = (rms < 2.0 && inlierRatio > 0.8 && translationRatio < 0.05);
+
               const inliersBuf = new Float32Array(inlierCount * 4);
               for (let k = 0; k < inlierCount; k++) {
                 inliersBuf[k * 4] = inliers[k].xi;
@@ -278,7 +286,8 @@ self.addEventListener('message', async (ev) => {
                 inliers: inliers,
                 inliersBuf: inliersBuf,
                 rms,
-                inlierCount
+                inlierCount,
+                isDuplicate
               });
             }
           }
@@ -303,6 +312,12 @@ self.addEventListener('message', async (ev) => {
         }
       }
 
+      // Detect and report near-duplicates
+      const duplicatePairs = edges.filter(e => e.isDuplicate).map(e => [e.i, e.j]);
+      if (duplicatePairs.length > 0) {
+        postMessage({type:'progress', stage:'matching', percent:100, info:`Found ${duplicatePairs.length} near-duplicate pair(s)`});
+      }
+
       // Send edges
       const edgeMessages = edges.map(e => ({
         i: e.i,
@@ -310,9 +325,10 @@ self.addEventListener('message', async (ev) => {
         HBuffer: e.H.buffer,
         inliersBuffer: e.inliersBuf.buffer,
         rms: e.rms,
-        inlierCount: e.inlierCount
+        inlierCount: e.inlierCount,
+        isDuplicate: e.isDuplicate || false
       }));
-      postMessage({type:'edges', edges: edgeMessages});
+      postMessage({type:'edges', edges: edgeMessages, duplicatePairs});
       return;
     }
 

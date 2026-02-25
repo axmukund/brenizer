@@ -324,7 +324,33 @@ export async function runStitchPreview(): Promise<void> {
     inliers: new Float32Array(e.inliersBuffer),
     rms: e.rms,
     inlierCount: e.inlierCount,
+    isDuplicate: e.isDuplicate || false,
   }));
+
+  // Handle near-duplicates: mark one image in each duplicate pair as excluded
+  if (edgesMsg.duplicatePairs && edgesMsg.duplicatePairs.length > 0) {
+    const toExclude = new Set<string>();
+    for (const [idA, idB] of edgesMsg.duplicatePairs) {
+      // Prefer to keep the image that appears earlier in the list
+      const imgA = active.find(i => i.id === idA);
+      const imgB = active.find(i => i.id === idB);
+      if (imgA && imgB) {
+        const idxA = active.indexOf(imgA);
+        const idxB = active.indexOf(imgB);
+        const excludeId = idxA < idxB ? idB : idA;
+        toExclude.add(excludeId);
+      }
+    }
+    
+    if (toExclude.size > 0) {
+      const allImages = getState().images;
+      const updated = allImages.map(img => 
+        toExclude.has(img.id) ? { ...img, excluded: true } : img
+      );
+      setState({ images: updated });
+      setStatus(`Excluded ${toExclude.size} near-duplicate image(s). ${active.length - toExclude.size} remain.`);
+    }
+  }
 
   if (lastEdges.length === 0) {
     setStatus('No matching pairs found. Try adding more overlapping images.');
