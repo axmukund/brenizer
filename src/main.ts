@@ -226,17 +226,17 @@ async function boot(): Promise<void> {
     });
   });
 
-  // Wire Full-Res Export button — temporarily enables maxResExport, then restores
+  // Wire Full-Res Export button — uses a cloned settings object with maxResExport=true
   document.getElementById('btn-export-fullres')!.addEventListener('click', () => {
     const { settings } = getState();
     if (!settings) return;
-    const prev = settings.maxResExport;
-    settings.maxResExport = true;
+    // Clone to avoid mutating shared state during async export
+    setState({ settings: { ...settings, maxResExport: true } });
     exportComposite().catch(err => {
       console.error('Export error:', err);
       setStatus(`Export error: ${err.message}`);
     }).finally(() => {
-      settings.maxResExport = prev;
+      setState({ settings: { ...settings } }); // restore original
     });
   });
 
@@ -345,7 +345,9 @@ function renderMatchHeatmap(
   for (const row of matrix) for (const v of row) if (v > maxCount) maxCount = v;
 
   // Build HTML table
-  const shortNames = images.map(i => i.name.replace(/\.[^.]+$/, '').slice(0, 8));
+  /** Escape HTML entities to prevent XSS from crafted filenames. */
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const shortNames = images.map(i => esc(i.name.replace(/\.[^.]+$/, '').slice(0, 8)));
   let html = '<div class="inlier-matrix" style="margin-top:8px;font-size:11px;"><strong>Inlier Matrix</strong>';
   html += '<table style="border-collapse:collapse;margin-top:4px;">';
   html += '<tr><td></td>';
@@ -465,7 +467,10 @@ function renderDiagnostics(
   const { images: allImages } = getState();
   const excludedImages = allImages.filter(i => i.excluded);
   if (excludedImages.length > 0) {
-    excludedEl.innerHTML = excludedImages.map(i => `<div style="color:var(--warn);">⚠ ${i.name} — excluded</div>`).join('');
+    excludedEl.innerHTML = excludedImages.map(i => {
+      const safe = i.name.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return `<div style="color:var(--warn);">⚠ ${safe} — excluded</div>`;
+    }).join('');
   } else {
     excludedEl.textContent = 'No images excluded.';
   }
@@ -476,7 +481,8 @@ function renderDiagnostics(
     let compIdx = 0;
     for (const [, members] of components) {
       compIdx++;
-      const names = members.map(i => images[i]?.name ?? `image-${i}`).join(', ');
+      const escName = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const names = members.map(i => escName(images[i]?.name ?? `image-${i}`)).join(', ');
       compHtml += `<div style="font-size:12px; margin-bottom:4px;">Component ${compIdx} (${members.length}): ${names}</div>`;
     }
     excludedEl.innerHTML += compHtml;
@@ -502,7 +508,6 @@ async function renderWarpedPreview(
   const gains = getLastGains();
   const meshes = getLastMeshes();
   const vignettes = getLastVignette();
-  const saliencyMaps = getLastSaliency();
   const { settings } = getState();
   const refId = getLastRefId();
   const wm = getWorkerManager();
@@ -1380,8 +1385,9 @@ async function exportComposite(): Promise<void> {
       [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
       [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
     } else {
-      // Feather-only fallback
-      const newPixels = new Uint8Array(outW * outH * 4);
+      // Feather-only fallback — reuse pre-allocated buffer
+      const newPixels = _expNewPixels;
+      newPixels.fill(0);
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);

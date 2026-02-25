@@ -495,7 +495,6 @@ export async function runStitchPreview(): Promise<void> {
     setStatus('Estimating vignetting…');
     updateProgress('vignetting', 0);
 
-    const vignettePromises: Promise<void>[] = [];
     const vignetteUnsub = workerManager!.onCV((msg) => {
       if (msg.type === 'vignetting') {
         const vmsg = msg as CVVignettingMsg;

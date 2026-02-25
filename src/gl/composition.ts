@@ -14,7 +14,7 @@ import { createFBO, type ManagedFBO } from './framebuffers';
 
 const BLEND_VERT = `#version 300 es
 precision highp float;
-in vec2 a_position;
+layout(location = 0) in vec2 a_position;
 out vec2 v_uv;
 void main() {
   v_uv = a_position * 0.5 + 0.5;
@@ -44,7 +44,7 @@ void main() {
 
 const BLUR_VERT = `#version 300 es
 precision highp float;
-in vec2 a_position;
+layout(location = 0) in vec2 a_position;
 out vec2 v_uv;
 void main() {
   v_uv = a_position * 0.5 + 0.5;

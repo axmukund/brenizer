@@ -720,8 +720,8 @@ self.addEventListener('message', async (ev) => {
       if (!matchAllPairs && edges.length > 0) {
         const connected = checkConnectivity(ids, edges);
         if (!connected) {
-          postMessage({type:'progress', stage:'matching', percent: 100, info: 'Graph disconnected, trying all pairs...'});
-          // Could expand window or match all — for now just warn
+          postMessage({type:'progress', stage:'matching', percent: 100, info: 'Graph disconnected — some images may not align'});
+          console.warn('Match graph is disconnected. Some images are not connected to the reference.');
         }
       }
 
