@@ -1,5 +1,6 @@
 import { getState, setState, subscribe, type ImageEntry } from './appState';
 import { capsSummary, type Capabilities } from './capabilities';
+import { getPreset } from './presets';
 import heic2any from 'heic2any';
 import UTIF from 'utif';
 
@@ -397,6 +398,159 @@ function updateStitchButton(): void {
   ($('btn-stitch') as HTMLButtonElement).disabled = active.length < 2;
 }
 
+// ── Settings panel ───────────────────────────────────────
+
+/** Build the interactive settings panel from current PipelineSettings. */
+function buildSettingsPanel(): void {
+  const panel = $('settings-panel');
+  const { settings } = getState();
+  if (!settings) return;
+
+  panel.innerHTML = '<h3>Pipeline Settings</h3>';
+
+  // Helper: add a section header
+  const section = (title: string) => {
+    const h = document.createElement('h4');
+    h.textContent = title;
+    h.style.cssText = 'font-size:12px; color:var(--accent); margin:14px 0 6px; border-bottom:1px solid var(--border); padding-bottom:3px;';
+    panel.appendChild(h);
+  };
+
+  // Helper: add a numeric slider row
+  const slider = (label: string, key: keyof typeof settings, min: number, max: number, step: number, suffix = '') => {
+    const row = document.createElement('div');
+    row.className = 'setting-row';
+    const lbl = document.createElement('label');
+    lbl.textContent = label;
+    lbl.style.cssText = 'flex:1; font-size:12px;';
+    const valSpan = document.createElement('span');
+    valSpan.style.cssText = 'font-size:11px; color:var(--text-dim); min-width:40px; text-align:right; margin-right:6px;';
+    valSpan.textContent = String(settings[key]) + suffix;
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.value = String(settings[key]);
+    input.style.cssText = 'width:90px;';
+    input.addEventListener('input', () => {
+      const v = Number(input.value);
+      (settings as any)[key] = v;
+      valSpan.textContent = (step < 1 ? v.toFixed(2) : String(v)) + suffix;
+    });
+    row.appendChild(lbl);
+    row.appendChild(valSpan);
+    row.appendChild(input);
+    panel.appendChild(row);
+  };
+
+  // Helper: add a toggle row
+  const toggle = (label: string, key: keyof typeof settings) => {
+    const row = document.createElement('div');
+    row.className = 'setting-row';
+    const lbl = document.createElement('label');
+    lbl.textContent = label;
+    lbl.style.cssText = 'flex:1; font-size:12px;';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!settings[key];
+    cb.style.cssText = 'width:auto;';
+    cb.addEventListener('change', () => { (settings as any)[key] = cb.checked; });
+    row.appendChild(lbl);
+    row.appendChild(cb);
+    panel.appendChild(row);
+  };
+
+  // Helper: add a select row
+  const select = (label: string, key: keyof typeof settings, options: { value: string; label: string }[]) => {
+    const row = document.createElement('div');
+    row.className = 'setting-row';
+    const lbl = document.createElement('label');
+    lbl.textContent = label;
+    lbl.style.cssText = 'flex:1; font-size:12px;';
+    const sel = document.createElement('select');
+    for (const opt of options) {
+      const o = document.createElement('option');
+      o.value = opt.value;
+      o.textContent = opt.label;
+      if (String(settings[key]) === opt.value) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', () => { (settings as any)[key] = sel.value; });
+    row.appendChild(lbl);
+    row.appendChild(sel);
+    panel.appendChild(row);
+  };
+
+  // ── Feature Extraction ──
+  section('Feature Extraction');
+  slider('Max Images', 'maxImages', 4, 50, 1);
+  slider('Align Scale (px)', 'alignScale', 512, 3072, 128, 'px');
+  slider('ORB Features', 'orbFeatures', 500, 10000, 500);
+  slider('Ratio Test', 'ratioTest', 0.5, 0.95, 0.05);
+  slider('RANSAC Threshold', 'ransacThreshPx', 1, 10, 0.5, 'px');
+
+  // ── Matching ──
+  section('Matching');
+  slider('Pair Window', 'pairWindowW', 2, 20, 1);
+  toggle('Match All Pairs', 'matchAllPairs');
+  slider('LM Iterations', 'refineIters', 0, 100, 5);
+  slider('APAP Grid', 'meshGrid', 0, 24, 2);
+
+  // ── Compositing ──
+  section('Compositing');
+  select('Seam Method', 'seamMethod', [
+    { value: 'graphcut', label: 'Graph Cut' },
+    { value: 'feather', label: 'Feather Only' },
+  ]);
+  slider('Block Size', 'seamBlockSize', 4, 64, 4, 'px');
+  slider('Feather Width', 'featherWidth', 5, 200, 5, 'px');
+  toggle('Multi-band Blend', 'multibandEnabled');
+  slider('Pyramid Levels (0=auto)', 'multibandLevels', 0, 7, 1);
+  toggle('Exposure Compensation', 'exposureComp');
+
+  // ── AI / ML ──
+  section('AI / ML');
+  toggle('Saliency-aware Seams', 'saliencyEnabled');
+  toggle('Blur-aware Stitching', 'blurAwareStitching');
+
+  // ── Lens Corrections ──
+  section('Lens Corrections');
+  toggle('Vignette Correction', 'vignetteCorrection');
+  toggle('Cylindrical Projection', 'cylindricalProjection');
+  toggle('Lens Distortion Corr.', 'lensDistortionCorrection');
+
+  // ── Export ──
+  section('Export');
+  slider('Export Scale', 'exportScale', 0.1, 1.0, 0.05);
+  select('Format', 'exportFormat', [
+    { value: 'png', label: 'PNG' },
+    { value: 'jpeg', label: 'JPEG' },
+  ]);
+  slider('JPEG Quality', 'exportJpegQuality', 0.5, 1.0, 0.05);
+  toggle('Max Resolution Export', 'maxResExport');
+
+  // ── Depth (experimental) ──
+  section('Depth (Experimental)');
+  toggle('Depth Enabled', 'depthEnabled');
+  slider('Depth Input Size', 'depthInputSize', 64, 512, 64, 'px');
+  slider('Depth Seam Bias', 'depthSeamBias', 0, 3, 0.1);
+
+  // Reset to defaults button
+  const resetRow = document.createElement('div');
+  resetRow.style.cssText = 'margin-top:16px; text-align:center;';
+  const resetBtn = document.createElement('button');
+  resetBtn.textContent = 'Reset to Defaults';
+  resetBtn.style.cssText = 'font-size:12px; padding:6px 16px; background:var(--surface2); border:1px solid var(--border); color:var(--text); border-radius:4px; cursor:pointer;';
+  resetBtn.addEventListener('click', () => {
+    const { resolvedMode } = getState();
+    setState({ settings: getPreset(resolvedMode || 'desktopHQ') });
+    buildSettingsPanel();
+  });
+  resetRow.appendChild(resetBtn);
+  panel.appendChild(resetRow);
+}
+
 // ── init ─────────────────────────────────────────────────
 export function initUI(): void {
   // File input
@@ -446,6 +600,7 @@ export function initUI(): void {
   renderImageList();
   updateCanvasPlaceholder();
   updateStitchButton();
+  buildSettingsPanel();
 }
 
 export { renderCapabilities, setStatus, startProgress, endProgress, updateProgress };
