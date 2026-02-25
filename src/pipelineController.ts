@@ -143,33 +143,6 @@ export function getLastVignette(): Map<string, VignetteParams> {
   return lastVignette;
 }
 
-/** Per-image seam masks (Uint8 alpha mask at alignment scale). */
-export interface SeamMask {
-  imageId: string;
-  mask: Uint8Array;     // alpha mask [0..255] at alignment scale
-  width: number;
-  height: number;
-  offsetX: number;      // offset in global composite coords
-  offsetY: number;
-}
-let lastSeamMasks: Map<string, SeamMask> = new Map();
-
-export function getLastSeamMasks(): Map<string, SeamMask> {
-  return lastSeamMasks;
-}
-
-/** Computed global bounding box of the composite. */
-export interface CompositeBounds {
-  minX: number; minY: number;
-  maxX: number; maxY: number;
-  width: number; height: number;
-}
-let lastCompositeBounds: CompositeBounds | null = null;
-
-export function getLastCompositeBounds(): CompositeBounds | null {
-  return lastCompositeBounds;
-}
-
 /** Per-image face detection results. */
 let lastFaces: Map<string, FaceRect[]> = new Map();
 
@@ -851,20 +824,25 @@ export async function runStitchPreview(): Promise<void> {
         if (!img) continue;
         const feat = lastFeatures.get(id);
         if (!feat) continue;
-        // Re-add image with depth buffer
-        const depthBuf = dm.depth.buffer.slice(0) as ArrayBuffer;
-        workerManager!.sendCV({
-          type: 'addImage',
-          imageId: id,
-          grayBuffer: new Uint8ClampedArray(1).buffer as ArrayBuffer, // dummy, already have gray
-          width: feat.keypoints.length > 0 ? Math.round(img.width * feat.scaleFactor) : img.width,
-          height: feat.keypoints.length > 0 ? Math.round(img.height * feat.scaleFactor) : img.height,
-          depth: depthBuf,
-        }, [depthBuf]);
-        await workerManager!.waitCV('progress', 5000);
+        try {
+          // Re-add image with depth buffer
+          const depthBuf = dm.depth.buffer.slice(0) as ArrayBuffer;
+          workerManager!.sendCV({
+            type: 'addImage',
+            imageId: id,
+            grayBuffer: new Uint8ClampedArray(1).buffer as ArrayBuffer, // dummy, already have gray
+            width: feat.keypoints.length > 0 ? Math.round(img.width * feat.scaleFactor) : img.width,
+            height: feat.keypoints.length > 0 ? Math.round(img.height * feat.scaleFactor) : img.height,
+            depth: depthBuf,
+          }, [depthBuf]);
+          await workerManager!.waitCV('progress', 5000);
+        } catch (e) {
+          console.warn(`Failed to re-send depth for ${id}, continuing without depth weighting:`, e);
+        }
       }
     }
 
+    let meshDone = 0; // separate counter excluding skipped reference image
     for (let idx = 0; idx < lastMstOrder.length; idx++) {
       const nodeId = lastMstOrder[idx];
       const parentId = lastMstParent[nodeId];
@@ -907,10 +885,11 @@ export async function runStitchPreview(): Promise<void> {
         bounds: meshMsg.bounds,
       });
 
+      meshDone++;
       const meshTotal = lastMstOrder.length - 1;
-      const meshPct = Math.round(((idx + 1) / meshTotal) * 100);
-      setStatus(`Computing adaptive meshes (${meshPct}%) — ${idx + 1}/${meshTotal}`);
-      updateProgress('apap', (idx + 1) / meshTotal);
+      const meshPct = Math.min(100, Math.round((meshDone / meshTotal) * 100));
+      setStatus(`Computing adaptive meshes (${meshPct}%) — ${meshDone}/${meshTotal}`);
+      updateProgress('apap', Math.min(1, meshDone / meshTotal));
     }
 
     setStatus(`Adaptive meshes computed for ${lastMeshes.size} images.`);

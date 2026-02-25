@@ -440,7 +440,7 @@ self.addEventListener('message', async (ev) => {
             // Determine which point belongs to this image
             const isI = (edge.i === id);
             const px = isI ? xi : xj, py = isI ? yi : yj;
-            const qx = isI ? xj : yj, qy = isI ? yj : xj;
+            const qx = isI ? xj : xi, qy = isI ? yj : yi;
 
             // Normalised radius
             const dx = px - cx, dy = py - cy;
@@ -1204,6 +1204,14 @@ self.addEventListener('message', async (ev) => {
           continue;
         }
 
+        // Check for NaN in delta (degenerate numeric solve)
+        let hasNaN = false;
+        for (let i = 0; i < delta.length; i++) { if (isNaN(delta[i])) { hasNaN = true; break; } }
+        if (hasNaN) {
+          lambda *= 10;
+          continue;
+        }
+
         // Trial step
         const oldParams = new Float64Array(params);
         for (let i = 0; i < paramCount; i++) {
@@ -1719,11 +1727,15 @@ function checkConnectivity(ids, edges) {
  * - Any source corner projects behind the camera
  */
 function isHomographyValid(H, srcW, srcH) {
-  // Normalize H so H[8] = 1 before checking
-  if (Math.abs(H[8]) > 1e-10) {
-    const inv = 1.0 / H[8];
-    for (let i = 0; i < 9; i++) H[i] *= inv;
+  // Work on a local copy to avoid mutating the caller's homography array
+  const Hn = new Float64Array(9);
+  for (let i = 0; i < 9; i++) Hn[i] = H[i];
+  // Normalize so Hn[8] = 1 before checking
+  if (Math.abs(Hn[8]) > 1e-10) {
+    const inv = 1.0 / Hn[8];
+    for (let i = 0; i < 9; i++) Hn[i] *= inv;
   }
+  H = Hn; // use local copy for rest of function
 
   // Compute local affine Jacobian at the image centre (more robust than
   // top-left 2×2 for perspective homographies with non-trivial H[6], H[7]).

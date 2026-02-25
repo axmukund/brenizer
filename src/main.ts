@@ -1,12 +1,12 @@
 import { detectCapabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
-import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress } from './ui';
+import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel } from './ui';
 import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
   createPyramidBlender,
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
-  makeViewMatrix, computeBlockCosts, labelsToMask, featherMask, estimateOverlapWidth,
+  makeViewMatrix, computeBlockCosts, labelsToMask, featherMask,
   createMaskTexture,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
   type PyramidBlender, type ManagedTexture, type FaceRectComposite,
@@ -27,6 +27,66 @@ let pyramidBlender: PyramidBlender | null = null;
 /** Sanitize a gain value: replace NaN/Infinity/non-positive with 1.0. */
 function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
+}
+
+/**
+ * Project a per-image saliency map into composite pixel coordinates.
+ * For each composite pixel, inverse-warp through T to image-space and sample.
+ * Returns null if no saliency data is available.
+ */
+function projectSaliencyToComposite(
+  imgId: string,
+  T: Float64Array,
+  minX: number, minY: number,
+  compositeScale: number,
+  compW: number, compH: number,
+  saliencyMaps: Map<string, import('./pipelineController').SaliencyData>,
+): Float32Array | null {
+  const sal = saliencyMaps.get(imgId);
+  if (!sal) return null;
+  const sw = sal.width, sh = sal.height;
+  const sMap = sal.saliency;
+  if (sMap.length < sw * sh) return null;
+
+  // Compute inverse of T for back-projection
+  const a = T[0], b = T[1], c = T[2];
+  const d = T[3], e = T[4], f = T[5];
+  const g = T[6], h = T[7], k = T[8];
+  const det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+  if (Math.abs(det) < 1e-15) return null;
+  const invDet = 1 / det;
+  const Ti = new Float64Array([
+    (e * k - f * h) * invDet, (c * h - b * k) * invDet, (b * f - c * e) * invDet,
+    (f * g - d * k) * invDet, (a * k - c * g) * invDet, (c * d - a * f) * invDet,
+    (d * h - e * g) * invDet, (b * g - a * h) * invDet, (a * e - b * d) * invDet,
+  ]);
+
+  const out = new Float32Array(compW * compH);
+  // Sparse sampling: sample every 4th pixel for speed, fill gaps
+  const step = 4;
+  for (let cy = 0; cy < compH; cy += step) {
+    for (let cx = 0; cx < compW; cx += step) {
+      // Composite pixel → global alignment coords
+      const gx = cx / compositeScale + minX;
+      const gy = cy / compositeScale + minY;
+      // Global → image coords via T^{-1}
+      const denom = Ti[6] * gx + Ti[7] * gy + Ti[8];
+      if (Math.abs(denom) < 1e-8) continue;
+      const ix = (Ti[0] * gx + Ti[1] * gy + Ti[2]) / denom;
+      const iy = (Ti[3] * gx + Ti[4] * gy + Ti[5]) / denom;
+      if (ix < 0 || ix >= sw - 1 || iy < 0 || iy >= sh - 1) continue;
+      // Nearest-neighbor sample from saliency map
+      const si = Math.round(iy) * sw + Math.round(ix);
+      const val = sMap[si] ?? 0;
+      // Fill the step×step block
+      for (let dy = 0; dy < step && cy + dy < compH; dy++) {
+        for (let dx = 0; dx < step && cx + dx < compW; dx++) {
+          out[(cy + dy) * compW + (cx + dx)] = val;
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /** Expose for UI to trigger image preview via WebGL */
@@ -76,8 +136,6 @@ export function renderKeypointOverlay(imageId: string, imgW: number, imgH: numbe
   const sf = features.scaleFactor;
   const origW = imgW;
   const origH = imgH;
-  const alignW = Math.round(origW * sf);
-  const alignH = Math.round(origH * sf);
 
   // Scale keypoints from alignment coords to original image coords
   const kps = features.keypoints;
@@ -146,6 +204,7 @@ async function boot(): Promise<void> {
       if (newMode !== s.resolvedMode) {
         const newSettings = getPreset(newMode);
         setState({ resolvedMode: newMode, settings: newSettings });
+        buildSettingsPanel(); // rebuild settings UI for new mode
         setStatus(`Mode changed to ${newMode}`);
       }
     }
@@ -215,13 +274,10 @@ async function boot(): Promise<void> {
     const active = images.filter(i => !i.excluded);
     if (active.length === 0 || !glCtx || !warpRenderer) return;
 
-    // Re-render the first image then overlay keypoints for all
+    // Re-render the first image then overlay its keypoints
     const first = active[0];
     await renderImagePreview(first);
-
-    for (const img of active) {
-      renderKeypointOverlay(img.id, img.width, img.height);
-    }
+    renderKeypointOverlay(first.id, first.width, first.height);
   });
 
   // Display match edge info after matching completes
@@ -712,6 +768,7 @@ async function renderWarpedPreview(
   // Pre-allocate readback buffers for compositing (reused each iteration)
   const _compPixels = new Uint8Array(compW * compH * 4);
   const _newPixels = new Uint8Array(compW * compH * 4);
+  const saliencyMaps = getLastSaliency();
 
   for (const imgId of mstOrder) {
     const img = images.find(i => i.id === imgId);
@@ -821,7 +878,8 @@ async function renderWarpedPreview(
       if (curFaces) {
         for (const f of curFaces) seamFaces.push({ ...f, imageLabel: 1 });
       }
-      const costs = computeBlockCosts(compPixels, newPixels, compW, compH, blockSize, 0, seamFaces);
+      const costs = computeBlockCosts(compPixels, newPixels, compW, compH, blockSize, 0, seamFaces,
+        projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, compW, compH, saliencyMaps));
 
       // Send to seam worker
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
@@ -1183,6 +1241,11 @@ async function exportComposite(): Promise<void> {
     if (projected.length > 0) facesInExportCoords.set(imgId, projected);
   }
 
+  // Saliency maps + pre-allocate readback buffers for export compositing
+  const exportSaliencyMaps = getLastSaliency();
+  const _expCompPixels = new Uint8Array(outW * outH * 4);
+  const _expNewPixels = new Uint8Array(outW * outH * 4);
+
   for (const imgId of mstOrder) {
     const img = active.find(i => i.id === imgId);
     if (!img) continue;
@@ -1268,9 +1331,9 @@ async function exportComposite(): Promise<void> {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
     } else if (useGraphCut) {
-      // Graph cut seam finding
-      const compPixels = new Uint8Array(outW * outH * 4);
-      const newPixels = new Uint8Array(outW * outH * 4);
+      // Graph cut seam finding — reuse pre-allocated buffers
+      const compPixels = _expCompPixels;
+      const newPixels = _expNewPixels;
       gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
@@ -1288,7 +1351,8 @@ async function exportComposite(): Promise<void> {
       if (curFacesExport) {
         for (const f of curFacesExport) seamFacesExport.push({ ...f, imageLabel: 1 });
       }
-      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize, 0, seamFacesExport);
+      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize, 0, seamFacesExport,
+        projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, outW, outH, exportSaliencyMaps));
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
       const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;

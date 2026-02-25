@@ -167,7 +167,6 @@ let dragSrcIdx: number | null = null;
 function renderImageList(): void {
   const list = $('image-list');
   const { images } = getState();
-  const empty = $('empty-state');
 
   // Clear children except empty-state
   list.innerHTML = '';
@@ -401,7 +400,7 @@ function updateStitchButton(): void {
 // ── Settings panel ───────────────────────────────────────
 
 /** Build the interactive settings panel from current PipelineSettings. */
-function buildSettingsPanel(): void {
+export function buildSettingsPanel(): void {
   const panel = $('settings-panel');
   const { settings } = getState();
   if (!settings) return;
