@@ -112,6 +112,8 @@ export interface Compositor {
 
 /**
  * Create block-grid seam costs from two RGBA pixel buffers.
+ * Uses distance-from-boundary data costs so the seam goes through the
+ * centre of the overlap zone rather than hugging image edges.
  * Returns { dataCosts, edgeWeights, hardConstraints } for seam-worker.
  */
 export function computeBlockCosts(
@@ -135,83 +137,125 @@ export function computeBlockCosts(
   const dataCosts = new Float32Array(nNodes * 2);
   const hardConstraints = new Uint8Array(nNodes);
 
-  // Compute per-block data terms
+  // ── Per-block alpha coverage ────────────────────────────
+  // Instead of single center-pixel alpha, sample multiple pixels per block
+  // to robustly determine which images have data.
+  const compHasBlock = new Uint8Array(nNodes);  // 1 = composite has data
+  const newHasBlock = new Uint8Array(nNodes);   // 1 = new image has data
+
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW; gx++) {
       const nodeIdx = gy * gridW + gx;
+      // Sample a 3×3 grid within the block for robust alpha detection
+      let compCount = 0, newCount = 0;
+      const samples = 3;
+      for (let sy = 0; sy < samples; sy++) {
+        for (let sx = 0; sx < samples; sx++) {
+          const px = Math.min(gx * blockSize + Math.round((sx + 0.5) * blockSize / samples), compW - 1);
+          const py = Math.min(gy * blockSize + Math.round((sy + 0.5) * blockSize / samples), compH - 1);
+          const idx = (py * compW + px) * 4 + 3;
+          if (compositePixels[idx] > 10) compCount++;
+          if (newImagePixels[idx] > 10) newCount++;
+        }
+      }
+      // Require majority coverage to count as "has data"
+      const thresh = Math.ceil(samples * samples * 0.5);
+      compHasBlock[nodeIdx] = compCount >= thresh ? 1 : 0;
+      newHasBlock[nodeIdx] = newCount >= thresh ? 1 : 0;
+    }
+  }
 
-      // Sample center pixel of block
-      const cx = Math.min(gx * blockSize + Math.floor(blockSize / 2), compW - 1);
-      const cy = Math.min(gy * blockSize + Math.floor(blockSize / 2), compH - 1);
-      const pixIdx = (cy * compW + cx) * 4;
+  // ── Distance-from-boundary via Chebyshev BFS ───────────
+  // For each image, compute distance from the nearest block WITHOUT data.
+  // Blocks far from their boundary → strong preference to keep that image.
+  const compDist = computeBlockDistanceField(compHasBlock, gridW, gridH);
+  const newDist = computeBlockDistanceField(newHasBlock, gridW, gridH);
 
-      const compR = compositePixels[pixIdx];
-      const compG = compositePixels[pixIdx + 1];
-      const compB = compositePixels[pixIdx + 2];
-      const compA = compositePixels[pixIdx + 3];
+  // Normalise distances for data cost weighting
+  let maxCompDist = 1, maxNewDist = 1;
+  for (let i = 0; i < nNodes; i++) {
+    if (compDist[i] > maxCompDist) maxCompDist = compDist[i];
+    if (newDist[i] > maxNewDist) maxNewDist = newDist[i];
+  }
 
-      const newR = newImagePixels[pixIdx];
-      const newG = newImagePixels[pixIdx + 1];
-      const newB = newImagePixels[pixIdx + 2];
-      const newA = newImagePixels[pixIdx + 3];
+  // ── Set hard constraints and data costs ─────────────────
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      const nodeIdx = gy * gridW + gx;
+      const cHas = compHasBlock[nodeIdx];
+      const nHas = newHasBlock[nodeIdx];
 
-      const compHasData = compA > 10;
-      const newHasData = newA > 10;
-
-      if (!compHasData && !newHasData) {
-        // Neither has data — free
+      if (!cHas && !nHas) {
         dataCosts[nodeIdx * 2] = 0;
         dataCosts[nodeIdx * 2 + 1] = 0;
-      } else if (compHasData && !newHasData) {
-        // Only composite — force keep composite
+      } else if (cHas && !nHas) {
         hardConstraints[nodeIdx] = 1;
-        dataCosts[nodeIdx * 2] = 0;
-        dataCosts[nodeIdx * 2 + 1] = 0;
-      } else if (!compHasData && newHasData) {
-        // Only new — force take new
+      } else if (!cHas && nHas) {
         hardConstraints[nodeIdx] = 2;
-        dataCosts[nodeIdx * 2] = 0;
-        dataCosts[nodeIdx * 2 + 1] = 0;
       } else {
-        // Both have data — overlap region
-        // Color difference as data cost (slightly prefer composite to avoid unnecessary cuts)
-        const diffR = Math.abs(compR - newR) / 255;
-        const diffG = Math.abs(compG - newG) / 255;
-        const diffB = Math.abs(compB - newB) / 255;
-        const diff = (diffR + diffG + diffB) / 3;
+        // ── Overlap: distance-based preference ───────
+        // Prefer the image whose boundary is FURTHER away (more interior).
+        // Also add a small color-difference term so the seam follows edges.
+        const cD = compDist[nodeIdx] / maxCompDist;   // 0..1 (0 = near edge, 1 = deep interior)
+        const nD = newDist[nodeIdx] / maxNewDist;
 
-        // Cost for keeping composite (slightly lower = prefer composite where similar)
-        dataCosts[nodeIdx * 2] = diff * 0.5;
-        // Cost for taking new (slightly higher = prefer composite where similar)
-        dataCosts[nodeIdx * 2 + 1] = diff * 0.5;
+        // Sample center pixel for color difference term
+        const cx = Math.min(gx * blockSize + (blockSize >> 1), compW - 1);
+        const cy = Math.min(gy * blockSize + (blockSize >> 1), compH - 1);
+        const pixIdx = (cy * compW + cx) * 4;
+
+        const diffR = Math.abs(compositePixels[pixIdx] - newImagePixels[pixIdx]) / 255;
+        const diffG = Math.abs(compositePixels[pixIdx + 1] - newImagePixels[pixIdx + 1]) / 255;
+        const diffB = Math.abs(compositePixels[pixIdx + 2] - newImagePixels[pixIdx + 2]) / 255;
+        const colorDiff = (diffR + diffG + diffB) / 3;
+
+        // Cost for label=composite: high when FAR from composite boundary (penalise keeping
+        // composite in the deep interior of the NEW image).
+        // Cost for label=new: high when FAR from new boundary (penalise taking new image
+        // in the deep interior of the composite).
+        // Result: seam goes through the zone where both distances are roughly equal —
+        // the centre of the overlap.
+        const distWeight = 0.8;
+        const colWeight = 0.2;
+
+        dataCosts[nodeIdx * 2]     = distWeight * (1.0 - cD) + colWeight * colorDiff;
+        dataCosts[nodeIdx * 2 + 1] = distWeight * (1.0 - nD) + colWeight * colorDiff;
       }
     }
   }
 
-  // Compute edge weights (smoothness term between adjacent blocks)
+  // ── Edge weights (smoothness term) ──────────────────────
+  // Use multi-pixel sampling along the block boundary for more robust gradient
+  // detection. Weight = 1 − maxGradient (seam prefers to cut through strong edges).
   const nHEdges = (gridW - 1) * gridH;
   const nVEdges = gridW * (gridH - 1);
   const edgeWeights = new Float32Array(nHEdges + nVEdges);
+
+  const edgeSamples = Math.max(2, Math.min(blockSize, 8)); // sample up to 8 pixels per edge
 
   // Horizontal edges
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW - 1; gx++) {
       const eIdx = gy * (gridW - 1) + gx;
-      // Sample boundary between blocks gx and gx+1
       const bx = Math.min((gx + 1) * blockSize, compW - 1);
-      const by = Math.min(gy * blockSize + Math.floor(blockSize / 2), compH - 1);
-      const pixIdx = (by * compW + bx) * 4;
-
-      // Weight inversely proportional to color gradient in composite+new
-      const compGrad = Math.abs(
-        compositePixels[pixIdx] - compositePixels[Math.max(0, pixIdx - 4)]
-      ) / 255;
-      const newGrad = Math.abs(
-        newImagePixels[pixIdx] - newImagePixels[Math.max(0, pixIdx - 4)]
-      ) / 255;
-      const grad = Math.max(compGrad, newGrad);
-      // High weight where image is smooth (seam should go through edges/gradients)
-      edgeWeights[eIdx] = Math.max(0.01, 1.0 - grad);
+      let maxGrad = 0;
+      for (let s = 0; s < edgeSamples; s++) {
+        const by = Math.min(gy * blockSize + Math.round((s + 0.5) * blockSize / edgeSamples), compH - 1);
+        const pixIdx = (by * compW + bx) * 4;
+        const prevIdx = Math.max(0, pixIdx - 4);
+        // Use colour difference both within each image and cross-image
+        let grad = 0;
+        for (let ch = 0; ch < 3; ch++) {
+          const cg = Math.abs(compositePixels[pixIdx + ch] - compositePixels[prevIdx + ch]);
+          const ng = Math.abs(newImagePixels[pixIdx + ch] - newImagePixels[prevIdx + ch]);
+          // Also cross-image difference at boundary (seam-quality metric)
+          const xg = Math.abs(compositePixels[pixIdx + ch] - newImagePixels[pixIdx + ch]);
+          grad += Math.max(cg, ng, xg);
+        }
+        grad /= (255 * 3);
+        if (grad > maxGrad) maxGrad = grad;
+      }
+      edgeWeights[eIdx] = Math.max(0.01, 1.0 - maxGrad);
     }
   }
 
@@ -219,23 +263,67 @@ export function computeBlockCosts(
   for (let gy = 0; gy < gridH - 1; gy++) {
     for (let gx = 0; gx < gridW; gx++) {
       const eIdx = nHEdges + gy * gridW + gx;
-      const bx = Math.min(gx * blockSize + Math.floor(blockSize / 2), compW - 1);
       const by = Math.min((gy + 1) * blockSize, compH - 1);
-      const pixIdx = (by * compW + bx) * 4;
-
       const stride = compW * 4;
-      const compGrad = Math.abs(
-        compositePixels[pixIdx] - compositePixels[Math.max(0, pixIdx - stride)]
-      ) / 255;
-      const newGrad = Math.abs(
-        newImagePixels[pixIdx] - newImagePixels[Math.max(0, pixIdx - stride)]
-      ) / 255;
-      const grad = Math.max(compGrad, newGrad);
-      edgeWeights[eIdx] = Math.max(0.01, 1.0 - grad);
+      let maxGrad = 0;
+      for (let s = 0; s < edgeSamples; s++) {
+        const bx = Math.min(gx * blockSize + Math.round((s + 0.5) * blockSize / edgeSamples), compW - 1);
+        const pixIdx = (by * compW + bx) * 4;
+        const prevIdx = Math.max(0, pixIdx - stride);
+        let grad = 0;
+        for (let ch = 0; ch < 3; ch++) {
+          const cg = Math.abs(compositePixels[pixIdx + ch] - compositePixels[prevIdx + ch]);
+          const ng = Math.abs(newImagePixels[pixIdx + ch] - newImagePixels[prevIdx + ch]);
+          const xg = Math.abs(compositePixels[pixIdx + ch] - newImagePixels[pixIdx + ch]);
+          grad += Math.max(cg, ng, xg);
+        }
+        grad /= (255 * 3);
+        if (grad > maxGrad) maxGrad = grad;
+      }
+      edgeWeights[eIdx] = Math.max(0.01, 1.0 - maxGrad);
     }
   }
 
   return { gridW, gridH, dataCosts, edgeWeights, hardConstraints };
+}
+
+/**
+ * Compute Chebyshev distance transform on a binary block grid.
+ * Distance = 0 at boundary (adjacent to a 0-block or grid edge), increases inward.
+ * Uses two-pass raster scan (O(n) approximation of the exact distance transform).
+ */
+function computeBlockDistanceField(
+  hasData: Uint8Array,
+  gridW: number,
+  gridH: number,
+): Float32Array {
+  const dist = new Float32Array(gridW * gridH);
+  const INF = gridW + gridH;
+
+  // Initialise: 0 for blocks without data, INF for blocks with data
+  for (let i = 0; i < dist.length; i++) {
+    dist[i] = hasData[i] ? INF : 0;
+  }
+
+  // Forward pass (top-left → bottom-right)
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      const idx = gy * gridW + gx;
+      if (gx > 0) dist[idx] = Math.min(dist[idx], dist[idx - 1] + 1);
+      if (gy > 0) dist[idx] = Math.min(dist[idx], dist[(gy - 1) * gridW + gx] + 1);
+    }
+  }
+
+  // Backward pass (bottom-right → top-left)
+  for (let gy = gridH - 1; gy >= 0; gy--) {
+    for (let gx = gridW - 1; gx >= 0; gx--) {
+      const idx = gy * gridW + gx;
+      if (gx < gridW - 1) dist[idx] = Math.min(dist[idx], dist[idx + 1] + 1);
+      if (gy < gridH - 1) dist[idx] = Math.min(dist[idx], dist[(gy + 1) * gridW + gx] + 1);
+    }
+  }
+
+  return dist;
 }
 
 /**

@@ -922,10 +922,13 @@ function checkConnectivity(ids, edges) {
 
 /**
  * Validate that a homography is physically plausible for panorama stitching.
+ * Uses the Jacobian at the image centre (not just the top-left 2×2) so that
+ * perspective terms don't cause false-positive reflection detection.
  * Rejects if:
- * - Top-left 2x2 submatrix has negative determinant (reflection)
+ * - Local affine Jacobian at image centre has negative determinant (reflection)
  * - Rotation angle > 120 degrees (likely spurious match)
  * - Extreme scale change (>4x or <0.25x)
+ * - Any source corner projects behind the camera
  */
 function isHomographyValid(H, srcW, srcH) {
   // Normalize H so H[8] = 1 before checking
@@ -934,11 +937,28 @@ function isHomographyValid(H, srcW, srcH) {
     for (let i = 0; i < 9; i++) H[i] *= inv;
   }
 
-  // Extract top-left 2x2 affine part
-  const a = H[0], b = H[1];
-  const c = H[3], d = H[4];
-  
-  // Determinant of 2x2 affine part — negative means reflection
+  // Compute local affine Jacobian at the image centre (more robust than
+  // top-left 2×2 for perspective homographies with non-trivial H[6], H[7]).
+  const cx = (srcW || 100) * 0.5;
+  const cy = (srcH || 100) * 0.5;
+  const w = H[6] * cx + H[7] * cy + H[8];
+  if (w < 0.1) {
+    console.warn('Homography rejected: image centre behind camera');
+    return false;
+  }
+  const w2 = w * w;
+  const u = H[0] * cx + H[1] * cy + H[2];
+  const v = H[3] * cx + H[4] * cy + H[5];
+
+  // Jacobian of the projective warp at (cx, cy):
+  //   dX/dx = (H[0]*w - H[6]*u) / w²     dX/dy = (H[1]*w - H[7]*u) / w²
+  //   dY/dx = (H[3]*w - H[6]*v) / w²     dY/dy = (H[4]*w - H[7]*v) / w²
+  const a = (H[0] * w - H[6] * u) / w2;
+  const b = (H[1] * w - H[7] * u) / w2;
+  const c = (H[3] * w - H[6] * v) / w2;
+  const d = (H[4] * w - H[7] * v) / w2;
+
+  // Determinant of local Jacobian — negative means reflection
   const det2x2 = a * d - b * c;
   if (det2x2 < 0) {
     console.warn('Homography rejected: reflection detected (det < 0)');
@@ -953,15 +973,14 @@ function isHomographyValid(H, srcW, srcH) {
     return false;
   }
   
-  // Compute scale from sqrt(det2x2) — should be near 1 for same-camera images
+  // Compute scale from sqrt(det) — should be near 1 for same-camera images
   const scale = Math.sqrt(Math.abs(det2x2));
   if (scale > 4.0 || scale < 0.25) {
     console.warn(`Homography rejected: extreme scale ${scale.toFixed(2)}x`);
     return false;
   }
 
-  // Check that all 4 corners of the source image project with positive denom
-  // through both H (forward) and H_inv (backward).
+  // Check that all 4 corners of the source image project with positive denom.
   // This rejects homographies where the perspective vanishing line intersects the image.
   if (srcW && srcH) {
     const corners = [[0,0], [srcW,0], [srcW,srcH], [0,srcH]];
