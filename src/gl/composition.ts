@@ -313,14 +313,41 @@ export function computeBlockCosts(
   // there, discouraging the graph cut from placing a seam.  Where gradients
   // disagree (low agreement), the weight is lower, inviting a seam cut.
   //
+  // Brenizer blur-aware enhancement: if a saliency map (which includes focus
+  // measure from Laplacian variance) is provided, edges in blurred regions
+  // get REDUCED weights — actively encouraging the seam to pass through
+  // the bokeh zone. This is the key innovation for Brenizer composites.
+  //
   // Concretely, each boundary edge weight is:
-  //   w = 0.4 × edgeStrength + 0.6 × gradientAgreement
-  // where gradientAgreement = 1 − |∇composite − ∇newImage| (normalised).
+  //   w = (0.4×edgeStrength + 0.6×gradientAgreement) × blurDiscount
+  // where blurDiscount = 1.0 in focused areas, down to 0.2 in blurred areas.
   const nHEdges = (gridW - 1) * gridH;
   const nVEdges = gridW * (gridH - 1);
   const edgeWeights = new Float32Array(nHEdges + nVEdges);
 
   const edgeSamples = Math.max(2, Math.min(blockSize, 8));
+
+  /** Sample average saliency at the boundary between two adjacent blocks. */
+  function sampleBoundarySaliency(bx: number, by: number, isHorizontal: boolean): number {
+    if (!saliencyMap || saliencyMap.length < compW * compH) return 1.0;
+    let sum = 0, count = 0;
+    const samples = 3;
+    for (let s = 0; s < samples; s++) {
+      let px: number, py: number;
+      if (isHorizontal) {
+        px = bx;
+        py = Math.min(by + Math.round((s + 0.5) * blockSize / samples), compH - 1);
+      } else {
+        px = Math.min(bx + Math.round((s + 0.5) * blockSize / samples), compW - 1);
+        py = by;
+      }
+      if (px >= 0 && px < compW && py >= 0 && py < compH) {
+        sum += saliencyMap[py * compW + px];
+        count++;
+      }
+    }
+    return count > 0 ? sum / count : 1.0;
+  }
 
   // Horizontal edges
   for (let gy = 0; gy < gridH; gy++) {
@@ -364,7 +391,14 @@ export function computeBlockCosts(
       // we want to cut where gradients AGREE, so low disagreement → good seam)
       const gradientAgreement = Math.max(0.01, 1.0 - avgGradConsistency);
       // Weighted combination: 60% gradient-domain, 40% edge avoidance
-      edgeWeights[eIdx] = 0.4 * edgeStrength + 0.6 * gradientAgreement;
+      let w = 0.4 * edgeStrength + 0.6 * gradientAgreement;
+      // ── Brenizer blur discount ──────────────────────────
+      // In blurred (bokeh) regions, reduce edge weight to encourage the seam
+      // to pass through. Low saliency ≈ blurred ≈ good seam location.
+      const sal = sampleBoundarySaliency(bx, gy * blockSize, true);
+      const blurDiscount = 0.2 + 0.8 * sal; // 0.2 in pure blur → 1.0 in sharp
+      w *= blurDiscount;
+      edgeWeights[eIdx] = w;
     }
   }
 
@@ -400,7 +434,12 @@ export function computeBlockCosts(
       const avgGradConsistency = gradSamples > 0 ? gradConsistencySum / gradSamples : 0;
       const edgeStrength = Math.max(0.01, 1.0 - maxGrad);
       const gradientAgreement = Math.max(0.01, 1.0 - avgGradConsistency);
-      edgeWeights[eIdx] = 0.4 * edgeStrength + 0.6 * gradientAgreement;
+      let vw = 0.4 * edgeStrength + 0.6 * gradientAgreement;
+      // Brenizer blur discount for vertical edges
+      const vSal = sampleBoundarySaliency(gx * blockSize, by, false);
+      const vBlurDiscount = 0.2 + 0.8 * vSal;
+      vw *= vBlurDiscount;
+      edgeWeights[eIdx] = vw;
     }
   }
 
