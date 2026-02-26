@@ -15,7 +15,7 @@ export interface PipelineSettings {
   depthInputSize: number;
   seamMethod: 'graphcut' | 'feather';
   seamBlockSize: number;
-  depthSeamBias: number;
+  depthSeamBias: number;   // reserved (not currently applied in seam cost)
   featherWidth: number;
   multibandEnabled: boolean;
   multibandLevels: number; // 0 = auto
@@ -31,9 +31,9 @@ export interface PipelineSettings {
   maxResExport: boolean;
   /** Blur-aware feature weighting for Brenizer method. */
   blurAwareStitching: boolean;
-  /** Cylindrical projection for wide-FoV panoramas (PTGui-style). */
+  /** Reserved for future cylindrical pre-warp integration. */
   cylindricalProjection: boolean;
-  /** Lens distortion correction using Brown-Conrady model. */
+  /** Reserved for future Brown-Conrady correction pass. */
   lensDistortionCorrection: boolean;
   /** Assume all photos share same camera settings (aperture, focal length,
    *  shutter speed, ISO) and were shot within ~2 min of each other.
@@ -54,7 +54,7 @@ const DESKTOP_HQ: PipelineSettings = {
   ransacThreshPx: 3,
   refineIters: 30,
   meshGrid: 12,
-  depthEnabled: true,
+  depthEnabled: false,
   depthInputSize: 256,
   seamMethod: 'graphcut',
   seamBlockSize: 16,
@@ -85,7 +85,7 @@ const MOBILE_QUALITY: PipelineSettings = {
   ransacThreshPx: 3,
   refineIters: 15,
   meshGrid: 10,
-  depthEnabled: true,
+  depthEnabled: false,
   depthInputSize: 192,
   seamMethod: 'graphcut',
   seamBlockSize: 24,
@@ -116,7 +116,7 @@ const MOBILE_SAFE: PipelineSettings = {
   ransacThreshPx: 3,
   refineIters: 8,
   meshGrid: 8,
-  depthEnabled: true,
+  depthEnabled: false,
   depthInputSize: 128,
   seamMethod: 'graphcut',
   seamBlockSize: 32,

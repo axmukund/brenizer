@@ -184,21 +184,23 @@ export function getWorkerManager(): WorkerManager | null {
 }
 
 /** Initialize all workers. Returns readiness status. */
-export async function initWorkers(): Promise<{ cv: boolean; depth: boolean; seam: boolean }> {
+export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: boolean } = {}): Promise<{ cv: boolean; depth: boolean; seam: boolean }> {
   if (workerManager) {
     workerManager.dispose();
   }
   workerManager = createWorkerManager();
   setStatus('Initializing workers…');
 
-  const result = await workerManager.initAll();
+  const result = await workerManager.initAll(opts);
 
   const parts: string[] = [];
   if (result.cv) parts.push('CV ✓');
   else parts.push('CV ✗');
-  if (result.depth) parts.push('Depth ✓');
+  if (opts.enableDepth === false) parts.push('Depth off');
+  else if (result.depth) parts.push('Depth ✓');
   else parts.push('Depth ✗');
-  if (result.seam) parts.push('Seam ✓');
+  if (opts.enableSeam === false) parts.push('Seam off');
+  else if (result.seam) parts.push('Seam ✓');
   else parts.push('Seam ✗');
 
   setStatus(`Workers: ${parts.join(' | ')}`);
@@ -337,7 +339,10 @@ export async function runStitchPreview(): Promise<void> {
   // Step 1: Init workers
   setStatus('Initializing OpenCV worker…');
   updateProgress('init', 0);
-  const ready = await initWorkers();
+  const ready = await initWorkers({
+    enableDepth: settings.depthEnabled,
+    enableSeam: settings.seamMethod === 'graphcut',
+  });
   updateProgress('init', 1);
   if (!ready.cv) {
     setStatus('CV worker failed to initialize. Cannot stitch.');

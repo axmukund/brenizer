@@ -14,7 +14,7 @@ Upload overlapping photos shot with a wide-aperture lens and get a single large-
 - **APAP local mesh warping** (As-Projective-As-Possible) for parallax reduction
 - **Graph-cut seam finding** (Edmonds–Karp max-flow on coarse block grid)
 - **Laplacian pyramid multi-band blending** (GPU-accelerated)
-- **Depth estimation** — optional ONNX Runtime MiDaS model
+- **Depth estimation** — optional (disabled by default), auto-disabled when ONNX runtime/model is unavailable
 
 ### AI / Saliency-Aware Compositing
 - **Itti–Koch–Niebur saliency model** with Achanta frequency-tuned colour distinctness
@@ -27,9 +27,8 @@ Upload overlapping photos shot with a wide-aperture lens and get a single large-
 - **Polynomial vignetting correction** — PTGui-style radial model
 
 ### PTGui-Style Algorithms
-- **Cylindrical projection** for wide-angle mosaics
-- **Brown–Conrady lens distortion** estimation
 - **Adaptive feathering** based on overlap width
+- **Cylindrical / Brown–Conrady prototypes** exist in worker code (not enabled in default UI pipeline)
 
 ### Export
 - **Max resolution export** at full sensor resolution
@@ -172,6 +171,9 @@ Default levels: $K = 4$ (desktop HQ), $K = 2$ (mobile safe).
 
 ### 11. Cylindrical Projection
 
+*Note:* the worker includes a cylindrical projection stage, but it is currently
+kept as experimental scaffolding and is not enabled by default in the main pipeline.
+
 For wide-angle mosaics, coordinates are projected onto a cylindrical surface:
 
 $$x_{\text{cyl}} = f \cdot \arctan\frac{x - c_x}{f}, \quad y_{\text{cyl}} = f \cdot \frac{y - c_y}{\sqrt{(x-c_x)^2 + f^2}}$$
@@ -179,6 +181,9 @@ $$x_{\text{cyl}} = f \cdot \arctan\frac{x - c_x}{f}, \quad y_{\text{cyl}} = f \c
 where $f$ is the estimated focal length and $(c_x, c_y)$ is the principal point.
 
 ### 12. Brown–Conrady Lens Distortion
+
+*Note:* Brown–Conrady coefficient estimation exists in worker code, but applying
+those coefficients in the main stitch/export pipeline is currently not enabled by default.
 
 Radial distortion coefficients are estimated from matched point residuals:
 
@@ -218,13 +223,12 @@ npm run dev
 
 Open http://localhost:5173 in Chrome.
 
-### Prerequisites
-
-The OpenCV.js WASM build must be placed at `public/opencv/opencv.js`.  
-Download from [@techstark/opencv-js](https://www.npmjs.com/package/@techstark/opencv-js) v4.12:
+The `dev` and `build` scripts automatically copy OpenCV.js from
+`node_modules/@techstark/opencv-js/dist/opencv.js` into `public/opencv/opencv.js`.
+You can run this step explicitly if needed:
 
 ```bash
-cp node_modules/@techstark/opencv-js/dist/opencv.js public/opencv/opencv.js
+npm run prepare:opencv
 ```
 
 ## Build
@@ -235,6 +239,15 @@ npm run build
 
 Output goes to `dist/`.
 
+## Testing
+
+```bash
+npm run test:e2e
+```
+
+The E2E runner starts Vite on port `5176`, uploads test tiles, runs a full stitch,
+and fails if the pipeline errors/times out.
+
 ## Deploy to GitHub Pages
 
 The Vite config supports subpath deployment via the `GH_PAGES_BASE` env variable:
@@ -243,35 +256,44 @@ The Vite config supports subpath deployment via the `GH_PAGES_BASE` env variable
 GH_PAGES_BASE=/your-repo-name/ npm run build
 ```
 
-### GitHub Actions (optional)
+### GitHub Actions
+
+This repo includes [`deploy-pages.yml`](.github/workflows/deploy-pages.yml)
+to build and deploy on pushes to `main`.
 
 ```yaml
-name: Deploy
+name: Deploy GitHub Pages
 on:
   push:
     branches: [main]
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
+    env:
+      GH_PAGES_BASE: /${{ github.event.repository.name }}/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 20
+          cache: npm
       - run: npm ci
-      - run: cp node_modules/@techstark/opencv-js/dist/opencv.js public/opencv/opencv.js
-      - run: GH_PAGES_BASE=/${{ github.event.repository.name }}/ npm run build
+      - run: npm run typecheck
+      - run: npm run build
+      - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with: { path: dist }
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
       - uses: actions/deploy-pages@v4
 ```
 
 ## Known Limitations
 
 - **Large image sets** (>20 images at high resolution) may exceed GPU memory on some devices
-- **WebGPU depth estimation** requires Chrome 113+ with WebGPU enabled
+- **Depth estimation** is off by default and requires both ONNX Runtime availability and a model at `public/models/depth_256.onnx`; otherwise it stays disabled
 - OpenCV.js WASM file is ~11 MB (loaded on first use)
 - Mobile browsers may limit texture sizes to 4096x4096
 - Featureless regions (sky, plain walls) may fail to match — ensure textured overlap
@@ -297,6 +319,9 @@ src/
     workerManager.ts   — worker lifecycle + messaging
     workerTypes.ts     — TypeScript message types
     depth.worker.ts    — ONNX Runtime depth inference
+scripts/
+  prepare-opencv.mjs  — copies OpenCV runtime into public/opencv
+  test-e2e.sh         — launches Vite + runs headless Puppeteer E2E
 public/
   workers/
     cv-worker.js       — ORB, MAGSAC++, LM, APAP, saliency, vignetting

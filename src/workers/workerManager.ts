@@ -10,7 +10,7 @@ import type {
 } from './workerTypes';
 
 export interface WorkerManager {
-  initAll(): Promise<{ cv: boolean; depth: boolean; seam: boolean }>;
+  initAll(opts?: { enableDepth?: boolean; enableSeam?: boolean }): Promise<{ cv: boolean; depth: boolean; seam: boolean }>;
   sendCV(msg: CVInMsg, transfer?: Transferable[]): void;
   sendDepth(msg: DepthInMsg, transfer?: Transferable[]): void;
   sendSeam(msg: SeamInMsg, transfer?: Transferable[]): void;
@@ -116,7 +116,9 @@ export function createWorkerManager(): WorkerManager {
   }
 
   return {
-    async initAll() {
+    async initAll(opts = {}) {
+      const enableDepth = opts.enableDepth !== false;
+      const enableSeam = opts.enableSeam !== false;
       const baseUrl = getBaseUrl();
       const results = { cv: false, depth: false, seam: false };
 
@@ -132,31 +134,35 @@ export function createWorkerManager(): WorkerManager {
       }
 
       // Init Depth worker (best-effort; may fail if no model)
-      try {
-        const w = createDepth();
-        w.postMessage({
-          type: 'init',
-          baseUrl,
-          modelPath: 'models/depth_256.onnx',
-          preferWebGPU: true,
-          targetSize: 256,
-        });
-        await waitForMsg(depthHandlers, 'progress', 60000);
-        results.depth = true;
-        console.log('depth-worker ready');
-      } catch (e) {
-        console.warn('depth-worker init failed (depth disabled):', e);
+      if (enableDepth) {
+        try {
+          const w = createDepth();
+          w.postMessage({
+            type: 'init',
+            baseUrl,
+            modelPath: 'models/depth_256.onnx',
+            preferWebGPU: true,
+            targetSize: 256,
+          });
+          await waitForMsg(depthHandlers, 'progress', 60000);
+          results.depth = true;
+          console.log('depth-worker ready');
+        } catch (e) {
+          console.warn('depth-worker init failed (depth disabled):', e);
+        }
       }
 
       // Init Seam worker (simple JS — should init quickly)
-      try {
-        const w = createSeam();
-        w.postMessage({ type: 'init', baseUrl, maxflowPath: 'wasm/maxflow/maxflow.js' });
-        await waitForMsg(seamHandlers, 'progress', 60000);
-        results.seam = true;
-        console.log('seam-worker ready');
-      } catch (e) {
-        console.warn('seam-worker init failed (seam disabled):', e);
+      if (enableSeam) {
+        try {
+          const w = createSeam();
+          w.postMessage({ type: 'init', baseUrl, maxflowPath: 'wasm/maxflow/maxflow.js' });
+          await waitForMsg(seamHandlers, 'progress', 60000);
+          results.seam = true;
+          console.log('seam-worker ready');
+        } catch (e) {
+          console.warn('seam-worker init failed (seam disabled):', e);
+        }
       }
 
       return results;

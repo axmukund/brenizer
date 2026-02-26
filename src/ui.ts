@@ -527,8 +527,6 @@ export function buildSettingsPanel(): void {
   // ── Lens Corrections ──
   section('Lens Corrections');
   toggle('Vignette Correction', 'vignetteCorrection');
-  toggle('Cylindrical Projection', 'cylindricalProjection');
-  toggle('Lens Distortion Corr.', 'lensDistortionCorrection');
 
   // ── Export ──
   section('Export');
@@ -544,7 +542,6 @@ export function buildSettingsPanel(): void {
   section('Depth (Experimental)');
   toggle('Depth Enabled', 'depthEnabled');
   slider('Depth Input Size', 'depthInputSize', 64, 512, 64, 'px');
-  slider('Depth Seam Bias', 'depthSeamBias', 0, 3, 0.1);
 
   // Reset to defaults button
   const resetRow = document.createElement('div');

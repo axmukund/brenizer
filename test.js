@@ -22,8 +22,8 @@
  */
 import puppeteer from 'puppeteer';
 
-/** URL of the Vite dev server serving the stitcher app */
-const APP_URL = 'http://localhost:5176';
+/** URL of the app under test (override via APP_URL env var) */
+const APP_URL = process.env.APP_URL || 'http://localhost:5176';
 
 /**
  * Landscape test tiles: 3×3 grid of 256×192 PNG crops with 30% overlap.
