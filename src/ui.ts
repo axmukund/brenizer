@@ -520,6 +520,10 @@ export function buildSettingsPanel(): void {
   toggle('Saliency-aware Seams', 'saliencyEnabled');
   toggle('Blur-aware Stitching', 'blurAwareStitching');
 
+  // ── Camera Model ──
+  section('Camera Model');
+  toggle('Same Camera Settings', 'sameCameraSettings');
+
   // ── Lens Corrections ──
   section('Lens Corrections');
   toggle('Vignette Correction', 'vignetteCorrection');

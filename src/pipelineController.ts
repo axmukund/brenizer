@@ -559,7 +559,7 @@ export async function runStitchPreview(): Promise<void> {
       }
     });
 
-    workerManager!.sendCV({ type: 'computeVignetting' });
+    workerManager!.sendCV({ type: 'computeVignetting', pooled: settings.sameCameraSettings });
 
     // Wait for vignetting progress complete
     await new Promise<void>((resolve, reject) => {
@@ -782,6 +782,7 @@ export async function runStitchPreview(): Promise<void> {
     maxIters: settings.refineIters,
     huberDeltaPx: 2.0,
     lambdaInit: 0.01,
+    sameCameraSettings: settings.sameCameraSettings,
   });
 
   const refinedMsg = await refineTransformPromise;
@@ -862,6 +863,7 @@ export async function runStitchPreview(): Promise<void> {
       maxIters: settings.refineIters,
       huberDeltaPx: 2.0,
       lambdaInit: 0.01,
+      sameCameraSettings: settings.sameCameraSettings,
     });
 
     const reRefinedMsg = await reRefinePromise;
@@ -926,7 +928,7 @@ export async function runStitchPreview(): Promise<void> {
       unsub = workerManager!.onCV(handler);
     });
 
-    workerManager!.sendCV({ type: 'computeExposure' });
+    workerManager!.sendCV({ type: 'computeExposure', sameCameraSettings: settings.sameCameraSettings });
 
     const exposureMsg = await exposurePromise;
     for (const g of exposureMsg.gains) {
@@ -1056,6 +1058,7 @@ export async function runStitchPreview(): Promise<void> {
         depthSigma: 0.1,  // depth sigma (normalized)
         minSupport: 4,
         faceRects: lastFaces.get(nodeId) || [],
+        sameCameraSettings: settings.sameCameraSettings,
       });
 
       const meshMsg = await meshPromise;

@@ -383,6 +383,71 @@ self.addEventListener('message', async (ev) => {
     // This follows the approach in PTGui / Autopano (polynomial radial model).
     if (msg.type === 'computeVignetting') {
       const ids = Object.keys(images);
+      const pooled = msg.pooled || false; // If true, estimate single model for all images
+
+      if (pooled && ids.length >= 2) {
+        // ── Pooled vignetting estimation ─────────────────────────
+        // When all images share the same lens+aperture (Brenizer method),
+        // pool radial luminance samples from ALL images for a single,
+        // more robust vignetting model.  N images = N× more data,
+        // greatly reducing noise in the polynomial fit.
+        const nBins = 10;
+        const binSum = new Float64Array(nBins);
+        const binCount = new Float64Array(nBins);
+        const step = 8;
+
+        for (const id of ids) {
+          const img = images[id];
+          const w = img.width, h = img.height;
+          const gray = img.gray;
+          const cx = w / 2, cy = h / 2;
+          const maxR = Math.sqrt(cx * cx + cy * cy);
+          for (let y = 0; y < h; y += step) {
+            for (let x = 0; x < w; x += step) {
+              const dx = x - cx, dy = y - cy;
+              const r = Math.sqrt(dx * dx + dy * dy) / maxR;
+              const bin = Math.min(Math.floor(r * nBins), nBins - 1);
+              binSum[bin] += gray[y * w + x];
+              binCount[bin]++;
+            }
+          }
+        }
+
+        const binMean = new Float64Array(nBins);
+        const centerMean = binCount[0] > 0 ? binSum[0] / binCount[0] : 128;
+        for (let i = 0; i < nBins; i++) {
+          binMean[i] = binCount[i] > 0 ? binSum[i] / binCount[i] : centerMean;
+        }
+
+        let sumR2R2 = 0, sumR2R4 = 0, sumR4R4 = 0;
+        let sumR2T = 0, sumR4T = 0;
+        for (let i = 1; i < nBins; i++) {
+          const r = (i + 0.5) / nBins;
+          const r2 = r * r, r4 = r2 * r2;
+          const target = (centerMean > 10 && binMean[i] > 10)
+            ? (centerMean / binMean[i] - 1.0) : 0;
+          sumR2R2 += r2 * r2; sumR2R4 += r2 * r4; sumR4R4 += r4 * r4;
+          sumR2T += r2 * target; sumR4T += r4 * target;
+        }
+        const det = sumR2R2 * sumR4R4 - sumR2R4 * sumR2R4;
+        let a = 0, b = 0;
+        if (Math.abs(det) > 1e-10) {
+          a = (sumR4R4 * sumR2T - sumR2R4 * sumR4T) / det;
+          b = (sumR2R2 * sumR4T - sumR2R4 * sumR2T) / det;
+        }
+        a = Math.max(-2, Math.min(2, a));
+        b = Math.max(-2, Math.min(2, b));
+
+        // Broadcast same params to all images
+        for (const id of ids) {
+          images[id].vignetteParams = { a, b };
+          postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b } });
+        }
+        postMessage({type:'progress', stage:'vignetting', percent:100, info:`pooled: a=${a.toFixed(4)}, b=${b.toFixed(4)}`});
+        return;
+      }
+
+      // Per-image vignetting (original path)
       for (const id of ids) {
         const img = images[id];
         const w = img.width, h = img.height;
@@ -1090,6 +1155,273 @@ self.addEventListener('message', async (ev) => {
         return;
       }
 
+      // ── Shared-intrinsics rotation-model BA ─────────────────────────────
+      // When all images share same camera (aperture, focal length, ISO),
+      // parameterise each global transform as T_i = K R_i K^{-1} where
+      //   K = [[f,0,cx],[0,f,cy],[0,0,1]]   (shared intrinsics)
+      //   R_i = Rodrigues(r_i)               (per-image rotation, 3 params)
+      // Total parameters: 3(N-1) + 1 vs 8(N-1), ~2.6× fewer.
+      // More constrained → better conditioned → more robust.
+      if (msg.sameCameraSettings && nImages >= 2) {
+        const refImg = images[refId];
+        const cx = refImg ? refImg.width / 2 : 0;
+        const cy = refImg ? refImg.height / 2 : 0;
+
+        // ── Estimate shared focal length from existing homographies ──
+        // Centre each transform and use column orthogonality constraint:
+        //   f² = −(Tc[0]·Tc[1] + Tc[3]·Tc[4]) / (Tc[6]·Tc[7])
+        const fEstimates = [];
+        const C = [1,0,-cx, 0,1,-cy, 0,0,1];
+        const Cinv = [1,0,cx, 0,1,cy, 0,0,1];
+        for (let i = 0; i < nImages; i++) {
+          if (i === refIdx) continue;
+          const T = transforms[ids[i]];
+          const Tc = mulMat3(mulMat3(C, T), Cinv);
+          // Orthogonality constraint
+          const d1 = Tc[6] * Tc[7];
+          if (Math.abs(d1) > 1e-12) {
+            const f2 = -(Tc[0]*Tc[1] + Tc[3]*Tc[4]) / d1;
+            if (f2 > 100) fEstimates.push(Math.sqrt(f2));
+          }
+          // Equal-norm constraint
+          const d2 = Tc[7]*Tc[7] - Tc[6]*Tc[6];
+          if (Math.abs(d2) > 1e-12) {
+            const f2 = (Tc[0]*Tc[0] + Tc[3]*Tc[3] - Tc[1]*Tc[1] - Tc[4]*Tc[4]) / d2;
+            if (f2 > 100) fEstimates.push(Math.sqrt(f2));
+          }
+        }
+        let f0;
+        if (fEstimates.length >= 1) {
+          fEstimates.sort((a, b) => a - b);
+          f0 = fEstimates[Math.floor(fEstimates.length / 2)];
+        } else {
+          f0 = (refImg ? refImg.width : 800) / (2 * Math.tan(25 * Math.PI / 180));
+        }
+        // Clamp to plausible range (10–20000 px)
+        f0 = Math.max(10, Math.min(20000, f0));
+
+        // ── Decompose each transform → Rodrigues vector ──
+        function extractRodrigues(R) {
+          const tr = R[0] + R[4] + R[8];
+          const cosT = Math.max(-1, Math.min(1, (tr - 1) / 2));
+          const theta = Math.acos(cosT);
+          if (theta < 1e-6) return [0, 0, 0];
+          const s = theta / (2 * Math.sin(theta));
+          return [s * (R[7]-R[5]), s * (R[2]-R[6]), s * (R[3]-R[1])];
+        }
+        function rodriguesToR(rx, ry, rz) {
+          const theta = Math.sqrt(rx*rx + ry*ry + rz*rz);
+          if (theta < 1e-10) return [1,0,0, 0,1,0, 0,0,1];
+          const kx=rx/theta, ky=ry/theta, kz=rz/theta;
+          const c=Math.cos(theta), s=Math.sin(theta), v=1-c;
+          return [
+            kx*kx*v+c,    kx*ky*v-kz*s, kx*kz*v+ky*s,
+            kx*ky*v+kz*s, ky*ky*v+c,    ky*kz*v-kx*s,
+            kx*kz*v-ky*s, ky*kz*v+kx*s, kz*kz*v+c
+          ];
+        }
+
+        // Parameter vector: [f, r0_x, r0_y, r0_z, r1_x, ...]  (skip ref)
+        const siPC = 1 + (nImages - 1) * 3;
+        const siP = new Float64Array(siPC);
+        siP[0] = f0;
+        const siOff = new Int32Array(nImages);
+        let soff = 1;
+        for (let i = 0; i < nImages; i++) {
+          if (i === refIdx) { siOff[i] = -1; continue; }
+          siOff[i] = soff;
+          const T = transforms[ids[i]];
+          const K = [f0,0,cx, 0,f0,cy, 0,0,1];
+          const Ki = [1/f0,0,-cx/f0, 0,1/f0,-cy/f0, 0,0,1];
+          const R = mulMat3(mulMat3(Ki, T), K);
+          const rv = extractRodrigues(R);
+          siP[soff] = rv[0]; siP[soff+1] = rv[1]; siP[soff+2] = rv[2];
+          soff += 3;
+        }
+
+        const _siIdent = [1,0,0, 0,1,0, 0,0,1];
+        function siGetT(idx) {
+          if (idx === refIdx) return _siIdent;
+          const f = siP[0], o = siOff[idx];
+          const R = rodriguesToR(siP[o], siP[o+1], siP[o+2]);
+          const K = [f,0,cx, 0,f,cy, 0,0,1];
+          const Ki = [1/f,0,-cx/f, 0,1/f,-cy/f, 0,0,1];
+          return mulMat3(mulMat3(K, R), Ki);
+        }
+
+        function siCost() {
+          let c = 0;
+          for (const obs of residualObs) {
+            const Ti = siGetT(obs.idxI);
+            const di = Ti[6]*obs.xi + Ti[7]*obs.yi + Ti[8];
+            if (Math.abs(di) < 1e-10) { c += huberDelta*huberDelta; continue; }
+            const pix = (Ti[0]*obs.xi + Ti[1]*obs.yi + Ti[2]) / di;
+            const piy = (Ti[3]*obs.xi + Ti[4]*obs.yi + Ti[5]) / di;
+            const Tj = siGetT(obs.idxJ);
+            const dj = Tj[6]*obs.xj + Tj[7]*obs.yj + Tj[8];
+            if (Math.abs(dj) < 1e-10) { c += huberDelta*huberDelta; continue; }
+            const pjx = (Tj[0]*obs.xj + Tj[1]*obs.yj + Tj[2]) / dj;
+            const pjy = (Tj[3]*obs.xj + Tj[4]*obs.yj + Tj[5]) / dj;
+            const dx = pix-pjx, dy = piy-pjy, r2 = dx*dx+dy*dy;
+            c += (r2 <= huberDelta*huberDelta) ? r2 : 2*huberDelta*Math.sqrt(r2) - huberDelta*huberDelta;
+          }
+          return c;
+        }
+
+        // ── LM iteration ──
+        const siEps = 1e-6;
+        let siLambda = lambdaInit;
+        let siPrev = siCost();
+        const siJtJ = new Float64Array(siPC * siPC);
+        const siJtr = new Float64Array(siPC);
+        const siJR = new Float64Array(siPC * 2);
+
+        for (let iter = 0; iter < maxIters; iter++) {
+          siJtJ.fill(0); siJtr.fill(0);
+
+          for (const obs of residualObs) {
+            siJR.fill(0);
+            // Current residual
+            const Ti = siGetT(obs.idxI);
+            const di = Ti[6]*obs.xi + Ti[7]*obs.yi + Ti[8];
+            if (Math.abs(di) < 1e-10) continue;
+            const pix = (Ti[0]*obs.xi + Ti[1]*obs.yi + Ti[2]) / di;
+            const piy = (Ti[3]*obs.xi + Ti[4]*obs.yi + Ti[5]) / di;
+            const Tj = siGetT(obs.idxJ);
+            const dj = Tj[6]*obs.xj + Tj[7]*obs.yj + Tj[8];
+            if (Math.abs(dj) < 1e-10) continue;
+            const pjx = (Tj[0]*obs.xj + Tj[1]*obs.yj + Tj[2]) / dj;
+            const pjy = (Tj[3]*obs.xj + Tj[4]*obs.yj + Tj[5]) / dj;
+            const rx = pix-pjx, ry = piy-pjy, r2 = rx*rx+ry*ry;
+            let w = 1.0;
+            if (r2 > huberDelta*huberDelta) w = huberDelta / Math.sqrt(r2);
+
+            // ∂r/∂f — perturb shared focal length (affects both images)
+            {
+              const old = siP[0];
+              siP[0] = old + siEps;
+              const Tip = siGetT(obs.idxI), Tjp = siGetT(obs.idxJ);
+              siP[0] = old - siEps;
+              const Tim = siGetT(obs.idxI), Tjm = siGetT(obs.idxJ);
+              siP[0] = old;
+              const dip = Tip[6]*obs.xi+Tip[7]*obs.yi+Tip[8];
+              const dim = Tim[6]*obs.xi+Tim[7]*obs.yi+Tim[8];
+              const djp = Tjp[6]*obs.xj+Tjp[7]*obs.yj+Tjp[8];
+              const djm = Tjm[6]*obs.xj+Tjm[7]*obs.yj+Tjm[8];
+              if (Math.abs(dip)>1e-10 && Math.abs(dim)>1e-10 &&
+                  Math.abs(djp)>1e-10 && Math.abs(djm)>1e-10) {
+                const rpx = (Tip[0]*obs.xi+Tip[1]*obs.yi+Tip[2])/dip - (Tjp[0]*obs.xj+Tjp[1]*obs.yj+Tjp[2])/djp;
+                const rpy = (Tip[3]*obs.xi+Tip[4]*obs.yi+Tip[5])/dip - (Tjp[3]*obs.xj+Tjp[4]*obs.yj+Tjp[5])/djp;
+                const rmx = (Tim[0]*obs.xi+Tim[1]*obs.yi+Tim[2])/dim - (Tjm[0]*obs.xj+Tjm[1]*obs.yj+Tjm[2])/djm;
+                const rmy = (Tim[3]*obs.xi+Tim[4]*obs.yi+Tim[5])/dim - (Tjm[3]*obs.xj+Tjm[4]*obs.yj+Tjm[5])/djm;
+                siJR[0] = (rpx - rmx) / (2*siEps);
+                siJR[siPC] = (rpy - rmy) / (2*siEps);
+              }
+            }
+
+            // ∂r/∂r_i — rotation params of image I
+            if (obs.idxI !== refIdx) {
+              const o = siOff[obs.idxI];
+              for (let p = 0; p < 3; p++) {
+                const old = siP[o+p];
+                siP[o+p] = old + siEps;
+                const Tp = siGetT(obs.idxI);
+                siP[o+p] = old - siEps;
+                const Tm = siGetT(obs.idxI);
+                siP[o+p] = old;
+                const dpp = Tp[6]*obs.xi+Tp[7]*obs.yi+Tp[8];
+                const dpm = Tm[6]*obs.xi+Tm[7]*obs.yi+Tm[8];
+                if (Math.abs(dpp)>1e-10 && Math.abs(dpm)>1e-10) {
+                  siJR[o+p] = ((Tp[0]*obs.xi+Tp[1]*obs.yi+Tp[2])/dpp - (Tm[0]*obs.xi+Tm[1]*obs.yi+Tm[2])/dpm) / (2*siEps);
+                  siJR[siPC+o+p] = ((Tp[3]*obs.xi+Tp[4]*obs.yi+Tp[5])/dpp - (Tm[3]*obs.xi+Tm[4]*obs.yi+Tm[5])/dpm) / (2*siEps);
+                }
+              }
+            }
+
+            // ∂r/∂r_j — rotation params of image J (negated: residual = pi − pj)
+            if (obs.idxJ !== refIdx) {
+              const o = siOff[obs.idxJ];
+              for (let p = 0; p < 3; p++) {
+                const old = siP[o+p];
+                siP[o+p] = old + siEps;
+                const Tp = siGetT(obs.idxJ);
+                siP[o+p] = old - siEps;
+                const Tm = siGetT(obs.idxJ);
+                siP[o+p] = old;
+                const dpp = Tp[6]*obs.xj+Tp[7]*obs.yj+Tp[8];
+                const dpm = Tm[6]*obs.xj+Tm[7]*obs.yj+Tm[8];
+                if (Math.abs(dpp)>1e-10 && Math.abs(dpm)>1e-10) {
+                  siJR[o+p] -= ((Tp[0]*obs.xj+Tp[1]*obs.yj+Tp[2])/dpp - (Tm[0]*obs.xj+Tm[1]*obs.yj+Tm[2])/dpm) / (2*siEps);
+                  siJR[siPC+o+p] -= ((Tp[3]*obs.xj+Tp[4]*obs.yj+Tp[5])/dpp - (Tm[3]*obs.xj+Tm[4]*obs.yj+Tm[5])/dpm) / (2*siEps);
+                }
+              }
+            }
+
+            // Accumulate J^T J and J^T r
+            for (let rr = 0; rr < 2; rr++) {
+              const res = rr === 0 ? rx : ry;
+              const ro = rr * siPC;
+              for (let i = 0; i < siPC; i++) {
+                const ji = siJR[ro + i];
+                if (Math.abs(ji) < 1e-15) continue;
+                siJtr[i] += w * ji * res;
+                for (let j = i; j < siPC; j++) {
+                  const jj = siJR[ro + j];
+                  if (Math.abs(jj) < 1e-15) continue;
+                  const v = w * ji * jj;
+                  siJtJ[i*siPC+j] += v;
+                  if (i !== j) siJtJ[j*siPC+i] += v;
+                }
+              }
+            }
+          }
+
+          // Damping
+          for (let i = 0; i < siPC; i++) {
+            siJtJ[i*siPC+i] *= (1 + siLambda);
+            if (Math.abs(siJtJ[i*siPC+i]) < 1e-12) siJtJ[i*siPC+i] = siLambda;
+          }
+          const negJ = new Float64Array(siPC);
+          for (let i = 0; i < siPC; i++) negJ[i] = -siJtr[i];
+          const delta = solveLinearN(siJtJ, negJ, siPC);
+          if (!delta) { siLambda *= 10; continue; }
+          let bad = false;
+          for (let i = 0; i < delta.length; i++) if (isNaN(delta[i])) { bad = true; break; }
+          if (bad) { siLambda *= 10; continue; }
+
+          const snap = new Float64Array(siP);
+          for (let i = 0; i < siPC; i++) siP[i] += delta[i];
+          if (siP[0] < 10) siP[0] = 10; // clamp focal length
+
+          const nc = siCost();
+          if (nc < siPrev) {
+            siLambda = Math.max(siLambda * 0.3, 1e-7);
+            siPrev = nc;
+            let mx = 0;
+            for (let i = 0; i < siPC; i++) if (Math.abs(delta[i]) > mx) mx = Math.abs(delta[i]);
+            if (mx < 1e-8) break;
+          } else {
+            for (let i = 0; i < siPC; i++) siP[i] = snap[i];
+            siLambda = Math.min(siLambda * 10, 1e8);
+          }
+          postMessage({type:'progress', stage:'refine', percent: Math.round(100*(iter+1)/maxIters),
+            info:`shared-intrinsics iter ${iter+1}/${maxIters}, f=${siP[0].toFixed(1)}px, cost=${siPrev.toFixed(2)}`});
+        }
+
+        // Reconstruct transforms from optimised params
+        for (let i = 0; i < nImages; i++) {
+          if (i === refIdx) continue;
+          transforms[ids[i]] = new Float64Array(siGetT(i));
+        }
+        const tList = Object.entries(transforms).map(([id, T]) => ({
+          imageId: id, TBuffer: new Float64Array(T).buffer
+        }));
+        postMessage({type:'transforms', refId, transforms: tList});
+        postMessage({type:'progress', stage:'refine', percent:100,
+          info:`shared-intrinsics LM done, f=${siP[0].toFixed(1)}px, cost=${siPrev.toFixed(2)}`});
+        return;
+      }
+
       // Flatten current transforms into parameter vector
       // Each image except ref has 8 params: H[0..7] (H[8] always 1)
       const paramCount = (nImages - 1) * 8;
@@ -1475,6 +1807,10 @@ self.addEventListener('message', async (ev) => {
       // If RGB small buffers are available (rgbSmall), we solve 3 independent
       // systems for R, G, B channels. Otherwise, we use the grayscale channel
       // for a single gain and replicate it across channels.
+      //
+      // When sameCameraSettings is true, we use much stronger regularization
+      // toward gain=1 (same aperture/ISO/shutter → expect near-equal exposure).
+      const sameCam = msg.sameCameraSettings || false;
       const ids = Object.keys(images);
       const n = ids.length;
 
@@ -1595,8 +1931,9 @@ self.addEventListener('message', async (ev) => {
 
           // Fix reference (strong prior)
           AtA[refIdx * n + refIdx] += 1000;
-          // Regularization toward gain=1
-          for (let i = 0; i < n; i++) AtA[i * n + i] += 0.01;
+          // Regularization toward gain=1  (much stronger when same camera settings)
+          const regWeight = sameCam ? 1.0 : 0.01;
+          for (let i = 0; i < n; i++) AtA[i * n + i] += regWeight;
 
           const logGains = solveLinearN(AtA, Atb, n);
           if (!logGains) return solution; // return last good solution
@@ -1644,6 +1981,22 @@ self.addEventListener('message', async (ev) => {
         };
       });
 
+      // When same-camera, check if all gains are negligible (within ±5%)
+      // If so, snap them to exactly 1.0 to avoid unnecessary pixel work.
+      if (sameCam) {
+        const allNear1 = gains.every(g =>
+          Math.abs(g.gainR - 1) < 0.05 &&
+          Math.abs(g.gainG - 1) < 0.05 &&
+          Math.abs(g.gainB - 1) < 0.05
+        );
+        if (allNear1) {
+          for (const g of gains) {
+            g.gain = 1.0; g.gainR = 1.0; g.gainG = 1.0; g.gainB = 1.0;
+          }
+          postMessage({type:'progress', stage:'exposure', percent:100, info:'same-camera: gains negligible, snapped to 1.0'});
+        }
+      }
+
       postMessage({ type: 'exposure', gains });
 
       // Free per-image RGB buffers — no longer needed after exposure computation
@@ -1655,6 +2008,7 @@ self.addEventListener('message', async (ev) => {
 
     if (msg.type === 'computeLocalMesh') {
       const { imageId, parentId, meshGrid, sigma, depthSigma, minSupport, faceRects } = msg;
+      const sameCam = msg.sameCameraSettings || false;
       const G = meshGrid || 4;
       const faces = faceRects || [];
       const img = images[imageId];
@@ -1846,8 +2200,12 @@ self.addEventListener('message', async (ev) => {
             // Tikhonov-regularized weighted DLT: pull toward global homography
             // where data is sparse. Adaptive γ: stronger regularization when
             // effective support is weak (far from correspondences).
+            // When sameCameraSettings: shared lens → same distortion → local
+            // warps should deviate less from the global model.  Triple the
+            // base gamma to enforce this.
             const supportRatio = Math.min(effectiveSupport / (minSupport * 10), 1.0);
-            const adaptiveGamma = 0.1 * (1.0 - supportRatio); // 0 when strong, 0.1 when weak
+            const baseGamma = sameCam ? 0.3 : 0.1;
+            const adaptiveGamma = baseGamma * (1.0 - supportRatio);
             const Hv = weightedDLT(srcPts, dstPts, weights, Ti, adaptiveGamma);
             if (Hv) {
               const localPt = projectVertex(Hv, vx, vy);

@@ -35,6 +35,11 @@ export interface PipelineSettings {
   cylindricalProjection: boolean;
   /** Lens distortion correction using Brown-Conrady model. */
   lensDistortionCorrection: boolean;
+  /** Assume all photos share same camera settings (aperture, focal length,
+   *  shutter speed, ISO) and were shot within ~2 min of each other.
+   *  Enables: pooled vignetting, shared-intrinsics BA, exposure skip,
+   *  color-transfer skip, tighter APAP regularization. */
+  sameCameraSettings: boolean;
 }
 
 export type ModeName = 'auto' | 'desktopHQ' | 'mobileQuality' | 'mobileSafe';
@@ -67,6 +72,7 @@ const DESKTOP_HQ: PipelineSettings = {
   blurAwareStitching: true,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
+  sameCameraSettings: true,
 };
 
 const MOBILE_QUALITY: PipelineSettings = {
@@ -97,6 +103,7 @@ const MOBILE_QUALITY: PipelineSettings = {
   blurAwareStitching: true,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
+  sameCameraSettings: true,
 };
 
 const MOBILE_SAFE: PipelineSettings = {
@@ -127,6 +134,7 @@ const MOBILE_SAFE: PipelineSettings = {
   blurAwareStitching: false,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
+  sameCameraSettings: true,
 };
 
 const MOBILE_LITE: PipelineSettings = {
@@ -157,6 +165,7 @@ const MOBILE_LITE: PipelineSettings = {
   blurAwareStitching: false,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
+  sameCameraSettings: true,
 };
 
 export const PRESETS: Record<string, PipelineSettings> = {

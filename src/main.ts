@@ -989,7 +989,10 @@ async function renderWarpedPreview(
       // zone and apply an affine correction so the new image matches the
       // composite's color distribution.  This handles non-linear differences
       // (white balance shifts, vignetting residuals, etc.).
-      {
+      // Skip when sameCameraSettings: same sensor + same exposure + same WB
+      // means color distributions are already matched; applying the transfer
+      // could introduce unnecessary rounding artefacts.
+      if (!settings.sameCameraSettings) {
         // Collect overlap pixel statistics
         let nOverlap = 0;
         const sumC = [0, 0, 0]; // composite R, G, B sums

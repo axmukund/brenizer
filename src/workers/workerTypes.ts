@@ -83,6 +83,7 @@ export interface CVComputeSaliencyMsg {
 
 export interface CVComputeVignettingMsg {
   type: 'computeVignetting';
+  pooled?: boolean;
 }
 
 export interface CVMatchGraphMsg {
@@ -103,6 +104,7 @@ export interface CVRefineMsg {
   maxIters: number;
   huberDeltaPx: number;
   lambdaInit: number;
+  sameCameraSettings?: boolean;
 }
 
 export interface CVQualityAssessmentInMsg {
@@ -112,6 +114,7 @@ export interface CVQualityAssessmentInMsg {
 
 export interface CVComputeExposureMsg {
   type: 'computeExposure';
+  sameCameraSettings?: boolean;
 }
 
 export interface CVBuildMSTMsg {
@@ -127,6 +130,7 @@ export interface CVComputeLocalMeshMsg {
   depthSigma: number;
   minSupport: number;
   faceRects?: Array<{ x: number; y: number; width: number; height: number; confidence: number }>;
+  sameCameraSettings?: boolean;
 }
 
 export type CVInMsg =
