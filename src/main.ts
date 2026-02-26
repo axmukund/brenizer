@@ -210,6 +210,7 @@ async function boot(): Promise<void> {
   const resolved = resolveMode(userMode, mobileSafeFlag, caps);
   const settings = getPreset(resolved);
   setState({ resolvedMode: resolved, settings });
+  buildSettingsPanel();
   setStatus(`Ready — mode: ${resolved}`);
 
   // Init WebGL2 context
