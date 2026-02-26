@@ -105,6 +105,11 @@ export interface CVRefineMsg {
   lambdaInit: number;
 }
 
+export interface CVQualityAssessmentInMsg {
+  type: 'qualityAssessment';
+  threshold?: number;
+}
+
 export interface CVComputeExposureMsg {
   type: 'computeExposure';
 }
@@ -134,6 +139,7 @@ export type CVInMsg =
   | CVMatchGraphMsg
   | CVBuildGraphMsg
   | CVRefineMsg
+  | CVQualityAssessmentInMsg
   | CVComputeExposureMsg
   | CVBuildMSTMsg
   | CVComputeLocalMeshMsg;
@@ -195,6 +201,14 @@ export interface CVExposureMsg {
   gains: { imageId: string; gain: number; gainR?: number; gainG?: number; gainB?: number }[];
 }
 
+export interface CVQualityAssessmentOutMsg {
+  type: 'qualityAssessment';
+  quality: { imageId: string; meanError: number; medianError: number; edgeCount: number; perspectiveMag: number; isOutlier: boolean; reason: string }[];
+  excludeIds: string[];
+  globalMedianError: number;
+  adaptiveThreshold: number;
+}
+
 export interface CVMSTMsg {
   type: 'mst';
   refId: string | null;
@@ -224,6 +238,7 @@ export type CVOutMsg =
   | CVEdgesMsg
   | CVTransformsMsg
   | CVExposureMsg
+  | CVQualityAssessmentOutMsg
   | CVMSTMsg
   | CVMeshMsg
   | CVErrorMsg;

@@ -20,7 +20,7 @@
  */
 
 import { createWorkerManager, type WorkerManager } from './workers/workerManager';
-import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg, CVSaliencyMsg, CVVignettingMsg } from './workers/workerTypes';
+import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg, CVSaliencyMsg, CVVignettingMsg, CVQualityAssessmentOutMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import { setStatus, startProgress, endProgress, updateProgress } from './ui';
@@ -327,6 +327,7 @@ export async function runStitchPreview(): Promise<void> {
     { name: 'matching', weight: 25 },
     { name: 'mst', weight: 2 },
     { name: 'refine', weight: 5 },
+    { name: 'quality', weight: 2 },
     { name: 'exposure', weight: 3 },
     { name: 'apap', weight: 10 },
   ]);
@@ -791,6 +792,116 @@ export async function runStitchPreview(): Promise<void> {
     });
   }
   updateProgress('refine', 1);
+
+  // Step 6a: Post-BA quality assessment — auto-exclude badly aligned images
+  updateProgress('quality', 0);
+  setStatus('Assessing alignment quality…');
+
+  const qualityPromise = new Promise<CVQualityAssessmentOutMsg>((resolve, reject) => {
+    let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for quality assessment')); }, 30000);
+    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+      if (msg.type === 'qualityAssessment') {
+        clearTimeout(timer);
+        if (unsub) unsub();
+        resolve(msg as CVQualityAssessmentOutMsg);
+      } else if (msg.type === 'error') {
+        clearTimeout(timer);
+        if (unsub) unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
+      }
+    };
+    unsub = workerManager!.onCV(handler);
+  });
+
+  workerManager!.sendCV({ type: 'qualityAssessment', threshold: 5.0 });
+
+  const qualityMsg = await qualityPromise;
+
+  // Auto-exclude recommended images
+  if (qualityMsg.excludeIds.length > 0 && qualityMsg.excludeIds.length < active.length - 1) {
+    const excludeSet = new Set(qualityMsg.excludeIds);
+    const reasons = qualityMsg.quality
+      .filter(q => q.isOutlier)
+      .map(q => `${q.imageId}: ${q.reason}`)
+      .join('; ');
+    setStatus(`Auto-excluding ${excludeSet.size} image(s): ${reasons}`);
+    console.warn('[quality] Excluding images:', reasons);
+
+    // Mark excluded in appState
+    const current = getState();
+    const updated = current.images.map(img =>
+      excludeSet.has(img.id) ? { ...img, excluded: true } : img
+    );
+    setState({ images: updated });
+
+    // Filter active list
+    active = active.filter(img => !excludeSet.has(img.id));
+
+    // Re-run BA without excluded images
+    setStatus('Re-running bundle adjustment without excluded images…');
+    const reRefinePromise = new Promise<CVTransformsMsg>((resolve, reject) => {
+      let unsub: (() => void) | null = null;
+      const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for re-refine transforms')); }, 60000);
+      const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+        if (msg.type === 'transforms') {
+          clearTimeout(timer);
+          if (unsub) unsub();
+          resolve(msg as CVTransformsMsg);
+        } else if (msg.type === 'error') {
+          clearTimeout(timer);
+          if (unsub) unsub();
+          reject(new Error((msg as any).message || 'Worker error'));
+        }
+      };
+      unsub = workerManager!.onCV(handler);
+    });
+
+    workerManager!.sendCV({
+      type: 'refine',
+      maxIters: settings.refineIters,
+      huberDeltaPx: 2.0,
+      lambdaInit: 0.01,
+    });
+
+    const reRefinedMsg = await reRefinePromise;
+    lastTransforms = new Map();
+    for (const t of reRefinedMsg.transforms) {
+      lastTransforms.set(t.imageId, {
+        imageId: t.imageId,
+        T: new Float64Array(t.TBuffer),
+      });
+    }
+
+    // Rebuild MST order for the reduced set
+    const reMSTPromise = new Promise<CVMSTMsg>((resolve, reject) => {
+      let unsub: (() => void) | null = null;
+      const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for MST rebuild')); }, 15000);
+      const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+        if (msg.type === 'mst') {
+          clearTimeout(timer);
+          if (unsub) unsub();
+          resolve(msg as CVMSTMsg);
+        } else if (msg.type === 'error') {
+          clearTimeout(timer);
+          if (unsub) unsub();
+          reject(new Error((msg as any).message || 'Worker error'));
+        }
+      };
+      unsub = workerManager!.onCV(handler);
+    });
+
+    workerManager!.sendCV({ type: 'buildMST' });
+    const reMstMsg = await reMSTPromise;
+    lastMstOrder = reMstMsg.order;
+    lastMstParent = reMstMsg.parent;
+    lastRefId = reMstMsg.refId;
+    setStatus(`Rebuilt MST for ${active.length} images (ref=${reMstMsg.refId})`);
+  } else if (qualityMsg.excludeIds.length >= active.length - 1) {
+    console.warn('[quality] Skipping exclusion — would remove all images');
+  }
+
+  updateProgress('quality', 1);
 
   // Step 6b: Exposure compensation (per-image scalar gain)
   lastGains = new Map();

@@ -29,7 +29,7 @@ import {
   createPyramidBlender,
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
   makeViewMatrix, computeBlockCosts, labelsToMask, featherMask,
-  createMaskTexture,
+  createMaskTexture, estimateOverlapWidth,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
   type PyramidBlender, type ManagedTexture, type FaceRectComposite,
 } from './gl';
@@ -715,15 +715,79 @@ async function renderWarpedPreview(
 
   // Determine MST order, falling back to image order with ref first.
   // Filter to only connected images.
+  // Then re-sort by confidence: greedily pick the next image that has the
+  // best edge quality (highest inlier count / lowest RMS) to already-composited
+  // images. This ensures high-confidence pairs blend first, producing a
+  // better foundation for subsequent incremental additions.
   const mstOrder = (() => {
-    const order: string[] = getLastMstOrder();
-    if (order.length > 0) return order.filter(id => connectedIds.has(id));
-    // Fallback: ref first, then rest
-    const ids = images.map(i => i.id).filter(id => connectedIds.has(id));
-    if (refId && ids.includes(refId)) {
-      return [refId, ...ids.filter(id => id !== refId)];
+    const baseOrder: string[] = getLastMstOrder();
+    const order = baseOrder.length > 0
+      ? baseOrder.filter(id => connectedIds.has(id))
+      : (() => {
+          const ids = images.map(i => i.id).filter(id => connectedIds.has(id));
+          if (refId && ids.includes(refId)) {
+            return [refId, ...ids.filter(id => id !== refId)];
+          }
+          return ids;
+        })();
+
+    if (order.length <= 2) return order;
+
+    // Build edge quality index: for each pair, store best inlier count and RMS
+    const edgeQuality = new Map<string, { inlierCount: number; rms: number }>();
+    const allEdges = getLastEdges();
+    for (const e of allEdges) {
+      const key1 = `${e.i}|${e.j}`;
+      const key2 = `${e.j}|${e.i}`;
+      const q = { inlierCount: e.inlierCount, rms: e.rms };
+      edgeQuality.set(key1, q);
+      edgeQuality.set(key2, q);
     }
-    return ids;
+
+    // Greedy re-ordering: start with reference, then always pick the
+    // remaining image with the highest "connection score" to already-placed images.
+    // Connection score = max over placed neighbours of (inlierCount / (rms + 1)).
+    const placed = new Set<string>();
+    const result: string[] = [order[0]];
+    placed.add(order[0]);
+    const remaining = new Set(order.slice(1));
+
+    while (remaining.size > 0) {
+      let bestId = '';
+      let bestScore = -Infinity;
+
+      for (const cand of remaining) {
+        let candScore = 0;
+        for (const pid of placed) {
+          const q = edgeQuality.get(`${pid}|${cand}`);
+          if (q) {
+            const score = q.inlierCount / (q.rms + 1);
+            candScore = Math.max(candScore, score);
+          }
+        }
+        if (candScore > bestScore) {
+          bestScore = candScore;
+          bestId = cand;
+        }
+      }
+
+      if (bestId) {
+        result.push(bestId);
+        placed.add(bestId);
+        remaining.delete(bestId);
+      } else {
+        // No edge connection found — append remaining in original order
+        for (const id of order) {
+          if (remaining.has(id)) {
+            result.push(id);
+            remaining.delete(id);
+          }
+        }
+        break;
+      }
+    }
+
+    return result;
   })();
 
   const blockSize = settings?.seamBlockSize ?? 16;
@@ -920,6 +984,79 @@ async function renderWarpedPreview(
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
+      // ── Reinhard-style color transfer in overlap region ──────────
+      // Beyond linear gain, compute per-channel mean+std in the overlap
+      // zone and apply an affine correction so the new image matches the
+      // composite's color distribution.  This handles non-linear differences
+      // (white balance shifts, vignetting residuals, etc.).
+      {
+        // Collect overlap pixel statistics
+        let nOverlap = 0;
+        const sumC = [0, 0, 0]; // composite R, G, B sums
+        const sumN = [0, 0, 0]; // new image R, G, B sums
+        const sumC2 = [0, 0, 0];
+        const sumN2 = [0, 0, 0];
+
+        // Sample every 4th pixel for speed (the stats converge quickly)
+        for (let px = 0; px < compW * compH; px += 4) {
+          const off = px * 4;
+          if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
+            nOverlap++;
+            for (let ch = 0; ch < 3; ch++) {
+              const cv = compPixels[off + ch];
+              const nv = newPixels[off + ch];
+              sumC[ch] += cv;
+              sumN[ch] += nv;
+              sumC2[ch] += cv * cv;
+              sumN2[ch] += nv * nv;
+            }
+          }
+        }
+
+        // Only apply if we have meaningful overlap (>100 sampled pixels)
+        if (nOverlap > 100) {
+          const gains = [0, 0, 0];
+          const offsets = [0, 0, 0];
+          let needsTransfer = false;
+
+          for (let ch = 0; ch < 3; ch++) {
+            const meanC = sumC[ch] / nOverlap;
+            const meanN = sumN[ch] / nOverlap;
+            const stdC = Math.sqrt(Math.max(0, sumC2[ch] / nOverlap - meanC * meanC));
+            const stdN = Math.sqrt(Math.max(0, sumN2[ch] / nOverlap - meanN * meanN));
+
+            if (stdN > 2) { // avoid div-by-zero for flat regions
+              const g = stdC / stdN;
+              // Clamp gain to reasonable range to avoid extreme corrections
+              gains[ch] = Math.max(0.5, Math.min(2.0, g));
+              offsets[ch] = meanC - gains[ch] * meanN;
+              // Only flag if correction is non-trivial
+              if (Math.abs(gains[ch] - 1.0) > 0.03 || Math.abs(offsets[ch]) > 3) {
+                needsTransfer = true;
+              }
+            } else {
+              gains[ch] = 1;
+              offsets[ch] = 0;
+            }
+          }
+
+          if (needsTransfer) {
+            // Apply affine per-channel correction to new image pixels
+            for (let px = 0; px < compW * compH; px++) {
+              if (newPixels[px * 4 + 3] < 10) continue;
+              for (let ch = 0; ch < 3; ch++) {
+                const corrected = gains[ch] * newPixels[px * 4 + ch] + offsets[ch];
+                newPixels[px * 4 + ch] = Math.max(0, Math.min(255, Math.round(corrected)));
+              }
+            }
+            // Re-upload corrected pixels to the new image texture
+            gl.bindTexture(gl.TEXTURE_2D, newImageTex!.texture);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+          }
+        }
+      }
+
       // Compute block costs
       // Collect face rects: faces in composite → label 0, faces in new image → label 1
       const seamFaces: FaceRectComposite[] = [];
@@ -964,7 +1101,109 @@ async function renderWarpedPreview(
 
       // Convert block labels to pixel mask + feather
       const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, blockSize, compW, compH);
-      const feathered = featherMask(pixelMask, compW, compH, Math.max(1, Math.round(featherWidth * compositeScale)));
+
+      // ── Adaptive feather width ─────────────────────────────────
+      // Use the actual overlap extent to size the feather, rather than a
+      // fixed pixel value.  This matches PTGui's behaviour: narrow overlaps
+      // get narrow feathers (avoids bleeding) while wide overlaps get wide
+      // feathers (smooth transitions).
+      const baseFW = Math.max(1, Math.round(featherWidth * compositeScale));
+      const adaptiveFW = estimateOverlapWidth(compPixels, newPixels, compW, compH, baseFW);
+      const feathered = featherMask(pixelMask, compW, compH, adaptiveFW);
+
+      // ── Mask clamping to valid alpha ───────────────────────────
+      // After feathering, the mask can extend beyond the new image's actual
+      // coverage (alpha=0 regions from warping).  Clamp the mask so that
+      // only pixels where the new image has content can contribute.
+      // Similarly clamp against composite alpha to prevent blending into
+      // void on the composite side (mask=0 where composite is empty).
+      for (let px = 0; px < compW * compH; px++) {
+        const newAlpha = newPixels[px * 4 + 3];
+        const compAlpha = compPixels[px * 4 + 3];
+        // In overlap (both have content), keep feathered mask as-is.
+        // Where only new image exists, force mask=255 (use new content).
+        // Where only composite exists, force mask=0 (keep composite).
+        // Where neither exists, mask=0.
+        if (newAlpha < 10 && compAlpha < 10) {
+          feathered[px] = 0;
+        } else if (newAlpha < 10) {
+          feathered[px] = 0;
+        } else if (compAlpha < 10) {
+          feathered[px] = 255;
+        }
+        // else: both have content → keep feathered value (seam-based)
+      }
+
+      // ── Ghost detection in overlap regions ───────────────────────
+      // Moving objects cause large per-pixel differences between the composite
+      // and new image in the overlap zone.  We detect these "ghost" regions
+      // by computing per-block color difference.  For blocks in the overlap
+      // where the difference is abnormally high, we force the mask to choose
+      // one side completely (the one with more surrounding support), preventing
+      // semi-transparent ghosting from the feathered blend.
+      {
+        const ghostBlockSize = blockSize * 2; // coarser blocks for ghost detection
+        const gW = Math.ceil(compW / ghostBlockSize);
+        const gH = Math.ceil(compH / ghostBlockSize);
+        const blockDiffs = new Float32Array(gW * gH);
+        const blockOverlapCount = new Uint32Array(gW * gH);
+
+        // Compute per-block mean absolute difference in overlap
+        for (let py = 0; py < compH; py++) {
+          const gy = Math.min(Math.floor(py / ghostBlockSize), gH - 1);
+          for (let px = 0; px < compW; px++) {
+            const off = (py * compW + px) * 4;
+            if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
+              const gx = Math.min(Math.floor(px / ghostBlockSize), gW - 1);
+              const gi = gy * gW + gx;
+              let diff = 0;
+              for (let ch = 0; ch < 3; ch++) {
+                diff += Math.abs(compPixels[off + ch] - newPixels[off + ch]);
+              }
+              blockDiffs[gi] += diff / 3; // average across channels
+              blockOverlapCount[gi]++;
+            }
+          }
+        }
+
+        // Compute block mean differences
+        const meanDiffs: number[] = [];
+        for (let gi = 0; gi < gW * gH; gi++) {
+          if (blockOverlapCount[gi] > 0) {
+            blockDiffs[gi] /= blockOverlapCount[gi];
+            meanDiffs.push(blockDiffs[gi]);
+          }
+        }
+
+        if (meanDiffs.length > 4) {
+          meanDiffs.sort((a, b) => a - b);
+          const medianDiff = meanDiffs[Math.floor(meanDiffs.length / 2)];
+          // Ghost threshold: blocks with > 3× median difference
+          const ghostThresh = Math.max(medianDiff * 3, 30); // minimum 30 to avoid false positives
+
+          let ghostPixels = 0;
+          for (let py = 0; py < compH; py++) {
+            const gy = Math.min(Math.floor(py / ghostBlockSize), gH - 1);
+            for (let px = 0; px < compW; px++) {
+              const off = (py * compW + px) * 4;
+              if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
+                const gx = Math.min(Math.floor(px / ghostBlockSize), gW - 1);
+                const gi = gy * gW + gx;
+                if (blockDiffs[gi] > ghostThresh) {
+                  // Ghost detected: force mask to whichever side the seam already
+                  // preferred (binary choice, no blend in ghost regions)
+                  const pi = py * compW + px;
+                  feathered[pi] = feathered[pi] > 128 ? 255 : 0;
+                  ghostPixels++;
+                }
+              }
+            }
+          }
+          if (ghostPixels > 0) {
+            console.log(`[ghost] Forced ${ghostPixels} pixels to binary mask (threshold=${ghostThresh.toFixed(1)}, median=${medianDiff.toFixed(1)})`);
+          }
+        }
+      }
 
       // Upload mask as texture
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
@@ -992,6 +1231,11 @@ async function renderWarpedPreview(
       const newPixels = _newPixels;
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+
+      // Also read composite for adaptive feather + alpha clamping
+      const compPixels = _compPixels;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+      gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
       // Create mask from new image alpha
@@ -999,7 +1243,23 @@ async function renderWarpedPreview(
       for (let i = 0; i < compW * compH; i++) {
         alphaMask[i] = newPixels[i * 4 + 3];
       }
-      const feathered = featherMask(alphaMask, compW, compH, Math.max(1, Math.round(featherWidth * compositeScale)));
+      // Adaptive feather
+      const baseFW = Math.max(1, Math.round(featherWidth * compositeScale));
+      const adaptiveFW = estimateOverlapWidth(compPixels, newPixels, compW, compH, baseFW);
+      const feathered = featherMask(alphaMask, compW, compH, adaptiveFW);
+
+      // Clamp mask to valid alpha (same logic as graph-cut path)
+      for (let px = 0; px < compW * compH; px++) {
+        const newAlpha = newPixels[px * 4 + 3];
+        const compAlpha = compPixels[px * 4 + 3];
+        if (newAlpha < 10 && compAlpha < 10) {
+          feathered[px] = 0;
+        } else if (newAlpha < 10) {
+          feathered[px] = 0;
+        } else if (compAlpha < 10) {
+          feathered[px] = 255;
+        }
+      }
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
       if (useMultiband) {
@@ -1026,31 +1286,215 @@ async function renderWarpedPreview(
     updateProgress('compositing', imgIdx / mstOrder.length);
   }
 
-  // ── Auto-crop: find content bounding box by scanning alpha ──
-  // Read back alpha from the composite FBO to locate the actual image
-  // content region, skipping the black (alpha=0) borders left by warping.
+  // ── Read back composite for auto-leveling + auto-crop ──
   const cropPixels = new Uint8Array(compW * compH * 4);
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, cropPixels);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  // Scan for bounding box of non-transparent pixels (alpha > 10)
-  let cropL = compW, cropB = compH, cropR = 0, cropT = 0; // in GL coords (bottom-up)
-  for (let y = 0; y < compH; y++) {
-    for (let x = 0; x < compW; x++) {
-      if (cropPixels[(y * compW + x) * 4 + 3] > 10) {
-        cropL = Math.min(cropL, x);
-        cropB = Math.min(cropB, y);
-        cropR = Math.max(cropR, x);
-        cropT = Math.max(cropT, y);
+  // ── Auto-leveling: correct panorama horizon tilt ─────────────
+  // Estimate the composite's dominant tilt by computing the principal axis
+  // of the content boundary.  We scan the top and bottom content edges
+  // and fit a line via least-squares.  The angle of that line gives the
+  // tilt to correct.  This mimics PTGui's "Optimize → Straighten Panorama".
+  let levelAngle = 0; // radians, counter-clockwise correction
+  {
+    // Find top and bottom content edge scanlines
+    const topEdge: [number, number][] = [];
+    const botEdge: [number, number][] = [];
+    // Sample every 8 columns for speed
+    for (let x = 0; x < compW; x += 8) {
+      let topY = -1, botY = -1;
+      for (let y = 0; y < compH; y++) {
+        if (cropPixels[(y * compW + x) * 4 + 3] > 10) {
+          if (topY < 0) topY = y;
+          botY = y;
+        }
+      }
+      if (topY >= 0) {
+        topEdge.push([x, topY]);
+        botEdge.push([x, botY]);
+      }
+    }
+
+    // Fit a line to the combined top+bottom edge points via least-squares
+    // to estimate horizontal tilt.  We use both edges to be robust against
+    // irregular content boundaries.
+    const allEdge = [...topEdge, ...botEdge];
+    if (allEdge.length >= 10) {
+      let sx = 0, sy = 0, sxx = 0, sxy = 0;
+      const n = allEdge.length;
+      for (const [ex, ey] of allEdge) {
+        sx += ex; sy += ey;
+        sxx += ex * ex; sxy += ex * ey;
+      }
+      const denom = n * sxx - sx * sx;
+      if (Math.abs(denom) > 1e-6) {
+        const slope = (n * sxy - sx * sy) / denom;
+        const angle = Math.atan(slope);
+        // Only correct if tilt is small (< 15°) — large tilts are likely
+        // intentional (e.g., vertical panorama) or indicate a bad fit
+        if (Math.abs(angle) > 0.002 && Math.abs(angle) < Math.PI / 12) {
+          levelAngle = -angle;
+          console.log(`[auto-level] Detected tilt: ${(angle * 180 / Math.PI).toFixed(2)}°, correcting by ${(levelAngle * 180 / Math.PI).toFixed(2)}°`);
+        }
       }
     }
   }
-  // Add 1px margin and clamp
-  cropL = Math.max(0, cropL - 1);
-  cropB = Math.max(0, cropB - 1);
-  cropR = Math.min(compW - 1, cropR + 1);
-  cropT = Math.min(compH - 1, cropT + 1);
+
+  // If leveling is needed, render a rotated version of the composite
+  if (Math.abs(levelAngle) > 0.001) {
+    // Create a rotation matrix in composite-space
+    const cos = Math.cos(levelAngle);
+    const sin = Math.sin(levelAngle);
+    const cx = compW / 2;
+    const cy = compH / 2;
+    // Rotate around center: T_translate_back * T_rotate * T_translate_to_origin
+    // Then map to clip space via the standard ortho projection
+    // Combined: view = ortho * translate(cx,cy) * rotate * translate(-cx,-cy)
+    const rotViewMat = new Float32Array([
+      2 * cos / compW, -2 * sin / compH, 0,
+      2 * sin / compW, 2 * cos / compH, 0,   // note: Y-flipped
+      // Translation: rotate center then re-center
+      (-2 * cos * cx - 2 * sin * cy) / compW + 1 + 2 * cx / compW - 1,
+      (2 * sin * cx - 2 * cos * cy) / compH + 1 + 2 * cy / compH - 1,
+      1,
+    ]);
+    // Simpler approach: use a fullscreen quad draw with the rotation matrix.
+    // Actually — let's just rotate the crop readback pixels on CPU.
+    // For small angles this is fast and avoids complex GPU matrix math.
+
+    // Rotate the cropPixels in-place via bilinear sampling
+    const rotated = new Uint8Array(compW * compH * 4);
+    const cosA = Math.cos(-levelAngle); // inverse rotation for sampling
+    const sinA = Math.sin(-levelAngle);
+    for (let y = 0; y < compH; y++) {
+      for (let x = 0; x < compW; x++) {
+        // Map output (x,y) back through inverse rotation to source
+        const dx = x - cx;
+        const dy = y - cy;
+        const sx = cosA * dx - sinA * dy + cx;
+        const sy = sinA * dx + cosA * dy + cy;
+        const sx0 = Math.floor(sx);
+        const sy0 = Math.floor(sy);
+        if (sx0 < 0 || sx0 >= compW - 1 || sy0 < 0 || sy0 >= compH - 1) {
+          // Out of bounds → transparent
+          const oi = (y * compW + x) * 4;
+          rotated[oi] = rotated[oi + 1] = rotated[oi + 2] = rotated[oi + 3] = 0;
+          continue;
+        }
+        // Bilinear interpolation
+        const fx = sx - sx0;
+        const fy = sy - sy0;
+        const i00 = (sy0 * compW + sx0) * 4;
+        const i10 = i00 + 4;
+        const i01 = i00 + compW * 4;
+        const i11 = i01 + 4;
+        const oi = (y * compW + x) * 4;
+        for (let ch = 0; ch < 4; ch++) {
+          const v = (1 - fx) * (1 - fy) * cropPixels[i00 + ch]
+                  + fx * (1 - fy) * cropPixels[i10 + ch]
+                  + (1 - fx) * fy * cropPixels[i01 + ch]
+                  + fx * fy * cropPixels[i11 + ch];
+          rotated[oi + ch] = Math.round(v);
+        }
+      }
+    }
+    // Replace cropPixels with rotated version
+    cropPixels.set(rotated);
+
+    // Re-upload to composite texture for display
+    gl.bindTexture(gl.TEXTURE_2D, currentCompTex.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, cropPixels);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  // ── Auto-crop: find content bounding box by scanning alpha ──
+  // Read back alpha from the composite FBO to locate the actual image
+  // content region, skipping the black (alpha=0) borders left by warping.
+  // (cropPixels may have been updated by auto-leveling above)
+
+  // ── Largest inscribed rectangle (content-aware optimal crop) ──
+  // Instead of a simple bounding box (which includes transparent corners),
+  // find the largest axis-aligned rectangle that contains only opaque pixels.
+  // This is the "maximum rectangle under a histogram" algorithm applied to
+  // each row of the alpha mask.  O(W×H) time.
+  //
+  // First, build a height-map: for each pixel, how many consecutive opaque
+  // pixels are above (and including) it.
+  const alphaThresh = 10;
+  const heights = new Uint16Array(compW * compH);
+  // First row
+  for (let x = 0; x < compW; x++) {
+    heights[x] = cropPixels[x * 4 + 3] > alphaThresh ? 1 : 0;
+  }
+  // Subsequent rows
+  for (let y = 1; y < compH; y++) {
+    for (let x = 0; x < compW; x++) {
+      if (cropPixels[(y * compW + x) * 4 + 3] > alphaThresh) {
+        heights[y * compW + x] = heights[(y - 1) * compW + x] + 1;
+      } else {
+        heights[y * compW + x] = 0;
+      }
+    }
+  }
+
+  // For each row, find the largest rectangle in the histogram using stack method
+  let bestArea = 0;
+  let bestCropL = 0, bestCropR = 0, bestCropB = 0, bestCropT = 0;
+  const stack: number[] = [];
+
+  for (let y = 0; y < compH; y++) {
+    stack.length = 0;
+    for (let x = 0; x <= compW; x++) {
+      const h = x < compW ? heights[y * compW + x] : 0;
+      while (stack.length > 0 && heights[y * compW + stack[stack.length - 1]] > h) {
+        const topH = heights[y * compW + stack.pop()!];
+        const width = stack.length === 0 ? x : x - stack[stack.length - 1] - 1;
+        const area = topH * width;
+        if (area > bestArea) {
+          bestArea = area;
+          bestCropR = x - 1;
+          bestCropL = stack.length === 0 ? 0 : stack[stack.length - 1] + 1;
+          bestCropT = y;
+          bestCropB = y - topH + 1;
+        }
+      }
+      stack.push(x);
+    }
+  }
+
+  // Fallback: if inscribed rect is too small compared to bounding box,
+  // fall back to simple bounding box (the panorama may be genuinely non-rectangular)
+  let cropL: number, cropB: number, cropR: number, cropT: number;
+
+  // Also compute simple bounding box for comparison
+  let bbL = compW, bbB = compH, bbR = 0, bbT = 0;
+  for (let y = 0; y < compH; y++) {
+    for (let x = 0; x < compW; x++) {
+      if (cropPixels[(y * compW + x) * 4 + 3] > alphaThresh) {
+        bbL = Math.min(bbL, x); bbB = Math.min(bbB, y);
+        bbR = Math.max(bbR, x); bbT = Math.max(bbT, y);
+      }
+    }
+  }
+  const bbArea = (bbR - bbL + 1) * (bbT - bbB + 1);
+
+  // Use inscribed rectangle if it covers ≥60% of the bounding box area
+  if (bestArea > 0 && bestArea >= bbArea * 0.6) {
+    cropL = bestCropL;
+    cropR = bestCropR;
+    cropB = bestCropB;
+    cropT = bestCropT;
+    console.log(`[auto-crop] Inscribed rect: ${bestCropR - bestCropL + 1}×${bestCropT - bestCropB + 1} (${(bestArea / bbArea * 100).toFixed(1)}% of bbox)`);
+  } else {
+    // Bounding box fallback (with 1px margin)
+    cropL = Math.max(0, bbL - 1);
+    cropB = Math.max(0, bbB - 1);
+    cropR = Math.min(compW - 1, bbR + 1);
+    cropT = Math.min(compH - 1, bbT + 1);
+    console.log(`[auto-crop] Bounding box fallback (inscribed too small: ${(bestArea / Math.max(1, bbArea) * 100).toFixed(1)}%)`);
+  }
 
   const cropW = cropR - cropL + 1;
   const cropH = cropT - cropB + 1;
@@ -1534,17 +1978,60 @@ async function exportComposite(): Promise<void> {
     flipped.set(pixels.subarray(srcRow, srcRow + outW * 4), dstRow);
   }
 
-  // Auto-crop transparent edges
+  // Auto-crop: use largest inscribed rectangle (same as preview)
+  const alphaThreshExport = 10;
+  const expHeights = new Uint16Array(outW * outH);
+  for (let x = 0; x < outW; x++) {
+    expHeights[x] = flipped[x * 4 + 3] > alphaThreshExport ? 1 : 0;
+  }
+  for (let y = 1; y < outH; y++) {
+    for (let x = 0; x < outW; x++) {
+      expHeights[y * outW + x] = flipped[(y * outW + x) * 4 + 3] > alphaThreshExport
+        ? expHeights[(y - 1) * outW + x] + 1 : 0;
+    }
+  }
+
+  let expBestArea = 0;
+  let expCropL = 0, expCropR = 0, expCropB = 0, expCropT = 0;
+  const expStack: number[] = [];
+  for (let y = 0; y < outH; y++) {
+    expStack.length = 0;
+    for (let x = 0; x <= outW; x++) {
+      const h = x < outW ? expHeights[y * outW + x] : 0;
+      while (expStack.length > 0 && expHeights[y * outW + expStack[expStack.length - 1]] > h) {
+        const topH = expHeights[y * outW + expStack.pop()!];
+        const width = expStack.length === 0 ? x : x - expStack[expStack.length - 1] - 1;
+        const area = topH * width;
+        if (area > expBestArea) {
+          expBestArea = area;
+          expCropR = x - 1;
+          expCropL = expStack.length === 0 ? 0 : expStack[expStack.length - 1] + 1;
+          expCropT = y;
+          expCropB = y - topH + 1;
+        }
+      }
+      expStack.push(x);
+    }
+  }
+
+  // Bounding box fallback
   let cropMinX = outW, cropMinY = outH, cropMaxX = 0, cropMaxY = 0;
   for (let y = 0; y < outH; y++) {
     for (let x = 0; x < outW; x++) {
-      if (flipped[(y * outW + x) * 4 + 3] > 10) {
+      if (flipped[(y * outW + x) * 4 + 3] > alphaThreshExport) {
         cropMinX = Math.min(cropMinX, x);
         cropMinY = Math.min(cropMinY, y);
         cropMaxX = Math.max(cropMaxX, x);
         cropMaxY = Math.max(cropMaxY, y);
       }
     }
+  }
+  const expBBArea = Math.max(1, (cropMaxX - cropMinX + 1) * (cropMaxY - cropMinY + 1));
+  if (expBestArea > 0 && expBestArea >= expBBArea * 0.6) {
+    cropMinX = expCropL;
+    cropMinY = expCropB;
+    cropMaxX = expCropR;
+    cropMaxY = expCropT;
   }
 
   const exportCanvas = new OffscreenCanvas(outW, outH);
