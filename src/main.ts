@@ -1026,19 +1026,66 @@ async function renderWarpedPreview(
     updateProgress('compositing', imgIdx / mstOrder.length);
   }
 
+  // ── Auto-crop: find content bounding box by scanning alpha ──
+  // Read back alpha from the composite FBO to locate the actual image
+  // content region, skipping the black (alpha=0) borders left by warping.
+  const cropPixels = new Uint8Array(compW * compH * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+  gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, cropPixels);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // Scan for bounding box of non-transparent pixels (alpha > 10)
+  let cropL = compW, cropB = compH, cropR = 0, cropT = 0; // in GL coords (bottom-up)
+  for (let y = 0; y < compH; y++) {
+    for (let x = 0; x < compW; x++) {
+      if (cropPixels[(y * compW + x) * 4 + 3] > 10) {
+        cropL = Math.min(cropL, x);
+        cropB = Math.min(cropB, y);
+        cropR = Math.max(cropR, x);
+        cropT = Math.max(cropT, y);
+      }
+    }
+  }
+  // Add 1px margin and clamp
+  cropL = Math.max(0, cropL - 1);
+  cropB = Math.max(0, cropB - 1);
+  cropR = Math.min(compW - 1, cropR + 1);
+  cropT = Math.min(compH - 1, cropT + 1);
+
+  const cropW = cropR - cropL + 1;
+  const cropH = cropT - cropB + 1;
+  const hasCrop = cropW > 0 && cropH > 0 && (cropW < compW || cropH < compH);
+
+  // Use cropped dimensions for the view if auto-crop found a smaller region
+  const dispW = hasCrop ? cropW : compW;
+  const dispH = hasCrop ? cropH : compH;
+
   // Display final composite on screen
-  const viewMat = makeViewMatrix(canvas.width, canvas.height, 0, 0, 1, compW, compH);
+  const viewMat = makeViewMatrix(canvas.width, canvas.height, 0, 0, 1, dispW, dispH);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0.05, 0.05, 0.1, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.disable(gl.BLEND);
 
-  // Draw composite as fullscreen quad.
+  // Draw composite as a quad, adjusting UVs to show only the content region.
   // FBO textures have v=0 at bottom (GL convention), so flip V to display right-side up.
-  const screenMesh = createIdentityMesh(compW, compH, 1, 1);
-  for (let i = 1; i < screenMesh.uvs.length; i += 2) {
-    screenMesh.uvs[i] = 1 - screenMesh.uvs[i];
+  const screenMesh = createIdentityMesh(dispW, dispH, 1, 1);
+  if (hasCrop) {
+    // Remap UVs from [0,1] to the cropped sub-region of the texture
+    const uMin = cropL / compW;
+    const uMax = (cropR + 1) / compW;
+    const vMin = cropB / compH; // GL bottom
+    const vMax = (cropT + 1) / compH; // GL top
+    for (let i = 0; i < screenMesh.uvs.length; i += 2) {
+      screenMesh.uvs[i] = uMin + screenMesh.uvs[i] * (uMax - uMin);
+      // Flip V: vMax becomes top of screen (v=0 in screen coords)
+      screenMesh.uvs[i + 1] = vMax - screenMesh.uvs[i + 1] * (vMax - vMin);
+    }
+  } else {
+    for (let i = 1; i < screenMesh.uvs.length; i += 2) {
+      screenMesh.uvs[i] = 1 - screenMesh.uvs[i];
+    }
   }
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
 

@@ -88,7 +88,36 @@ void main() {
 }
 `;
 
+// ── Pre-fill: replace transparent pixels with fallback image ─────
+// Before building Gaussian pyramids, we fill transparent (alpha=0)
+// regions of each image with the other image's pixel data. Without
+// this, the 2×2 box-filter downsample bleeds black (0,0,0,0) border
+// pixels into the image data at coarser levels, corrupting Laplacian
+// detail coefficients near image boundaries and producing bright/dark
+// seam bands during reconstruction.
+
+const PREFILL_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_primary;   // image to fill gaps in
+uniform sampler2D u_fallback;  // image to use for transparent pixels
+out vec4 fragColor;
+void main() {
+  vec4 p = texture(u_primary, v_uv);
+  vec4 f = texture(u_fallback, v_uv);
+  // Blend by primary alpha: smooth transition avoids hard edges
+  // that would create ringing in the Laplacian pyramid.
+  fragColor = mix(f, p, p.a);
+  fragColor.a = max(p.a, f.a);
+}
+`;
+
 // ── Blend Laplacian levels ───────────────────────────────
+// The mask alone determines the blend ratio at each pyramid level.
+// We do NOT modulate by newImage alpha here — that was causing
+// level-inconsistent blending near image boundaries (bright seam bands).
+// The pre-fill pass above ensures both images have valid pixel data
+// everywhere, so the mask is the sole blend authority.
 
 const BLEND_LAP_FRAG = `#version 300 es
 precision highp float;
@@ -101,9 +130,7 @@ void main() {
   vec4 lc = texture(u_lapComp, v_uv);
   vec4 ln = texture(u_lapNew, v_uv);
   float m = texture(u_mask, v_uv).r;
-  // Handle alpha: where new image has no data, keep composite
-  float effectiveM = m * ln.a;
-  fragColor = vec4(mix(lc.rgb, ln.rgb, effectiveM), max(lc.a, ln.a));
+  fragColor = vec4(mix(lc.rgb, ln.rgb, m), max(lc.a, ln.a));
 }
 `;
 
@@ -178,6 +205,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
   // Compile all shaders — pick float variants when available
   const downsampleProg = createProgram(gl, FS_VERT, DOWNSAMPLE_FRAG);
   const upsampleProg = createProgram(gl, FS_VERT, UPSAMPLE_FRAG);
+  const prefillProg = createProgram(gl, FS_VERT, PREFILL_FRAG);
   const laplacianProg = createProgram(gl, FS_VERT, useFloat ? LAPLACIAN_FLOAT_FRAG : LAPLACIAN_FRAG);
   const blendLapProg = createProgram(gl, FS_VERT, BLEND_LAP_FRAG);
   const reconstructProg = createProgram(gl, FS_VERT, useFloat ? RECONSTRUCT_FLOAT_FRAG : RECONSTRUCT_FRAG);
@@ -202,6 +230,10 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
   const recLoc = {
     uLap: gl.getUniformLocation(reconstructProg, 'u_laplacian'),
     uUp: gl.getUniformLocation(reconstructProg, 'u_upsampled'),
+  };
+  const pfLoc = {
+    uPrimary: gl.getUniformLocation(prefillProg, 'u_primary'),
+    uFallback: gl.getUniformLocation(prefillProg, 'u_fallback'),
   };
 
   // Fullscreen quad VAO
@@ -237,6 +269,26 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
 
   function freeLevels(levels: PyramidLevel[]) {
     levels.forEach(freeLevel);
+  }
+
+  /**
+   * Pre-fill: replace transparent pixels of `primary` with `fallback` data.
+   * Renders into dstFBO at the given dimensions.
+   */
+  function prefill(primaryTex: WebGLTexture, fallbackTex: WebGLTexture, dstFBO: WebGLFramebuffer, w: number, h: number) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO);
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(prefillProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, primaryTex);
+    gl.uniform1i(pfLoc.uPrimary, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, fallbackTex);
+    gl.uniform1i(pfLoc.uFallback, 1);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   /** Render source texture downsampled 2x into dst FBO */
@@ -343,9 +395,18 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
       numLevels = Math.max(2, Math.min(numLevels, 7));
       gl.disable(gl.BLEND);
 
+      // ── Phase 0: Pre-fill transparent regions ──────────────────────
+      // Fill transparent pixels of each image with the other's data so
+      // that the 2×2 box-filter downsample never bleeds black (alpha=0)
+      // border pixels into the image data at coarser pyramid levels.
+      const filledComp = createLevel(width, height);
+      const filledNew = createLevel(width, height);
+      prefill(compositeTex, newImageTex, filledComp.fbo.fbo, width, height);
+      prefill(newImageTex, compositeTex, filledNew.fbo.fbo, width, height);
+
       // ── Phase 1: Build Gaussian pyramids for both images and mask ──
-      const gaussComp = buildGaussianPyramid(compositeTex, width, height, numLevels);
-      const gaussNew = buildGaussianPyramid(newImageTex, width, height, numLevels);
+      const gaussComp = buildGaussianPyramid(filledComp.tex.texture, width, height, numLevels);
+      const gaussNew = buildGaussianPyramid(filledNew.tex.texture, width, height, numLevels);
       const gaussMask = buildGaussianPyramid(maskTex, width, height, numLevels);
 
       // ── Phase 2: Build Laplacian pyramids (band-pass detail) ──
@@ -430,6 +491,8 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
 
       // Cleanup
       if (current !== lapBlended[numLevels - 1]) freeLevel(current);
+      freeLevel(filledComp);
+      freeLevel(filledNew);
       freeLevels(gaussComp);
       freeLevels(gaussNew);
       freeLevels(gaussMask);
@@ -441,6 +504,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
     dispose() {
       gl.deleteProgram(downsampleProg);
       gl.deleteProgram(upsampleProg);
+      gl.deleteProgram(prefillProg);
       gl.deleteProgram(laplacianProg);
       gl.deleteProgram(blendLapProg);
       gl.deleteProgram(reconstructProg);

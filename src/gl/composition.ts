@@ -33,8 +33,11 @@ void main() {
   vec4 comp = texture(u_composite, v_uv);
   vec4 newI = texture(u_newImage, v_uv);
   float m = texture(u_mask, v_uv).r;
-  // Where new image has zero alpha (outside warp), keep composite
-  m *= newI.a;
+  // The mask already encodes boundary information:
+  //  - Graph-cut path: hard constraints force m=0 outside new image
+  //  - Feather-only path: mask is derived from newImage alpha
+  // We do NOT multiply m by newI.a here — that double-applies the
+  // boundary falloff, producing visible seam bands.
   fragColor = mix(comp, newI, m);
   fragColor.a = max(comp.a, newI.a);
 }
