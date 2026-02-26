@@ -120,11 +120,11 @@ export function createWorkerManager(): WorkerManager {
       const baseUrl = getBaseUrl();
       const results = { cv: false, depth: false, seam: false };
 
-      // Init CV worker
+      // Init CV worker — generous timeout because opencv.js is ~11 MB WASM
       try {
         const w = createCV();
         w.postMessage({ type: 'init', baseUrl, opencvPath: 'opencv/opencv.js' });
-        await waitForMsg(cvHandlers, 'progress', 30000);
+        await waitForMsg(cvHandlers, 'progress', 60000);
         results.cv = true;
         console.log('cv-worker ready');
       } catch (e) {
@@ -141,18 +141,18 @@ export function createWorkerManager(): WorkerManager {
           preferWebGPU: true,
           targetSize: 256,
         });
-        await waitForMsg(depthHandlers, 'progress', 30000);
+        await waitForMsg(depthHandlers, 'progress', 60000);
         results.depth = true;
         console.log('depth-worker ready');
       } catch (e) {
         console.warn('depth-worker init failed (depth disabled):', e);
       }
 
-      // Init Seam worker (best-effort; may fail if no WASM)
+      // Init Seam worker (simple JS — should init quickly)
       try {
         const w = createSeam();
         w.postMessage({ type: 'init', baseUrl, maxflowPath: 'wasm/maxflow/maxflow.js' });
-        await waitForMsg(seamHandlers, 'progress', 30000);
+        await waitForMsg(seamHandlers, 'progress', 60000);
         results.seam = true;
         console.log('seam-worker ready');
       } catch (e) {

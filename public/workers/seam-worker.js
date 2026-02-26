@@ -17,12 +17,14 @@
  *  - Face penalty: keeps seams away from detected faces
  *
  * Messages in:
-//  - {type:'init', baseUrl, maxflowPath}
-//  - {type:'solve', jobId, gridW, gridH, dataCostsBuffer, edgeWeightsBuffer, hardConstraintsBuffer, params}
-// Messages out:
-//  - {type:'progress', stage, percent, info}
-//  - {type:'result', jobId, labelsBuffer}
-//  - {type:'error', jobId?, message}
+ *  - {type:'init', baseUrl, maxflowPath}
+ *  - {type:'solve', jobId, gridW, gridH, dataCostsBuffer, edgeWeightsBuffer, hardConstraintsBuffer, params}
+ *
+ * Messages out:
+ *  - {type:'progress', stage, percent, info}
+ *  - {type:'result', jobId, labelsBuffer}
+ *  - {type:'error', jobId?, message}
+ */
 
 let ready = false;
 

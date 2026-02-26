@@ -58,9 +58,11 @@ async function runTest() {
     headless: true,
     args: [
       '--no-sandbox',
+      '--disable-setuid-sandbox',
       // Force software WebGL via SwiftShader so test works without a GPU
       '--use-gl=angle',
       '--use-angle=swiftshader',
+      '--enable-unsafe-swiftshader',
     ],
     protocolTimeout: TIMEOUTS.protocol,
   });

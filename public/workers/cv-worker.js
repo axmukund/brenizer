@@ -16,29 +16,30 @@
  *  - APAP mesh: Tikhonov-regularized weighted DLT with depth/face weighting
  *
  * Messages accepted:
-//  - {type:'init', baseUrl, opencvPath}
-//  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?}
-//  - {type:'computeFeatures', orbParams}
-//  - {type:'computeSaliency'}
-//  - {type:'matchGraph', windowW, ratio, ransacThreshPx, minInliers, matchAllPairs}
-//  - {type:'buildGraph'}
-//  - {type:'refine', maxIters, huberDeltaPx, lambdaInit}
-//  - {type:'computeExposure', robustHuber?}
-//  - {type:'buildMST'}
-//  - {type:'computeLocalMesh', imageId, parentId, meshGrid, sigma, depthSigma, minSupport}
-//  - {type:'computeVignetting'}
-
-// Messages posted back:
-//  - {type:'progress', stage, percent, info}
-//  - {type:'features', imageId, keypointsBuffer, descriptorsBuffer, descCols}
-//  - {type:'saliency', imageId, saliencyBuffer, width, height}
-//  - {type:'edges', edges: [...]}
-//  - {type:'transforms', refId, transforms: [...]}
-//  - {type:'exposure', gains: [...]}
-//  - {type:'vignetting', imageId, vignetteParams}
-//  - {type:'mst', refId, order, parent}
-//  - {type:'mesh', imageId, verticesBuffer, uvsBuffer, indicesBuffer, bounds}
-//  - {type:'error', message}
+ *  - {type:'init', baseUrl, opencvPath}
+ *  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?}
+ *  - {type:'computeFeatures', orbParams}
+ *  - {type:'computeSaliency'}
+ *  - {type:'matchGraph', windowW, ratio, ransacThreshPx, minInliers, matchAllPairs}
+ *  - {type:'buildGraph'}
+ *  - {type:'refine', maxIters, huberDeltaPx, lambdaInit}
+ *  - {type:'computeExposure', robustHuber?}
+ *  - {type:'buildMST'}
+ *  - {type:'computeLocalMesh', imageId, parentId, meshGrid, sigma, depthSigma, minSupport}
+ *  - {type:'computeVignetting'}
+ *
+ * Messages posted back:
+ *  - {type:'progress', stage, percent, info}
+ *  - {type:'features', imageId, keypointsBuffer, descriptorsBuffer, descCols}
+ *  - {type:'saliency', imageId, saliencyBuffer, width, height}
+ *  - {type:'edges', edges: [...]}
+ *  - {type:'transforms', refId, transforms: [...]}
+ *  - {type:'exposure', gains: [...]}
+ *  - {type:'vignetting', imageId, vignetteParams}
+ *  - {type:'mst', refId, order, parent}
+ *  - {type:'mesh', imageId, verticesBuffer, uvsBuffer, indicesBuffer, bounds}
+ *  - {type:'error', message}
+ */
 
 let cvReady = false;
 let images = {}; // imageId -> {width, height, gray:Uint8ClampedArray, depth?:Uint16Array, keypoints:Float32Array, descriptors:Uint8Array, descCols:number}
