@@ -187,17 +187,19 @@ self.addEventListener('message', async (ev) => {
             descBuf.set(descriptors.data.slice(0, descRows * descCols));
           }
 
-          img.keypoints = kps;
-          img.descriptors = descBuf;
+          // Store copies on the image record (worker-side reference)
+          img.keypoints = new Float32Array(kps);
+          img.descriptors = new Uint8Array(descBuf);
           img.descCols = descCols;
 
+          // Transfer (zero-copy) the original buffers to the main thread
           postMessage({
             type:'features',
             imageId: id,
             keypointsBuffer: kps.buffer,
             descriptorsBuffer: descBuf.buffer,
             descCols
-          });
+          }, [kps.buffer, descBuf.buffer]);
 
         } finally {
           if (mat) mat.delete();

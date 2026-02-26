@@ -37,15 +37,18 @@ let _state: AppState = {
 type Listener = () => void;
 const _listeners: Listener[] = [];
 
+/** Return the current global application state (immutable snapshot). */
 export function getState(): AppState {
   return _state;
 }
 
+/** Merge `partial` into the current state and notify all subscribers. */
 export function setState(partial: Partial<AppState>): void {
   _state = { ..._state, ...partial };
   _listeners.forEach(fn => fn());
 }
 
+/** Subscribe to state changes. Returns an unsubscribe function. */
 export function subscribe(fn: Listener): () => void {
   _listeners.push(fn);
   return () => {

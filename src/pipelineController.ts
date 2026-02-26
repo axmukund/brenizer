@@ -61,10 +61,12 @@ export interface MatchEdge {
 }
 let lastEdges: MatchEdge[] = [];
 
+/** Return the feature descriptors from the last pipeline run. */
 export function getLastFeatures(): Map<string, ImageFeatures> {
   return lastFeatures;
 }
 
+/** Return the pairwise match edges from the last pipeline run. */
 export function getLastEdges(): MatchEdge[] {
   return lastEdges;
 }
@@ -79,15 +81,19 @@ let lastRefId: string | null = null;
 let lastMstOrder: string[] = [];
 let lastMstParent: Record<string, string | null> = {};
 
+/** Return the global homography transforms from the last pipeline run. */
 export function getLastTransforms(): Map<string, GlobalTransform> {
   return lastTransforms;
 }
+/** Return the reference image ID chosen as the MST root. */
 export function getLastRefId(): string | null {
   return lastRefId;
 }
+/** Return the MST traversal order (image IDs, root first). */
 export function getLastMstOrder(): string[] {
   return lastMstOrder;
 }
+/** Return the MST parent mapping: imageId → parentId (null for root). */
 export function getLastMstParent(): Record<string, string | null> {
   return lastMstParent;
 }
@@ -102,6 +108,7 @@ export interface DepthMap {
 }
 let lastDepthMaps: Map<string, DepthMap> = new Map();
 
+/** Return depth maps from the last pipeline run (empty if depth disabled). */
 export function getLastDepthMaps(): Map<string, DepthMap> {
   return lastDepthMaps;
 }
@@ -116,6 +123,7 @@ export interface APAPMesh {
 }
 let lastMeshes: Map<string, APAPMesh> = new Map();
 
+/** Return APAP mesh data per image from the last pipeline run. */
 export function getLastMeshes(): Map<string, APAPMesh> {
   return lastMeshes;
 }
@@ -129,6 +137,7 @@ export interface ExposureGain {
 }
 let lastGains: Map<string, ExposureGain> = new Map();
 
+/** Return per-image exposure gains (scalar + RGB) from the last pipeline run. */
 export function getLastGains(): Map<string, ExposureGain> {
   return lastGains;
 }
@@ -143,6 +152,7 @@ export interface SaliencyData {
 }
 let lastSaliency: Map<string, SaliencyData> = new Map();
 
+/** Return per-image saliency maps at alignment scale. */
 export function getLastSaliency(): Map<string, SaliencyData> {
   return lastSaliency;
 }
@@ -155,6 +165,7 @@ export interface VignetteParams {
 }
 let lastVignette: Map<string, VignetteParams> = new Map();
 
+/** Return per-image vignetting polynomial coefficients. */
 export function getLastVignette(): Map<string, VignetteParams> {
   return lastVignette;
 }
@@ -162,10 +173,12 @@ export function getLastVignette(): Map<string, VignetteParams> {
 /** Per-image face detection results. */
 let lastFaces: Map<string, FaceRect[]> = new Map();
 
+/** Return per-image face detection results (bounding boxes). */
 export function getLastFaces(): Map<string, FaceRect[]> {
   return lastFaces;
 }
 
+/** Return the shared WorkerManager instance (null until first pipeline run). */
 export function getWorkerManager(): WorkerManager | null {
   return workerManager;
 }
@@ -272,7 +285,9 @@ async function detectFaces(
       height: f.boundingBox.height,
       confidence: 1.0,
     }));
-  } catch {
+  } catch (e) {
+    // Non-fatal: face detection is best-effort. Log for diagnostics.
+    console.warn('Face detection failed for', entry.name, ':', e);
     return [];
   }
 }
@@ -392,32 +407,42 @@ export async function runStitchPreview(): Promise<void> {
   setStatus(`Extracting features (0/${active.length})…`);
   updateProgress('features', 0);
 
-  // Collect features messages as they arrive
+  // Collect features messages as they arrive.
+  // Uses a single CV handler to dispatch per-image results, avoiding
+  // the broadcast-error problem where one error rejects all promises.
+  const featureResolvers = new Map<string, {
+    resolve: (m: CVFeaturesMsg) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   const featurePromises = new Map<string, Promise<CVFeaturesMsg>>();
   for (const img of active) {
     featurePromises.set(
       img.id,
       new Promise<CVFeaturesMsg>((resolve, reject) => {
-        let unsub: (() => void) | null = null;
         const timer = setTimeout(() => {
-          if (unsub) unsub();
+          featureResolvers.delete(img.id);
           reject(new Error(`Timeout waiting for features of ${img.name}`));
         }, 60000);
-        const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
-          if (msg.type === 'features' && msg.imageId === img.id) {
-            clearTimeout(timer);
-            if (unsub) unsub();
-            resolve(msg as CVFeaturesMsg);
-          } else if (msg.type === 'error') {
-            clearTimeout(timer);
-            if (unsub) unsub();
-            reject(new Error((msg as any).message || 'Feature extraction failed'));
-          }
-        };
-        unsub = workerManager!.onCV(handler);
+        featureResolvers.set(img.id, { resolve, reject, timer });
       }),
     );
   }
+  const featUnsub = workerManager!.onCV((msg) => {
+    if (msg.type === 'features' && featureResolvers.has(msg.imageId)) {
+      const r = featureResolvers.get(msg.imageId)!;
+      clearTimeout(r.timer);
+      featureResolvers.delete(msg.imageId);
+      r.resolve(msg as CVFeaturesMsg);
+    } else if (msg.type === 'error') {
+      // Only reject remaining promises on a fatal worker error
+      for (const [id, r] of featureResolvers) {
+        clearTimeout(r.timer);
+        r.reject(new Error((msg as any).message || 'Feature extraction failed'));
+      }
+      featureResolvers.clear();
+    }
+  });
 
   workerManager!.sendCV({
     type: 'computeFeatures',
@@ -445,6 +470,7 @@ export async function runStitchPreview(): Promise<void> {
   const totalKp = Array.from(lastFeatures.values()).reduce(
     (s, f) => s + f.keypoints.length / 2, 0,
   );
+  featUnsub(); // unsubscribe the feature collection handler
   setStatus(`Feature extraction complete — ${totalKp} keypoints across ${active.length} images.`);
 
   // Dispatch custom event so main.ts can draw keypoint overlay
@@ -456,31 +482,40 @@ export async function runStitchPreview(): Promise<void> {
     setStatus('Computing saliency maps…');
     updateProgress('saliency', 0);
 
+    // Single handler for saliency results (same pattern as features)
+    const salResolvers = new Map<string, {
+      resolve: (m: CVSaliencyMsg) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }>();
     const saliencyPromises = new Map<string, Promise<CVSaliencyMsg>>();
     for (const img of active) {
       saliencyPromises.set(
         img.id,
         new Promise<CVSaliencyMsg>((resolve, reject) => {
-          let unsub: (() => void) | null = null;
           const timer = setTimeout(() => {
-            if (unsub) unsub();
+            salResolvers.delete(img.id);
             reject(new Error(`Timeout waiting for saliency of ${img.name}`));
           }, 60000);
-          const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
-            if (msg.type === 'saliency' && (msg as CVSaliencyMsg).imageId === img.id) {
-              clearTimeout(timer);
-              if (unsub) unsub();
-              resolve(msg as CVSaliencyMsg);
-            } else if (msg.type === 'error') {
-              clearTimeout(timer);
-              if (unsub) unsub();
-              reject(new Error((msg as any).message || 'Saliency computation failed'));
-            }
-          };
-          unsub = workerManager!.onCV(handler);
+          salResolvers.set(img.id, { resolve, reject, timer });
         }),
       );
     }
+    const salUnsub = workerManager!.onCV((msg) => {
+      if (msg.type === 'saliency' && salResolvers.has((msg as CVSaliencyMsg).imageId)) {
+        const m = msg as CVSaliencyMsg;
+        const r = salResolvers.get(m.imageId)!;
+        clearTimeout(r.timer);
+        salResolvers.delete(m.imageId);
+        r.resolve(m);
+      } else if (msg.type === 'error') {
+        for (const [, r] of salResolvers) {
+          clearTimeout(r.timer);
+          r.reject(new Error((msg as any).message || 'Saliency computation failed'));
+        }
+        salResolvers.clear();
+      }
+    });
 
     workerManager!.sendCV({ type: 'computeSaliency' });
 
@@ -502,6 +537,7 @@ export async function runStitchPreview(): Promise<void> {
       updateProgress('saliency', salIdx / active.length);
     }
     setStatus(`Saliency maps computed for ${lastSaliency.size}/${active.length} images.`);
+    salUnsub();
   }
   updateProgress('saliency', 1);
 

@@ -434,7 +434,8 @@ export function buildSettingsPanel(): void {
     input.style.cssText = 'width:90px;';
     input.addEventListener('input', () => {
       const v = Number(input.value);
-      (settings as any)[key] = v;
+      const { settings: cur } = getState();
+      if (cur) setState({ settings: { ...cur, [key]: v } });
       valSpan.textContent = (step < 1 ? v.toFixed(2) : String(v)) + suffix;
     });
     row.appendChild(lbl);
@@ -454,7 +455,10 @@ export function buildSettingsPanel(): void {
     cb.type = 'checkbox';
     cb.checked = !!settings[key];
     cb.style.cssText = 'width:auto;';
-    cb.addEventListener('change', () => { (settings as any)[key] = cb.checked; });
+    cb.addEventListener('change', () => {
+      const { settings: cur } = getState();
+      if (cur) setState({ settings: { ...cur, [key]: cb.checked } });
+    });
     row.appendChild(lbl);
     row.appendChild(cb);
     panel.appendChild(row);
@@ -475,7 +479,10 @@ export function buildSettingsPanel(): void {
       if (String(settings[key]) === opt.value) o.selected = true;
       sel.appendChild(o);
     }
-    sel.addEventListener('change', () => { (settings as any)[key] = sel.value; });
+    sel.addEventListener('change', () => {
+      const { settings: cur } = getState();
+      if (cur) setState({ settings: { ...cur, [key]: sel.value } });
+    });
     row.appendChild(lbl);
     row.appendChild(sel);
     panel.appendChild(row);
