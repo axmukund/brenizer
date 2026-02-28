@@ -74,7 +74,7 @@ where $\tilde{p}$ denotes homogeneous coordinates and $\rho$ is the Huber loss.
 
 Each LM iteration solves the damped normal equations:
 
-$$(J^\top J + \lambda \operatorname{diag}(J^\top J)) \, \delta = -J^\top r$$
+$$(J^\top J + \lambda \mathrm{diag}(J^\top J)) \, \delta = -J^\top r$$
 
 NaN protection is applied to the delta vector to prevent degenerate numeric solves.
 
