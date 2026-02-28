@@ -100,6 +100,18 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
   const S = n;     // virtual source node
   const T = n + 1; // virtual sink node
   const totalNodes = n + 2;
+  const totalEdgesEstimate = (gridW - 1) * gridH + gridW * (gridH - 1);
+  let lastBuildProgressAt = performance.now();
+
+  function maybeBuildProgress(stage, processed, total) {
+    if (!onProgress) return;
+    const now = performance.now();
+    if (now - lastBuildProgressAt >= progressEveryMs) {
+      lastBuildProgressAt = now;
+      const pct = total > 0 ? Math.min(100, (processed / total) * 100) : 0;
+      onProgress(stage, `Graph build ${Math.round(pct)}%`, { augments: 0 });
+    }
+  }
 
   // Build adjacency list graph with capacities
   // Each edge is stored in both directions (forward + reverse)
@@ -133,10 +145,12 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
 
     if (capS > 0) addEdge(S, i, capS);
     if (capT > 0) addEdge(i, T, capT);
+    if ((i & 0x7ff) === 0) maybeBuildProgress('seam-solve-build-data', i, n);
   }
 
   // Add n-links (smoothness between adjacent blocks)
   const nHorizontal = (gridW - 1) * gridH;
+  let processedEdges = 0;
 
   for (let y = 0; y < gridH; y++) {
     for (let x = 0; x < gridW - 1; x++) {
@@ -145,6 +159,8 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
       const eIdx = y * (gridW - 1) + x;
       const w = edgeWeights ? edgeWeights[eIdx] : 1.0;
       addEdgeBi(a, b, w);
+      processedEdges++;
+      if ((processedEdges & 0x7ff) === 0) maybeBuildProgress('seam-solve-build-edges', processedEdges, totalEdgesEstimate);
     }
   }
 
@@ -155,6 +171,8 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
       const eIdx = nHorizontal + y * gridW + x;
       const w = edgeWeights ? edgeWeights[eIdx] : 1.0;
       addEdgeBi(a, b, w);
+      processedEdges++;
+      if ((processedEdges & 0x7ff) === 0) maybeBuildProgress('seam-solve-build-edges', processedEdges, totalEdgesEstimate);
     }
   }
 
