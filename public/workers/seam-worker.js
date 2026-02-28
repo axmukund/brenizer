@@ -40,6 +40,21 @@ self.addEventListener('message', async (ev) => {
 
     if (msg.type === 'solve') {
       const { jobId, gridW, gridH, dataCostsBuffer, edgeWeightsBuffer, hardConstraintsBuffer, params } = msg;
+      const solveParams = params || {};
+      const progressEveryMs = Math.max(250, Number(solveParams.progressEveryMs) || 1200);
+      const startedAt = performance.now();
+      const emitProgress = (stage, percent, info, extra = {}) => {
+        postMessage({
+          type: 'progress',
+          stage,
+          percent,
+          info,
+          jobId,
+          elapsedMs: Math.round(performance.now() - startedAt),
+          ...extra,
+        });
+      };
+      emitProgress('seam-solve-start', 0, `Solving seam ${gridW}×${gridH}`);
 
       // dataCosts: Float32Array, 2 floats per node [cost_source, cost_sink]
       //   cost_source = cost if labelled 0 (keep composite) — i.e., penalty for NOT being source
@@ -54,8 +69,18 @@ self.addEventListener('message', async (ev) => {
       // hard constraints: Uint8Array per node: 0=free, 1=force source (composite), 2=force sink (new)
       const hard = hardConstraintsBuffer ? new Uint8Array(hardConstraintsBuffer) : null;
 
-      const labels = solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, params || {});
+      const labels = solveMinCut(
+        gridW,
+        gridH,
+        dataCosts,
+        edgeWeights,
+        hard,
+        solveParams,
+        (stage, info, extra = {}) => emitProgress(stage, 0, info, extra),
+        progressEveryMs,
+      );
 
+      emitProgress('seam-solve-done', 100, 'Seam solve complete');
       postMessage({type:'result', jobId, labelsBuffer: labels.buffer}, [labels.buffer]);
       return;
     }
@@ -70,7 +95,7 @@ self.addEventListener('message', async (ev) => {
  * Solve binary min-cut on a 2D grid graph using Edmonds-Karp maxflow.
  * Returns Uint8Array of labels: 0 = source (keep composite), 1 = sink (take new image).
  */
-function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, params) {
+function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProgress, progressEveryMs) {
   const n = gridW * gridH;
   const S = n;     // virtual source node
   const T = n + 1; // virtual sink node
@@ -133,8 +158,10 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, params) {
     }
   }
 
+  if (onProgress) onProgress('seam-solve-graph', `Graph ready (${n} nodes)`);
+
   // Edmonds-Karp maxflow
-  maxflow(adj, S, T, totalNodes);
+  const flowStats = maxflow(adj, S, T, totalNodes, onProgress, progressEveryMs);
 
   // Find min-cut: BFS from S on residual graph
   const visited = new Uint8Array(totalNodes);
@@ -157,16 +184,33 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, params) {
     labels[i] = visited[i] ? 0 : 1;
   }
 
+  if (onProgress) onProgress('seam-solve-labels', `Labels built (${flowStats.augments} augments)`, {
+    augments: flowStats.augments,
+  });
+
   return labels;
 }
 
 /**
  * Edmonds-Karp maxflow algorithm (BFS for shortest augmenting path).
  */
-function maxflow(adj, S, T, totalNodes) {
+function maxflow(adj, S, T, totalNodes, onProgress, progressEveryMs) {
   let totalFlow = 0;
   const parent = new Int32Array(totalNodes);
   const parentEdge = new Int32Array(totalNodes);
+  let augments = 0;
+  let visitedNodes = 0;
+  let lastProgressAt = performance.now();
+  const tickMask = 0x3ff;
+
+  function maybeProgress(stage) {
+    if (!onProgress) return;
+    const now = performance.now();
+    if (now - lastProgressAt >= progressEveryMs) {
+      lastProgressAt = now;
+      onProgress(stage, `Augments ${augments}, visited ${visitedNodes}`, { augments });
+    }
+  }
 
   while (true) {
     parent.fill(-1);
@@ -177,6 +221,8 @@ function maxflow(adj, S, T, totalNodes) {
 
     while (qi < queue.length && parent[T] === -1) {
       const u = queue[qi++];
+      visitedNodes++;
+      if ((visitedNodes & tickMask) === 0) maybeProgress('seam-solve-search');
       const edges = adj[u];
       for (let k = 0; k < edges.length; k++) {
         const e = edges[k];
@@ -212,7 +258,10 @@ function maxflow(adj, S, T, totalNodes) {
     }
 
     totalFlow += bottleneck;
+    augments++;
+    if ((augments & 0x1f) === 0) maybeProgress('seam-solve-augment');
   }
 
-  return totalFlow;
+  if (onProgress) onProgress('seam-solve-maxflow', `Maxflow done (${augments} augments)`, { augments });
+  return { totalFlow, augments };
 }

@@ -46,6 +46,65 @@ let kpRenderer: KeypointRenderer | null = null;
 let compositor: Compositor | null = null;
 let pyramidBlender: PyramidBlender | null = null;
 
+const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
+const EXPORT_SEAM_HARD_GRID_NODES = 90000;
+const EXPORT_SEAM_MAX_BLOCK_SIZE = 256;
+const EXPORT_SEAM_PROGRESS_INTERVAL_MS = 1200;
+const EXPORT_SEAM_STALL_TIMEOUT_MS = 15000;
+const EXPORT_SEAM_INITIAL_TIMEOUT_MS = 30000;
+const EXPORT_SEAM_MAX_SOLVE_MS = 180000;
+const EXPORT_ENCODING_STATUS_INTERVAL_MS = 1000;
+
+type ExportSeamTimeoutKind = 'slow' | 'stall';
+
+class ExportSeamTimeoutError extends Error {
+  kind: ExportSeamTimeoutKind;
+  constructor(kind: ExportSeamTimeoutKind, message: string) {
+    super(message);
+    this.name = 'ExportSeamTimeoutError';
+    this.kind = kind;
+  }
+}
+
+interface ExportSeamPlan {
+  blockSize: number;
+  gridW: number;
+  gridH: number;
+  nodes: number;
+  forceFeather: boolean;
+}
+
+function chooseExportSeamPlan(outW: number, outH: number, requestedBlockSize: number): ExportSeamPlan {
+  const quantize = (v: number): number => Math.max(4, Math.round(v / 4) * 4);
+  const evaluate = (blockSize: number) => {
+    const gridW = Math.ceil(outW / blockSize);
+    const gridH = Math.ceil(outH / blockSize);
+    return { blockSize, gridW, gridH, nodes: gridW * gridH };
+  };
+
+  const requested = evaluate(Math.max(4, requestedBlockSize));
+  let planned = requested;
+  if (planned.nodes > EXPORT_SEAM_TARGET_GRID_NODES) {
+    const scale = Math.sqrt(planned.nodes / EXPORT_SEAM_TARGET_GRID_NODES);
+    const grown = Math.min(EXPORT_SEAM_MAX_BLOCK_SIZE, quantize(planned.blockSize * scale));
+    planned = evaluate(grown);
+  }
+  if (planned.nodes > EXPORT_SEAM_HARD_GRID_NODES && planned.blockSize < EXPORT_SEAM_MAX_BLOCK_SIZE) {
+    const scale = Math.sqrt(planned.nodes / EXPORT_SEAM_HARD_GRID_NODES);
+    const grown = Math.min(EXPORT_SEAM_MAX_BLOCK_SIZE, quantize(planned.blockSize * scale));
+    planned = evaluate(grown);
+  }
+
+  return {
+    ...planned,
+    forceFeather: planned.nodes > EXPORT_SEAM_HARD_GRID_NODES,
+  };
+}
+
+function formatElapsedSeconds(ms: number): string {
+  return `${Math.max(0, Math.round(ms / 1000))}s`;
+}
+
 /** Sanitize a gain value: replace NaN/Infinity/non-positive with 1.0. */
 function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
@@ -1754,6 +1813,20 @@ async function exportComposite(): Promise<void> {
   })();
   const wm = getWorkerManager();
   const useGraphCut = settings.seamMethod === 'graphcut' && wm !== null;
+  const exportSeamPlan = useGraphCut ? chooseExportSeamPlan(outW, outH, blockSize) : null;
+  const useGraphCutForExport = useGraphCut && exportSeamPlan !== null && !exportSeamPlan.forceFeather;
+
+  if (useGraphCut && exportSeamPlan) {
+    if (exportSeamPlan.forceFeather) {
+      setStatus(
+        `Export seam graph ${exportSeamPlan.gridW}×${exportSeamPlan.gridH} is too large (${exportSeamPlan.nodes.toLocaleString()} nodes); using feather fallback.`,
+      );
+    } else if (exportSeamPlan.blockSize !== blockSize) {
+      setStatus(
+        `Export seam block size adjusted ${blockSize}px → ${exportSeamPlan.blockSize}px to keep graph size manageable.`,
+      );
+    }
+  }
 
   let imgIdx = 0;
   const gridN = 8;
@@ -1802,8 +1875,121 @@ async function exportComposite(): Promise<void> {
 
   // Saliency maps + pre-allocate readback buffers for export compositing
   const exportSaliencyMaps = getLastSaliency();
-  const _expCompPixels = new Uint8Array(outW * outH * 4);
+  const _expCompPixels = useGraphCutForExport ? new Uint8Array(outW * outH * 4) : null;
   const _expNewPixels = new Uint8Array(outW * outH * 4);
+  const exportFeatherWidth = Math.max(1, Math.round(featherWidth * compositeScale));
+
+  const blendWithMask = (maskPixels: Uint8Array): void => {
+    const maskTex = createMaskTexture(gl, maskPixels, outW, outH);
+    if (useMultiband) {
+      pyramidBlender!.blend(currentCompTex.texture, newImageTex!.texture, maskTex.texture, altCompFBO.fbo, outW, outH, mbLevels);
+    } else {
+      compositor!.blendWithMask(currentCompTex.texture, newImageTex!.texture, maskTex.texture, altCompFBO.fbo, outW, outH);
+    }
+    maskTex.dispose();
+    [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+    [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+  };
+
+  const blendFeatherFromNewPixels = (newPixels: Uint8Array): void => {
+    const alphaMask = new Uint8Array(outW * outH);
+    for (let i = 0; i < outW * outH; i++) alphaMask[i] = newPixels[i * 4 + 3];
+    const feathered = featherMask(alphaMask, outW, outH, exportFeatherWidth);
+    blendWithMask(feathered);
+  };
+
+  const solveSeamForExport = async (
+    imgId: string,
+    imgNumber: number,
+    gridW: number,
+    gridH: number,
+    dataCostsBuf: ArrayBuffer,
+    edgeWeightsBuf: ArrayBuffer,
+    hardBuf: ArrayBuffer,
+  ): Promise<SeamResultMsg> => {
+    if (!wm) throw new Error('Seam worker unavailable');
+    const jobId = `export-${imgId}`;
+    const startedAt = performance.now();
+    let lastProgressAt = startedAt;
+    let sawHeartbeat = false;
+    let lastInfo = `grid ${gridW}×${gridH}`;
+    let done = false;
+
+    return await new Promise<SeamResultMsg>((resolve, reject) => {
+      const cleanup = (timer: number, unsub: () => void): void => {
+        window.clearInterval(timer);
+        unsub();
+      };
+
+      const unsub = wm.onSeam((msg) => {
+        if (done) return;
+        if (msg.type === 'progress') {
+          if (msg.jobId && msg.jobId !== jobId) return;
+          if (!msg.stage.startsWith('seam-solve')) return;
+          sawHeartbeat = true;
+          lastProgressAt = performance.now();
+          lastInfo = msg.info ?? msg.stage;
+          return;
+        }
+        if (msg.type === 'result') {
+          if (msg.jobId !== jobId) return;
+          done = true;
+          cleanup(monitorTimer, unsub);
+          resolve(msg);
+          return;
+        }
+        if (msg.type === 'error') {
+          if (msg.jobId && msg.jobId !== jobId) return;
+          done = true;
+          cleanup(monitorTimer, unsub);
+          reject(new Error(msg.message || 'Seam worker error'));
+        }
+      });
+
+      const monitorTimer = window.setInterval(() => {
+        if (done) return;
+        const now = performance.now();
+        const elapsedMs = now - startedAt;
+        const staleMs = now - lastProgressAt;
+        const stallLimitMs = sawHeartbeat ? EXPORT_SEAM_STALL_TIMEOUT_MS : EXPORT_SEAM_INITIAL_TIMEOUT_MS;
+
+        setStatus(`Export: ${imgNumber}/${mstOrder.length} — seam ${formatElapsedSeconds(elapsedMs)} (${lastInfo})`);
+
+        if (elapsedMs > EXPORT_SEAM_MAX_SOLVE_MS) {
+          done = true;
+          cleanup(monitorTimer, unsub);
+          reject(new ExportSeamTimeoutError(
+            'slow',
+            `Seam solve exceeded ${formatElapsedSeconds(EXPORT_SEAM_MAX_SOLVE_MS)} with ongoing progress.`,
+          ));
+        } else if (staleMs > stallLimitMs) {
+          done = true;
+          cleanup(monitorTimer, unsub);
+          reject(new ExportSeamTimeoutError(
+            'stall',
+            `Seam solve stalled (${formatElapsedSeconds(staleMs)} without progress heartbeat).`,
+          ));
+        }
+      }, 1000);
+
+      try {
+        wm.sendSeam({
+          type: 'solve',
+          jobId,
+          gridW,
+          gridH,
+          dataCostsBuffer: dataCostsBuf,
+          edgeWeightsBuffer: edgeWeightsBuf,
+          hardConstraintsBuffer: hardBuf,
+          params: { progressEveryMs: EXPORT_SEAM_PROGRESS_INTERVAL_MS },
+        }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
+      } catch (err) {
+        done = true;
+        cleanup(monitorTimer, unsub);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  };
 
   for (const imgId of mstOrder) {
     const img = active.find(i => i.id === imgId);
@@ -1889,9 +2075,9 @@ async function exportComposite(): Promise<void> {
       gl.blitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-    } else if (useGraphCut) {
-      // Graph cut seam finding — reuse pre-allocated buffers
-      const compPixels = _expCompPixels;
+    } else if (useGraphCutForExport) {
+      // Graph cut seam finding with adaptive block sizing and stall monitoring.
+      const compPixels = _expCompPixels!;
       const newPixels = _expNewPixels;
       gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
@@ -1910,7 +2096,9 @@ async function exportComposite(): Promise<void> {
       if (curFacesExport) {
         for (const f of curFacesExport) seamFacesExport.push({ ...f, imageLabel: 1 });
       }
-      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, blockSize, 0, seamFacesExport,
+
+      const seamBlockSize = exportSeamPlan?.blockSize ?? blockSize;
+      const costs = computeBlockCosts(compPixels, newPixels, outW, outH, seamBlockSize, 0, seamFacesExport,
         settings?.blurAwareStitching
           ? projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, outW, outH, exportSaliencyMaps)
           : null);
@@ -1918,28 +2106,35 @@ async function exportComposite(): Promise<void> {
       const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
 
-      const resultPromise = wm!.waitSeam('result', 30000) as Promise<SeamResultMsg>;
-      wm!.sendSeam({
-        type: 'solve', jobId: `export-${imgId}`,
-        gridW: costs.gridW, gridH: costs.gridH,
-        dataCostsBuffer: dataCostsBuf, edgeWeightsBuffer: edgeWeightsBuf,
-        hardConstraintsBuffer: hardBuf, params: {},
-      }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
-
-      const seamResult = await resultPromise;
-      const blockLabels = new Uint8Array(seamResult.labelsBuffer);
-      const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, blockSize, outW, outH);
-      const feathered = featherMask(pixelMask, outW, outH, Math.max(1, Math.round(featherWidth * compositeScale)));
-      const maskTex = createMaskTexture(gl, feathered, outW, outH);
-
-      if (useMultiband) {
-        pyramidBlender!.blend(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH, mbLevels);
-      } else {
-        compositor.blendWithMask(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH);
+      try {
+        const seamResult = await solveSeamForExport(
+          imgId,
+          imgIdx + 1,
+          costs.gridW,
+          costs.gridH,
+          dataCostsBuf,
+          edgeWeightsBuf,
+          hardBuf,
+        );
+        const blockLabels = new Uint8Array(seamResult.labelsBuffer);
+        const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, seamBlockSize, outW, outH);
+        const feathered = featherMask(pixelMask, outW, outH, exportFeatherWidth);
+        blendWithMask(feathered);
+      } catch (err) {
+        if (err instanceof ExportSeamTimeoutError) {
+          if (err.kind === 'stall') {
+            console.warn(`Export seam stalled for ${imgId}; falling back to feather blend.`, err.message);
+            setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam stalled, using feather fallback`);
+          } else {
+            console.warn(`Export seam too slow for ${imgId}; falling back to feather blend.`, err.message);
+            setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam too slow, using feather fallback`);
+          }
+        } else {
+          console.warn(`Export seam solve failed for ${imgId}; falling back to feather blend.`, err);
+          setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam failed, using feather fallback`);
+        }
+        blendFeatherFromNewPixels(newPixels);
       }
-      maskTex.dispose();
-      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
-      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
     } else {
       // Feather-only fallback — reuse pre-allocated buffer
       const newPixels = _expNewPixels;
@@ -1947,20 +2142,7 @@ async function exportComposite(): Promise<void> {
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-      const alphaMask = new Uint8Array(outW * outH);
-      for (let i = 0; i < outW * outH; i++) alphaMask[i] = newPixels[i * 4 + 3];
-      const feathered = featherMask(alphaMask, outW, outH, Math.max(1, Math.round(featherWidth * compositeScale)));
-      const maskTex = createMaskTexture(gl, feathered, outW, outH);
-
-      if (useMultiband) {
-        pyramidBlender!.blend(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH, mbLevels);
-      } else {
-        compositor.blendWithMask(currentCompTex.texture, newImageTex.texture, maskTex.texture, altCompFBO.fbo, outW, outH);
-      }
-      maskTex.dispose();
-      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
-      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+      blendFeatherFromNewPixels(newPixels);
     }
 
     imgIdx++;
@@ -1968,7 +2150,7 @@ async function exportComposite(): Promise<void> {
   }
 
   // Read back final composite
-  setStatus('Encoding…');
+  setStatus('Finalizing export pixels…');
   const pixels = new Uint8Array(outW * outH * 4);
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
@@ -2055,7 +2237,19 @@ async function exportComposite(): Promise<void> {
 
   const mimeType = exportFormat === 'jpeg' ? 'image/jpeg' : 'image/png';
   const quality = exportFormat === 'jpeg' ? jpegQuality : undefined;
-  const blob = await finalCanvas.convertToBlob({ type: mimeType, quality });
+  const encodeStartedAt = performance.now();
+  setStatus(`Encoding ${exportFormat.toUpperCase()}… ${formatElapsedSeconds(0)}`);
+  const encodingTicker = window.setInterval(() => {
+    const elapsedMs = performance.now() - encodeStartedAt;
+    setStatus(`Encoding ${exportFormat.toUpperCase()}… ${formatElapsedSeconds(elapsedMs)}`);
+  }, EXPORT_ENCODING_STATUS_INTERVAL_MS);
+
+  let blob: Blob;
+  try {
+    blob = await finalCanvas.convertToBlob({ type: mimeType, quality });
+  } finally {
+    window.clearInterval(encodingTicker);
+  }
 
   // Trigger download
   const url = URL.createObjectURL(blob);

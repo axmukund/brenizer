@@ -274,10 +274,20 @@ export interface SeamResultMsg {
   labelsBuffer: ArrayBuffer;
 }
 
+export interface SeamProgressMsg {
+  type: 'progress';
+  stage: string;
+  percent: number;
+  info?: string;
+  jobId?: string;
+  elapsedMs?: number;
+  augments?: number;
+}
+
 export interface SeamErrorMsg {
   type: 'error';
   jobId?: string;
   message: string;
 }
 
-export type SeamOutMsg = SeamResultMsg | SeamErrorMsg | CVProgressMsg;
+export type SeamOutMsg = SeamResultMsg | SeamErrorMsg | SeamProgressMsg;
