@@ -49,15 +49,15 @@ let pyramidBlender: PyramidBlender | null = null;
 const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
 const EXPORT_SEAM_HARD_GRID_NODES = 90000;
 const EXPORT_SEAM_MAX_BLOCK_SIZE = 256;
-const PREVIEW_SEAM_RESULT_TIMEOUT_MS = 120000;
 const PREVIEW_SEAM_PROGRESS_INTERVAL_MS = 1000;
 const EXPORT_SEAM_PROGRESS_INTERVAL_MS = 1200;
-const EXPORT_SEAM_STALL_TIMEOUT_MS = 15000;
-const EXPORT_SEAM_INITIAL_TIMEOUT_MS = 30000;
-const EXPORT_SEAM_MAX_SOLVE_MS = 180000;
+const SEAM_INITIAL_STALL_TIMEOUT_MS = 30000;
+const SEAM_MIN_STALL_TIMEOUT_MS = 15000;
+const SEAM_MAX_STALL_TIMEOUT_MS = 180000;
+const SEAM_STALL_GRACE_MULTIPLIER = 6;
 const EXPORT_ENCODING_STATUS_INTERVAL_MS = 1000;
 
-type ExportSeamTimeoutKind = 'slow' | 'stall';
+type ExportSeamTimeoutKind = 'stall';
 
 class ExportSeamTimeoutError extends Error {
   kind: ExportSeamTimeoutKind;
@@ -105,6 +105,170 @@ function chooseExportSeamPlan(outW: number, outH: number, requestedBlockSize: nu
 
 function formatElapsedSeconds(ms: number): string {
   return `${Math.max(0, Math.round(ms / 1000))}s`;
+}
+
+type SeamWorkerClient = Pick<NonNullable<ReturnType<typeof getWorkerManager>>, 'onSeam' | 'sendSeam'>;
+
+interface SeamSolveStatusSnapshot {
+  elapsedMs: number;
+  percent: number | null;
+  remainingMs: number | null;
+  info: string;
+  staleMs: number;
+  stallLimitMs: number;
+}
+
+function clampNumber(v: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, v));
+}
+
+function estimateRemainingFromPercent(percent: number | null, elapsedMs: number): number | null {
+  if (percent === null || percent <= 0 || percent >= 100) return null;
+  const remainingMs = Math.round((elapsedMs * (100 - percent)) / percent);
+  return Number.isFinite(remainingMs) && remainingMs >= 0 ? remainingMs : null;
+}
+
+function formatSeamEstimate(percent: number | null, remainingMs: number | null): string {
+  const pctText = percent === null ? 'estimating' : `${Math.round(percent)}%`;
+  const remainingText = remainingMs === null ? 'estimating remaining' : `${formatElapsedSeconds(remainingMs)} remaining`;
+  return `${pctText}, ${remainingText}`;
+}
+
+async function waitForSeamSolveAdaptive(
+  wm: SeamWorkerClient,
+  opts: {
+    jobId: string;
+    gridW: number;
+    gridH: number;
+    dataCostsBuf: ArrayBuffer;
+    edgeWeightsBuf: ArrayBuffer;
+    hardBuf: ArrayBuffer;
+    progressEveryMs: number;
+    onStatus: (snapshot: SeamSolveStatusSnapshot) => void;
+  },
+): Promise<SeamResultMsg> {
+  const {
+    jobId,
+    gridW,
+    gridH,
+    dataCostsBuf,
+    edgeWeightsBuf,
+    hardBuf,
+    progressEveryMs,
+    onStatus,
+  } = opts;
+
+  const startedAt = performance.now();
+  let lastProgressAt = startedAt;
+  let lastHeartbeatAt = startedAt;
+  let heartbeatEwmaMs = progressEveryMs;
+  let sawHeartbeat = false;
+  let bestPercent = 0;
+  let lastInfo = `grid ${gridW}×${gridH}`;
+  let lastRemainingMs: number | null = null;
+  let done = false;
+
+  const makeSnapshot = (now: number): SeamSolveStatusSnapshot => {
+    const elapsedMs = now - startedAt;
+    const percent = bestPercent > 0 ? bestPercent : null;
+    const remainingMs = lastRemainingMs ?? estimateRemainingFromPercent(percent, elapsedMs);
+    const staleMs = now - lastProgressAt;
+    const adaptiveStallLimitMs = sawHeartbeat
+      ? clampNumber(
+          Math.round(heartbeatEwmaMs * SEAM_STALL_GRACE_MULTIPLIER),
+          SEAM_MIN_STALL_TIMEOUT_MS,
+          SEAM_MAX_STALL_TIMEOUT_MS,
+        )
+      : SEAM_INITIAL_STALL_TIMEOUT_MS;
+    return {
+      elapsedMs,
+      percent,
+      remainingMs,
+      info: lastInfo,
+      staleMs,
+      stallLimitMs: adaptiveStallLimitMs,
+    };
+  };
+
+  return await new Promise<SeamResultMsg>((resolve, reject) => {
+    let monitorTimer = 0;
+    const cleanup = (unsub: () => void): void => {
+      if (monitorTimer !== 0) window.clearInterval(monitorTimer);
+      unsub();
+    };
+
+    const unsub = wm.onSeam((msg) => {
+      if (done) return;
+      if (msg.type === 'progress') {
+        if (msg.jobId && msg.jobId !== jobId) return;
+        if (!msg.stage.startsWith('seam-solve')) return;
+        const now = performance.now();
+        if (sawHeartbeat) {
+          const intervalMs = Math.max(1, now - lastHeartbeatAt);
+          heartbeatEwmaMs = heartbeatEwmaMs * 0.8 + intervalMs * 0.2;
+        }
+        sawHeartbeat = true;
+        lastHeartbeatAt = now;
+        lastProgressAt = now;
+        lastInfo = msg.info ?? msg.stage;
+        if (Number.isFinite(msg.percent)) {
+          bestPercent = Math.max(bestPercent, clampNumber(msg.percent, 0, 100));
+        }
+        if (typeof msg.remainingMs === 'number' && Number.isFinite(msg.remainingMs) && msg.remainingMs >= 0) {
+          lastRemainingMs = Math.round(msg.remainingMs);
+        } else {
+          lastRemainingMs = estimateRemainingFromPercent(bestPercent > 0 ? bestPercent : null, now - startedAt);
+        }
+        return;
+      }
+      if (msg.type === 'result') {
+        if (msg.jobId !== jobId) return;
+        done = true;
+        cleanup(unsub);
+        resolve(msg);
+        return;
+      }
+      if (msg.type === 'error') {
+        if (msg.jobId && msg.jobId !== jobId) return;
+        done = true;
+        cleanup(unsub);
+        reject(new Error(msg.message || 'Seam worker error'));
+      }
+    });
+
+    const tick = (): void => {
+      if (done) return;
+      const snapshot = makeSnapshot(performance.now());
+      onStatus(snapshot);
+      if (snapshot.staleMs > snapshot.stallLimitMs) {
+        done = true;
+        cleanup(unsub);
+        reject(new Error(
+          `Seam solve stalled (${formatElapsedSeconds(snapshot.staleMs)} without progress heartbeat; limit ${formatElapsedSeconds(snapshot.stallLimitMs)}).`,
+        ));
+      }
+    };
+
+    monitorTimer = window.setInterval(tick, 1000);
+    onStatus(makeSnapshot(startedAt));
+
+    try {
+      wm.sendSeam({
+        type: 'solve',
+        jobId,
+        gridW,
+        gridH,
+        dataCostsBuffer: dataCostsBuf,
+        edgeWeightsBuffer: edgeWeightsBuf,
+        hardConstraintsBuffer: hardBuf,
+        params: { progressEveryMs },
+      }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
+    } catch (err) {
+      done = true;
+      cleanup(unsub);
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
 }
 
 /** Sanitize a gain value: replace NaN/Infinity/non-positive with 1.0. */
@@ -1148,20 +1312,18 @@ async function renderWarpedPreview(
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
 
       const jobId = `seam-${imgId}`;
-      const resultPromise = wm!.waitSeam('result', PREVIEW_SEAM_RESULT_TIMEOUT_MS) as Promise<SeamResultMsg>;
-
-      wm!.sendSeam({
-        type: 'solve',
+      const seamResult = await waitForSeamSolveAdaptive(wm!, {
         jobId,
         gridW: costs.gridW,
         gridH: costs.gridH,
-        dataCostsBuffer: dataCostsBuf,
-        edgeWeightsBuffer: edgeWeightsBuf,
-        hardConstraintsBuffer: hardBuf,
-        params: { progressEveryMs: PREVIEW_SEAM_PROGRESS_INTERVAL_MS },
-      }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
-
-      const seamResult = await resultPromise;
+        dataCostsBuf,
+        edgeWeightsBuf,
+        hardBuf,
+        progressEveryMs: PREVIEW_SEAM_PROGRESS_INTERVAL_MS,
+        onStatus: ({ percent, remainingMs, info }) => {
+          setStatus(`Compositing ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
+        },
+      });
       const blockLabels = new Uint8Array(seamResult.labelsBuffer);
 
       // Convert block labels to pixel mask + feather
@@ -1911,86 +2073,25 @@ async function exportComposite(): Promise<void> {
   ): Promise<SeamResultMsg> => {
     if (!wm) throw new Error('Seam worker unavailable');
     const jobId = `export-${imgId}`;
-    const startedAt = performance.now();
-    let lastProgressAt = startedAt;
-    let sawHeartbeat = false;
-    let lastInfo = `grid ${gridW}×${gridH}`;
-    let done = false;
-
-    return await new Promise<SeamResultMsg>((resolve, reject) => {
-      const cleanup = (timer: number, unsub: () => void): void => {
-        window.clearInterval(timer);
-        unsub();
-      };
-
-      const unsub = wm.onSeam((msg) => {
-        if (done) return;
-        if (msg.type === 'progress') {
-          if (msg.jobId && msg.jobId !== jobId) return;
-          if (!msg.stage.startsWith('seam-solve')) return;
-          sawHeartbeat = true;
-          lastProgressAt = performance.now();
-          lastInfo = msg.info ?? msg.stage;
-          return;
-        }
-        if (msg.type === 'result') {
-          if (msg.jobId !== jobId) return;
-          done = true;
-          cleanup(monitorTimer, unsub);
-          resolve(msg);
-          return;
-        }
-        if (msg.type === 'error') {
-          if (msg.jobId && msg.jobId !== jobId) return;
-          done = true;
-          cleanup(monitorTimer, unsub);
-          reject(new Error(msg.message || 'Seam worker error'));
-        }
+    try {
+      return await waitForSeamSolveAdaptive(wm, {
+        jobId,
+        gridW,
+        gridH,
+        dataCostsBuf,
+        edgeWeightsBuf,
+        hardBuf,
+        progressEveryMs: EXPORT_SEAM_PROGRESS_INTERVAL_MS,
+        onStatus: ({ percent, remainingMs, info }) => {
+          setStatus(`Export: ${imgNumber}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
+        },
       });
-
-      const monitorTimer = window.setInterval(() => {
-        if (done) return;
-        const now = performance.now();
-        const elapsedMs = now - startedAt;
-        const staleMs = now - lastProgressAt;
-        const stallLimitMs = sawHeartbeat ? EXPORT_SEAM_STALL_TIMEOUT_MS : EXPORT_SEAM_INITIAL_TIMEOUT_MS;
-
-        setStatus(`Export: ${imgNumber}/${mstOrder.length} — seam ${formatElapsedSeconds(elapsedMs)} (${lastInfo})`);
-
-        if (elapsedMs > EXPORT_SEAM_MAX_SOLVE_MS) {
-          done = true;
-          cleanup(monitorTimer, unsub);
-          reject(new ExportSeamTimeoutError(
-            'slow',
-            `Seam solve exceeded ${formatElapsedSeconds(EXPORT_SEAM_MAX_SOLVE_MS)} with ongoing progress.`,
-          ));
-        } else if (staleMs > stallLimitMs) {
-          done = true;
-          cleanup(monitorTimer, unsub);
-          reject(new ExportSeamTimeoutError(
-            'stall',
-            `Seam solve stalled (${formatElapsedSeconds(staleMs)} without progress heartbeat).`,
-          ));
-        }
-      }, 1000);
-
-      try {
-        wm.sendSeam({
-          type: 'solve',
-          jobId,
-          gridW,
-          gridH,
-          dataCostsBuffer: dataCostsBuf,
-          edgeWeightsBuffer: edgeWeightsBuf,
-          hardConstraintsBuffer: hardBuf,
-          params: { progressEveryMs: EXPORT_SEAM_PROGRESS_INTERVAL_MS },
-        }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
-      } catch (err) {
-        done = true;
-        cleanup(monitorTimer, unsub);
-        reject(err instanceof Error ? err : new Error(String(err)));
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('stalled')) {
+        throw new ExportSeamTimeoutError('stall', err.message);
       }
-    });
+      throw err;
+    }
   };
 
   for (const imgId of mstOrder) {
@@ -2124,13 +2225,8 @@ async function exportComposite(): Promise<void> {
         blendWithMask(feathered);
       } catch (err) {
         if (err instanceof ExportSeamTimeoutError) {
-          if (err.kind === 'stall') {
-            console.warn(`Export seam stalled for ${imgId}; falling back to feather blend.`, err.message);
-            setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam stalled, using feather fallback`);
-          } else {
-            console.warn(`Export seam too slow for ${imgId}; falling back to feather blend.`, err.message);
-            setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam too slow, using feather fallback`);
-          }
+          console.warn(`Export seam stalled for ${imgId}; falling back to feather blend.`, err.message);
+          setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam stalled, using feather fallback`);
         } else {
           console.warn(`Export seam solve failed for ${imgId}; falling back to feather blend.`, err);
           setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam failed, using feather fallback`);

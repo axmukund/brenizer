@@ -282,6 +282,8 @@ export interface SeamProgressMsg {
   jobId?: string;
   elapsedMs?: number;
   augments?: number;
+  remainingMs?: number;
+  expectedAugments?: number;
 }
 
 export interface SeamErrorMsg {

@@ -27,6 +27,7 @@
  */
 
 let ready = false;
+let rollingAugmentsPerNode = 0.35;
 
 self.addEventListener('message', async (ev) => {
   const msg = ev.data;
@@ -76,7 +77,7 @@ self.addEventListener('message', async (ev) => {
         edgeWeights,
         hard,
         solveParams,
-        (stage, info, extra = {}) => emitProgress(stage, 0, info, extra),
+        (stage, percent, info, extra = {}) => emitProgress(stage, percent, info, extra),
         progressEveryMs,
       );
 
@@ -102,14 +103,22 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
   const totalNodes = n + 2;
   const totalEdgesEstimate = (gridW - 1) * gridH + gridW * (gridH - 1);
   let lastBuildProgressAt = performance.now();
+  const BUILD_DATA_START_PERCENT = 5;
+  const BUILD_DATA_SPAN_PERCENT = 25;
+  const BUILD_EDGES_START_PERCENT = BUILD_DATA_START_PERCENT + BUILD_DATA_SPAN_PERCENT;
+  const BUILD_EDGES_SPAN_PERCENT = 25;
+  const MAXFLOW_START_PERCENT = BUILD_EDGES_START_PERCENT + BUILD_EDGES_SPAN_PERCENT;
+  const MAXFLOW_SPAN_PERCENT = 40;
+  const LABELS_PERCENT = 98;
 
-  function maybeBuildProgress(stage, processed, total) {
+  function maybeBuildProgress(stage, processed, total, startPercent, spanPercent) {
     if (!onProgress) return;
     const now = performance.now();
     if (now - lastBuildProgressAt >= progressEveryMs) {
       lastBuildProgressAt = now;
-      const pct = total > 0 ? Math.min(100, (processed / total) * 100) : 0;
-      onProgress(stage, `Graph build ${Math.round(pct)}%`, { augments: 0 });
+      const phasePct = total > 0 ? Math.min(1, processed / total) : 0;
+      const overallPercent = startPercent + spanPercent * phasePct;
+      onProgress(stage, overallPercent, `Graph build ${Math.round(phasePct * 100)}%`, { augments: 0 });
     }
   }
 
@@ -145,8 +154,11 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
 
     if (capS > 0) addEdge(S, i, capS);
     if (capT > 0) addEdge(i, T, capT);
-    if ((i & 0x7ff) === 0) maybeBuildProgress('seam-solve-build-data', i, n);
+    if ((i & 0x7ff) === 0) {
+      maybeBuildProgress('seam-solve-build-data', i, n, BUILD_DATA_START_PERCENT, BUILD_DATA_SPAN_PERCENT);
+    }
   }
+  maybeBuildProgress('seam-solve-build-data', n, n, BUILD_DATA_START_PERCENT, BUILD_DATA_SPAN_PERCENT);
 
   // Add n-links (smoothness between adjacent blocks)
   const nHorizontal = (gridW - 1) * gridH;
@@ -160,7 +172,9 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
       const w = edgeWeights ? edgeWeights[eIdx] : 1.0;
       addEdgeBi(a, b, w);
       processedEdges++;
-      if ((processedEdges & 0x7ff) === 0) maybeBuildProgress('seam-solve-build-edges', processedEdges, totalEdgesEstimate);
+      if ((processedEdges & 0x7ff) === 0) {
+        maybeBuildProgress('seam-solve-build-edges', processedEdges, totalEdgesEstimate, BUILD_EDGES_START_PERCENT, BUILD_EDGES_SPAN_PERCENT);
+      }
     }
   }
 
@@ -172,14 +186,30 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
       const w = edgeWeights ? edgeWeights[eIdx] : 1.0;
       addEdgeBi(a, b, w);
       processedEdges++;
-      if ((processedEdges & 0x7ff) === 0) maybeBuildProgress('seam-solve-build-edges', processedEdges, totalEdgesEstimate);
+      if ((processedEdges & 0x7ff) === 0) {
+        maybeBuildProgress('seam-solve-build-edges', processedEdges, totalEdgesEstimate, BUILD_EDGES_START_PERCENT, BUILD_EDGES_SPAN_PERCENT);
+      }
     }
   }
+  maybeBuildProgress('seam-solve-build-edges', totalEdgesEstimate, totalEdgesEstimate, BUILD_EDGES_START_PERCENT, BUILD_EDGES_SPAN_PERCENT);
 
-  if (onProgress) onProgress('seam-solve-graph', `Graph ready (${n} nodes)`);
+  if (onProgress) onProgress('seam-solve-graph', MAXFLOW_START_PERCENT, `Graph ready (${n} nodes)`);
 
   // Edmonds-Karp maxflow
-  const flowStats = maxflow(adj, S, T, totalNodes, onProgress, progressEveryMs);
+  const flowStats = maxflow(
+    adj,
+    S,
+    T,
+    totalNodes,
+    n,
+    onProgress
+      ? (stage, phasePct, info, extra = {}) => {
+          const overallPercent = MAXFLOW_START_PERCENT + MAXFLOW_SPAN_PERCENT * phasePct;
+          onProgress(stage, overallPercent, info, extra);
+        }
+      : null,
+    progressEveryMs,
+  );
 
   // Find min-cut: BFS from S on residual graph
   const visited = new Uint8Array(totalNodes);
@@ -202,8 +232,9 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
     labels[i] = visited[i] ? 0 : 1;
   }
 
-  if (onProgress) onProgress('seam-solve-labels', `Labels built (${flowStats.augments} augments)`, {
+  if (onProgress) onProgress('seam-solve-labels', LABELS_PERCENT, `Labels built (${flowStats.augments} augments)`, {
     augments: flowStats.augments,
+    remainingMs: 0,
   });
 
   return labels;
@@ -212,13 +243,15 @@ function solveMinCut(gridW, gridH, dataCosts, edgeWeights, hard, _params, onProg
 /**
  * Edmonds-Karp maxflow algorithm (BFS for shortest augmenting path).
  */
-function maxflow(adj, S, T, totalNodes, onProgress, progressEveryMs) {
+function maxflow(adj, S, T, totalNodes, gridNodes, onProgress, progressEveryMs) {
   let totalFlow = 0;
   const parent = new Int32Array(totalNodes);
   const parentEdge = new Int32Array(totalNodes);
   let augments = 0;
   let visitedNodes = 0;
   let lastProgressAt = performance.now();
+  const startedAt = performance.now();
+  let expectedAugments = Math.max(32, Math.round(gridNodes * rollingAugmentsPerNode));
   const tickMask = 0x3ff;
 
   function maybeProgress(stage) {
@@ -226,7 +259,20 @@ function maxflow(adj, S, T, totalNodes, onProgress, progressEveryMs) {
     const now = performance.now();
     if (now - lastProgressAt >= progressEveryMs) {
       lastProgressAt = now;
-      onProgress(stage, `Augments ${augments}, visited ${visitedNodes}`, { augments });
+      while (augments >= expectedAugments * 0.9) {
+        expectedAugments = Math.max(expectedAugments + 1, Math.round(expectedAugments * 1.35));
+      }
+      const phasePct = expectedAugments > 0 ? Math.min(0.995, augments / expectedAugments) : 0;
+      const elapsedMs = now - startedAt;
+      const augmentsPerSec = elapsedMs > 0 ? augments / (elapsedMs / 1000) : 0;
+      const remainingAugments = Math.max(0, expectedAugments - augments);
+      const remainingMs = augmentsPerSec > 0.05 ? Math.round((remainingAugments / augmentsPerSec) * 1000) : undefined;
+      onProgress(
+        stage,
+        phasePct,
+        `Maxflow ${Math.round(phasePct * 100)}% (${augments}/${expectedAugments} est augments)`,
+        { augments, remainingMs, expectedAugments },
+      );
     }
   }
 
@@ -280,6 +326,15 @@ function maxflow(adj, S, T, totalNodes, onProgress, progressEveryMs) {
     if ((augments & 0x1f) === 0) maybeProgress('seam-solve-augment');
   }
 
-  if (onProgress) onProgress('seam-solve-maxflow', `Maxflow done (${augments} augments)`, { augments });
+  const augmentsPerNode = augments / Math.max(1, gridNodes);
+  const clampedAugmentsPerNode = Math.min(8, Math.max(0.02, augmentsPerNode));
+  rollingAugmentsPerNode = rollingAugmentsPerNode * 0.85 + clampedAugmentsPerNode * 0.15;
+  if (onProgress) {
+    onProgress('seam-solve-maxflow', 1, `Maxflow done (${augments} augments)`, {
+      augments,
+      remainingMs: 0,
+      expectedAugments: Math.max(expectedAugments, augments),
+    });
+  }
   return { totalFlow, augments };
 }
