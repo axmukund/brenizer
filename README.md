@@ -342,6 +342,12 @@ public/
 - Brown & Lowe, "Automatic Panoramic Image Stitching using Invariant Features," IJCV 2007
 - Burt & Adelson, "A Multiresolution Spline with Application to Image Mosaics," TOG 1983
 
+## Third-Party Asset Attribution
+
+- Favicon (`public/favicon.svg`) is adapted from Tabler Icons: `icons/outline/aperture.svg` (MIT).
+  Source: https://github.com/tabler/tabler-icons/blob/main/icons/outline/aperture.svg
+  License: https://github.com/tabler/tabler-icons/blob/main/LICENSE
+
 ## License
 
 MIT
