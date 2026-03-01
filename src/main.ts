@@ -49,6 +49,8 @@ let pyramidBlender: PyramidBlender | null = null;
 const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
 const EXPORT_SEAM_HARD_GRID_NODES = 90000;
 const EXPORT_SEAM_MAX_BLOCK_SIZE = 256;
+const PREVIEW_SEAM_RESULT_TIMEOUT_MS = 120000;
+const PREVIEW_SEAM_PROGRESS_INTERVAL_MS = 1000;
 const EXPORT_SEAM_PROGRESS_INTERVAL_MS = 1200;
 const EXPORT_SEAM_STALL_TIMEOUT_MS = 15000;
 const EXPORT_SEAM_INITIAL_TIMEOUT_MS = 30000;
@@ -1146,7 +1148,7 @@ async function renderWarpedPreview(
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
 
       const jobId = `seam-${imgId}`;
-      const resultPromise = wm!.waitSeam('result', 15000) as Promise<SeamResultMsg>;
+      const resultPromise = wm!.waitSeam('result', PREVIEW_SEAM_RESULT_TIMEOUT_MS) as Promise<SeamResultMsg>;
 
       wm!.sendSeam({
         type: 'solve',
@@ -1156,7 +1158,7 @@ async function renderWarpedPreview(
         dataCostsBuffer: dataCostsBuf,
         edgeWeightsBuffer: edgeWeightsBuf,
         hardConstraintsBuffer: hardBuf,
-        params: {},
+        params: { progressEveryMs: PREVIEW_SEAM_PROGRESS_INTERVAL_MS },
       }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
 
       const seamResult = await resultPromise;
