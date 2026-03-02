@@ -105,9 +105,54 @@
     }
     #canvas-container canvas {
       max-width: 100%; max-height: 100%;
+      transition: transform 0.08s linear;
     }
     #canvas-placeholder {
       color: var(--text-dim); font-size: 14px; text-align: center; pointer-events: none;
+    }
+    #view-controls {
+      position: absolute;
+      right: 12px;
+      top: 12px;
+      z-index: 3;
+      width: 200px;
+      padding: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: rgba(15, 52, 96, 0.86);
+      backdrop-filter: blur(2px);
+      color: var(--text);
+      font-size: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    #view-controls .row {
+      display: grid;
+      grid-template-columns: 56px 1fr 42px;
+      align-items: center;
+      gap: 6px;
+    }
+    #view-controls input[type="range"] {
+      width: 100%;
+    }
+    #view-controls .val {
+      text-align: right;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    #view-controls button {
+      border: 1px solid var(--border);
+      background: rgba(22, 33, 62, 0.9);
+      color: var(--text);
+      border-radius: 4px;
+      padding: 4px 6px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #view-controls button:hover {
+      border-color: var(--accent);
+      color: var(--accent);
     }
 
     /* Capabilities bar */
@@ -226,6 +271,19 @@
           <canvas id="preview-canvas" width="800" height="600" style="display:none;"></canvas>
           <div id="canvas-placeholder">
             Upload images and click "Stitch Preview" to begin
+          </div>
+          <div id="view-controls" aria-label="Panorama Editor View Controls">
+            <div class="row">
+              <span>Zoom</span>
+              <input id="editor-zoom" type="range" min="0.25" max="3.00" step="0.01" value="1.00" />
+              <span id="editor-zoom-val" class="val">100%</span>
+            </div>
+            <div class="row">
+              <span>Rotate</span>
+              <input id="editor-rotate" type="range" min="-20" max="20" step="0.1" value="0" />
+              <span id="editor-rotate-val" class="val">0.0°</span>
+            </div>
+            <button id="editor-reset" type="button">Reset View</button>
           </div>
         </div>
       </div>

@@ -46,6 +46,8 @@ let warpRenderer: WarpRenderer | null = null;
 let kpRenderer: KeypointRenderer | null = null;
 let compositor: Compositor | null = null;
 let pyramidBlender: PyramidBlender | null = null;
+let editorZoom = 1.0;
+let editorRotationDeg = 0.0;
 
 const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
 const EXPORT_SEAM_HARD_GRID_NODES = 90000;
@@ -277,6 +279,59 @@ function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
 }
 
+function applyPreviewEditorTransform(): void {
+  const canvas = document.getElementById('preview-canvas') as HTMLCanvasElement | null;
+  if (!canvas) return;
+  canvas.style.transformOrigin = '50% 50%';
+  canvas.style.transform = `scale(${editorZoom.toFixed(3)}) rotate(${editorRotationDeg.toFixed(2)}deg)`;
+}
+
+function refreshEditorControlLabels(): void {
+  const zoomVal = document.getElementById('editor-zoom-val');
+  const rotVal = document.getElementById('editor-rotate-val');
+  if (zoomVal) zoomVal.textContent = `${Math.round(editorZoom * 100)}%`;
+  if (rotVal) rotVal.textContent = `${editorRotationDeg.toFixed(1)}°`;
+}
+
+function rotateRgbaImage(src: Uint8ClampedArray, width: number, height: number, angleRad: number): Uint8ClampedArray {
+  if (Math.abs(angleRad) < 1e-6) return src;
+  const out = new Uint8ClampedArray(src.length);
+  const cx = width / 2;
+  const cy = height / 2;
+  const cosA = Math.cos(-angleRad);
+  const sinA = Math.sin(-angleRad);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      const sx = cosA * dx - sinA * dy + cx;
+      const sy = sinA * dx + cosA * dy + cy;
+      const sx0 = Math.floor(sx);
+      const sy0 = Math.floor(sy);
+      const outIdx = (y * width + x) * 4;
+      if (sx0 < 0 || sx0 >= width - 1 || sy0 < 0 || sy0 >= height - 1) {
+        out[outIdx] = out[outIdx + 1] = out[outIdx + 2] = out[outIdx + 3] = 0;
+        continue;
+      }
+      const fx = sx - sx0;
+      const fy = sy - sy0;
+      const i00 = (sy0 * width + sx0) * 4;
+      const i10 = i00 + 4;
+      const i01 = i00 + width * 4;
+      const i11 = i01 + 4;
+      for (let ch = 0; ch < 4; ch++) {
+        const v = (1 - fx) * (1 - fy) * src[i00 + ch]
+                + fx * (1 - fy) * src[i10 + ch]
+                + (1 - fx) * fy * src[i01 + ch]
+                + fx * fy * src[i11 + ch];
+        out[outIdx + ch] = Math.round(v);
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Project a per-image saliency map into composite pixel coordinates.
  *
@@ -375,6 +430,7 @@ export async function renderImagePreview(imageEntry: { file: File; width: number
   gl.clear(gl.COLOR_BUFFER_BIT);
   warpRenderer.drawMesh(tex.texture, mesh, viewMat);
   tex.dispose();
+  applyPreviewEditorTransform();
 }
 
 /**
@@ -466,6 +522,41 @@ async function boot(): Promise<void> {
       }
     }
   });
+
+  // Wire PTGui-style editor view controls
+  const zoomSlider = document.getElementById('editor-zoom') as HTMLInputElement | null;
+  const rotateSlider = document.getElementById('editor-rotate') as HTMLInputElement | null;
+  const resetViewBtn = document.getElementById('editor-reset') as HTMLButtonElement | null;
+  const applyEditorControlsFromUI = () => {
+    if (zoomSlider) {
+      editorZoom = clampNumber(Number(zoomSlider.value), 0.25, 3.0);
+    }
+    if (rotateSlider) {
+      editorRotationDeg = clampNumber(Number(rotateSlider.value), -20, 20);
+    }
+    refreshEditorControlLabels();
+    applyPreviewEditorTransform();
+  };
+  if (zoomSlider) {
+    zoomSlider.value = editorZoom.toFixed(2);
+    zoomSlider.addEventListener('input', applyEditorControlsFromUI);
+  }
+  if (rotateSlider) {
+    rotateSlider.value = editorRotationDeg.toFixed(1);
+    rotateSlider.addEventListener('input', applyEditorControlsFromUI);
+  }
+  if (resetViewBtn) {
+    resetViewBtn.addEventListener('click', () => {
+      editorZoom = 1.0;
+      editorRotationDeg = 0.0;
+      if (zoomSlider) zoomSlider.value = editorZoom.toFixed(2);
+      if (rotateSlider) rotateSlider.value = editorRotationDeg.toFixed(1);
+      refreshEditorControlLabels();
+      applyPreviewEditorTransform();
+    });
+  }
+  refreshEditorControlLabels();
+  applyPreviewEditorTransform();
 
   // Wire Stitch Preview button
   document.getElementById('btn-stitch')!.addEventListener('click', () => {
@@ -1772,6 +1863,7 @@ async function renderWarpedPreview(
     }
   }
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
+  applyPreviewEditorTransform();
 
   // Cleanup FBOs
   } catch (err) {
@@ -2274,6 +2366,13 @@ async function exportComposite(): Promise<void> {
     const srcRow = (outH - 1 - y) * outW * 4;
     const dstRow = y * outW * 4;
     flipped.set(pixels.subarray(srcRow, srcRow + outW * 4), dstRow);
+  }
+
+  // Apply manual rotation from the panorama editor before export crop.
+  if (Math.abs(editorRotationDeg) > 0.01) {
+    const rotated = rotateRgbaImage(flipped, outW, outH, editorRotationDeg * Math.PI / 180);
+    flipped.set(rotated);
+    console.log(`[editor-rotate] Applied manual export rotation: ${editorRotationDeg.toFixed(2)}°`);
   }
 
   // Auto-crop: use largest inscribed rectangle (same as preview)
