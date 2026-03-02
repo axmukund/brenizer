@@ -48,6 +48,13 @@ let compositor: Compositor | null = null;
 let pyramidBlender: PyramidBlender | null = null;
 let editorZoom = 1.0;
 let editorRotationDeg = 0.0;
+let editorPanX = 0.0;
+let editorPanY = 0.0;
+let editorPanPointerId: number | null = null;
+let editorPanStartX = 0.0;
+let editorPanStartY = 0.0;
+let editorPanBaseX = 0.0;
+let editorPanBaseY = 0.0;
 
 const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
 const EXPORT_SEAM_HARD_GRID_NODES = 90000;
@@ -283,7 +290,14 @@ function applyPreviewEditorTransform(): void {
   const canvas = document.getElementById('preview-canvas') as HTMLCanvasElement | null;
   if (!canvas) return;
   canvas.style.transformOrigin = '50% 50%';
-  canvas.style.transform = `scale(${editorZoom.toFixed(3)}) rotate(${editorRotationDeg.toFixed(2)}deg)`;
+  canvas.style.transform = `translate(${editorPanX.toFixed(1)}px, ${editorPanY.toFixed(1)}px) scale(${editorZoom.toFixed(3)}) rotate(${editorRotationDeg.toFixed(2)}deg)`;
+}
+
+function setPanCursorState(isPanning: boolean): void {
+  const container = document.getElementById('canvas-container');
+  if (!container) return;
+  container.classList.add('pan-enabled');
+  container.classList.toggle('panning', isPanning);
 }
 
 function refreshEditorControlLabels(): void {
@@ -527,6 +541,7 @@ async function boot(): Promise<void> {
   const zoomSlider = document.getElementById('editor-zoom') as HTMLInputElement | null;
   const rotateSlider = document.getElementById('editor-rotate') as HTMLInputElement | null;
   const resetViewBtn = document.getElementById('editor-reset') as HTMLButtonElement | null;
+  const previewCanvas = document.getElementById('preview-canvas') as HTMLCanvasElement | null;
   const applyEditorControlsFromUI = () => {
     if (zoomSlider) {
       editorZoom = clampNumber(Number(zoomSlider.value), 0.25, 3.0);
@@ -549,11 +564,44 @@ async function boot(): Promise<void> {
     resetViewBtn.addEventListener('click', () => {
       editorZoom = 1.0;
       editorRotationDeg = 0.0;
+      editorPanX = 0.0;
+      editorPanY = 0.0;
       if (zoomSlider) zoomSlider.value = editorZoom.toFixed(2);
       if (rotateSlider) rotateSlider.value = editorRotationDeg.toFixed(1);
       refreshEditorControlLabels();
       applyPreviewEditorTransform();
     });
+  }
+  if (previewCanvas) {
+    const endPan = (ev?: PointerEvent) => {
+      if (ev && editorPanPointerId !== null && ev.pointerId !== editorPanPointerId) return;
+      if (editorPanPointerId !== null && previewCanvas.hasPointerCapture(editorPanPointerId)) {
+        previewCanvas.releasePointerCapture(editorPanPointerId);
+      }
+      editorPanPointerId = null;
+      setPanCursorState(false);
+    };
+    previewCanvas.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0) return;
+      editorPanPointerId = ev.pointerId;
+      editorPanStartX = ev.clientX;
+      editorPanStartY = ev.clientY;
+      editorPanBaseX = editorPanX;
+      editorPanBaseY = editorPanY;
+      previewCanvas.setPointerCapture(ev.pointerId);
+      setPanCursorState(true);
+      ev.preventDefault();
+    });
+    previewCanvas.addEventListener('pointermove', (ev) => {
+      if (editorPanPointerId === null || ev.pointerId !== editorPanPointerId) return;
+      editorPanX = editorPanBaseX + (ev.clientX - editorPanStartX);
+      editorPanY = editorPanBaseY + (ev.clientY - editorPanStartY);
+      applyPreviewEditorTransform();
+      ev.preventDefault();
+    });
+    previewCanvas.addEventListener('pointerup', endPan);
+    previewCanvas.addEventListener('pointercancel', endPan);
+    previewCanvas.addEventListener('lostpointercapture', () => endPan());
   }
   refreshEditorControlLabels();
   applyPreviewEditorTransform();
