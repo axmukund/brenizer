@@ -495,6 +495,170 @@ function countCandidatePairs(imageCount: number, windowW: number, matchAllPairs:
   return pairs;
 }
 
+interface MatchGraphPlan {
+  windowW: number;
+  matchAllPairs: boolean;
+  candidatePairs: number;
+  workloadScore: number;
+  changed: boolean;
+  summary: string;
+}
+
+function optimizeMatchGraphPlan(
+  activeCount: number,
+  baseWindowW: number,
+  baseMatchAllPairs: boolean,
+  avgKeypoints: number,
+): MatchGraphPlan {
+  const baseW = clamp(Math.round(baseWindowW), 2, 20);
+  const basePairs = countCandidatePairs(activeCount, baseW, baseMatchAllPairs);
+  const keypointFactor = clamp(avgKeypoints / 1400, 0.8, 4.0);
+  const workloadScore = basePairs * keypointFactor;
+
+  let windowW = baseW;
+  let matchAllPairs = baseMatchAllPairs;
+
+  // Runtime optimization pass for large/high-detail sets:
+  // keep quality-oriented behavior for small sets, but limit pair explosion
+  // when expected matching work is very high.
+  if (activeCount > 12 && workloadScore > 220 && matchAllPairs) {
+    matchAllPairs = false;
+    windowW = Math.min(windowW, Math.max(4, Math.ceil(activeCount / 4)));
+  }
+  if (!matchAllPairs && activeCount >= 18 && workloadScore > 300) {
+    windowW = Math.min(windowW, Math.max(4, Math.ceil(activeCount / 5)));
+  }
+  if (!matchAllPairs && activeCount >= 26 && workloadScore > 420) {
+    windowW = Math.min(windowW, 4);
+  }
+
+  const candidatePairs = countCandidatePairs(activeCount, windowW, matchAllPairs);
+  const changed = windowW !== baseW || matchAllPairs !== baseMatchAllPairs;
+  const summary = changed
+    ? `matchGraph runtime optimization: window ${baseW}→${windowW}, allPairs ${baseMatchAllPairs}→${matchAllPairs}, pairs ${basePairs}→${candidatePairs}`
+    : `matchGraph runtime optimization kept defaults: window ${baseW}, allPairs ${baseMatchAllPairs}, pairs ${candidatePairs}`;
+
+  return {
+    windowW,
+    matchAllPairs,
+    candidatePairs,
+    workloadScore,
+    changed,
+    summary,
+  };
+}
+
+interface MatchGraphTimeoutPlan {
+  absoluteTimeoutMs: number;
+  initialStallTimeoutMs: number;
+}
+
+function estimateMatchGraphTimeoutPlan(
+  candidatePairs: number,
+  activeCount: number,
+  avgKeypoints: number,
+): MatchGraphTimeoutPlan {
+  const keypointFactor = clamp(avgKeypoints / 1200, 0.8, 4.5);
+  const estimatedAbsoluteMs = 60000 + candidatePairs * 900 * keypointFactor + activeCount * 1500;
+  const absoluteTimeoutMs = clamp(Math.round(estimatedAbsoluteMs), 120000, 900000);
+  const initialStallTimeoutMs = clamp(Math.round(45000 + keypointFactor * 15000), 45000, 240000);
+  return { absoluteTimeoutMs, initialStallTimeoutMs };
+}
+
+interface WaitForMatchGraphEdgesOptions {
+  wm: WorkerManager;
+  candidatePairs: number;
+  activeCount: number;
+  avgKeypoints: number;
+  timeoutLabel: string;
+  onProgress?: (percent: number) => void;
+}
+
+async function waitForMatchGraphEdges(options: WaitForMatchGraphEdgesOptions): Promise<CVEdgesMsg> {
+  const {
+    wm,
+    candidatePairs,
+    activeCount,
+    avgKeypoints,
+    timeoutLabel,
+    onProgress,
+  } = options;
+  const timePlan = estimateMatchGraphTimeoutPlan(candidatePairs, activeCount, avgKeypoints);
+  const startedAt = performance.now();
+  let lastProgressAt = startedAt;
+  let heartbeatSeen = false;
+  let heartbeatEwmaMs = 1000;
+  let bestPercent = 0;
+
+  return await new Promise<CVEdgesMsg>((resolve, reject) => {
+    let monitorTimer = 0;
+    let unsub: (() => void) | null = null;
+
+    const cleanup = () => {
+      if (monitorTimer) window.clearInterval(monitorTimer);
+      if (unsub) unsub();
+    };
+
+    const rejectWith = (message: string): void => {
+      cleanup();
+      reject(new Error(message));
+    };
+
+    const tick = () => {
+      const now = performance.now();
+      const elapsedMs = now - startedAt;
+      const staleMs = now - lastProgressAt;
+      const stallLimitMs = heartbeatSeen
+        ? clamp(
+            Math.round(Math.max(timePlan.initialStallTimeoutMs, heartbeatEwmaMs * 8)),
+            45000,
+            300000,
+          )
+        : timePlan.initialStallTimeoutMs;
+
+      if (elapsedMs > timePlan.absoluteTimeoutMs) {
+        rejectWith(
+          `Timeout waiting for ${timeoutLabel} edges (${Math.round(elapsedMs / 1000)}s elapsed, ${Math.round(bestPercent)}% complete, budget ${Math.round(timePlan.absoluteTimeoutMs / 1000)}s, ${candidatePairs} pairs).`,
+        );
+        return;
+      }
+      if (staleMs > stallLimitMs) {
+        rejectWith(
+          `Timeout waiting for ${timeoutLabel} edges: matching progress stalled for ${Math.round(staleMs / 1000)}s (limit ${Math.round(stallLimitMs / 1000)}s, ${Math.round(bestPercent)}% complete).`,
+        );
+      }
+    };
+
+    monitorTimer = window.setInterval(tick, 1000);
+
+    unsub = wm.onCV((msg) => {
+      if (msg.type === 'progress' && msg.stage === 'matching' && msg.percent !== undefined) {
+        const now = performance.now();
+        if (heartbeatSeen) {
+          const intervalMs = Math.max(1, now - lastProgressAt);
+          heartbeatEwmaMs = heartbeatEwmaMs * 0.8 + intervalMs * 0.2;
+        } else {
+          heartbeatSeen = true;
+          heartbeatEwmaMs = 1000;
+        }
+        lastProgressAt = now;
+        bestPercent = Math.max(bestPercent, clamp(msg.percent, 0, 100));
+        if (onProgress) onProgress(bestPercent);
+        return;
+      }
+      if (msg.type === 'edges') {
+        cleanup();
+        resolve(msg as CVEdgesMsg);
+        return;
+      }
+      if (msg.type === 'error') {
+        cleanup();
+        reject(new Error((msg as any).message || 'Worker error'));
+      }
+    });
+  });
+}
+
 interface MatchingProbeMetrics {
   probeOrbFeatures: number;
   probeMinInliers: number;
@@ -919,53 +1083,42 @@ async function runMatchingProbe(
   }, 0) / active.length;
   const probeMinInliers = Math.max(4, Math.min(12, Math.round(avgAlignedDim / 85)));
   const probeMatchAllPairs = active.length <= 10 || baseSettings.matchAllPairs;
-  const candidatePairCount = countCandidatePairs(active.length, baseSettings.pairWindowW, probeMatchAllPairs);
+  const matchPlan = optimizeMatchGraphPlan(
+    active.length,
+    baseSettings.pairWindowW,
+    probeMatchAllPairs,
+    avgKeypoints,
+  );
+  const candidatePairCount = matchPlan.candidatePairs;
+  console.info('[prepass-match-plan]', matchPlan.summary, {
+    workloadScore: Number(matchPlan.workloadScore.toFixed(1)),
+    avgKeypoints: Number(avgKeypoints.toFixed(0)),
+  });
 
   setStatus('First pass: probing pair matches (0%)…');
   updateProgress('prepass', 0.45);
-  const matchProgressUnsub = wm.onCV((msg) => {
-    if (msg.type === 'progress' && msg.stage === 'matching' && msg.percent !== undefined) {
-      const pct = msg.percent;
+  const edgesPromise = waitForMatchGraphEdges({
+    wm,
+    candidatePairs: candidatePairCount,
+    activeCount: active.length,
+    avgKeypoints,
+    timeoutLabel: 'first-pass matchGraph',
+    onProgress: (pct) => {
       setStatus(`First pass: probing pair matches (${pct}%)…`);
       updateProgress('prepass', 0.45 + (pct / 100) * 0.45);
-    }
-  });
-
-  const edgesPromise = new Promise<CVEdgesMsg>((resolve, reject) => {
-    let unsub: (() => void) | null = null;
-    const timer = setTimeout(() => {
-      if (unsub) unsub();
-      reject(new Error('Timeout waiting for first-pass edges'));
-    }, 120000);
-    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
-      if (msg.type === 'edges') {
-        clearTimeout(timer);
-        if (unsub) unsub();
-        resolve(msg as CVEdgesMsg);
-      } else if (msg.type === 'error') {
-        clearTimeout(timer);
-        if (unsub) unsub();
-        reject(new Error((msg as any).message || 'Worker error'));
-      }
-    };
-    unsub = wm.onCV(handler);
+    },
   });
 
   wm.sendCV({
     type: 'matchGraph',
-    windowW: baseSettings.pairWindowW,
+    windowW: matchPlan.windowW,
     ratio: baseSettings.ratioTest,
     ransacThreshPx: baseSettings.ransacThreshPx,
     minInliers: probeMinInliers,
-    matchAllPairs: probeMatchAllPairs,
+    matchAllPairs: matchPlan.matchAllPairs,
   });
 
-  let edgesMsg: CVEdgesMsg;
-  try {
-    edgesMsg = await edgesPromise;
-  } finally {
-    matchProgressUnsub();
-  }
+  const edgesMsg = await edgesPromise;
   updateProgress('prepass', 0.90);
 
   const usableEdges: CVEdge[] = [];
@@ -1315,32 +1468,6 @@ export async function runStitchPreview(): Promise<void> {
   setStatus('Matching image pairs (0%)…');
   updateProgress('matching', 0);
 
-  // Listen for matching progress from worker
-  const matchProgressUnsub = workerManager!.onCV((msg) => {
-    if (msg.type === 'progress' && msg.stage === 'matching' && msg.percent !== undefined) {
-      const pct = msg.percent;
-      setStatus(`Matching image pairs (${pct}%)…`);
-      updateProgress('matching', pct / 100);
-    }
-  });
-
-  const edgesPromise = new Promise<CVEdgesMsg>((resolve, reject) => {
-    let unsub: (() => void) | null = null;
-    const timer = setTimeout(() => { if (unsub) unsub(); reject(new Error('Timeout waiting for matchGraph edges')); }, 120000);
-    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
-      if (msg.type === 'edges') {
-        clearTimeout(timer);
-        if (unsub) unsub();
-        resolve(msg as CVEdgesMsg);
-      } else if (msg.type === 'error') {
-        clearTimeout(timer);
-        if (unsub) unsub();
-        reject(new Error((msg as any).message || 'Worker error'));
-      }
-    };
-    unsub = workerManager!.onCV(handler);
-  });
-
   // ── Adaptive min-inliers threshold ─────────────────────────────
   // For small tiles (≤ 512px), the overlap zone contains fewer features
   // and ORB has less room for matches (especially in sky/featureless areas
@@ -1363,22 +1490,46 @@ export async function runStitchPreview(): Promise<void> {
   // With ≤ 12 images, the O(n²) matching cost is low and ensuring
   // full connectivity (especially in grid-layout tiles) is critical.
   const forceAllPairs = active.length <= 12 || effectiveSettings.matchAllPairs;
+  const avgMatchKeypoints = active.reduce((sum, img) => {
+    const feat = lastFeatures.get(img.id);
+    const kpCount = feat ? feat.keypoints.length / 2 : 0;
+    return sum + kpCount;
+  }, 0) / active.length;
+  const matchPlan = optimizeMatchGraphPlan(
+    active.length,
+    effectiveSettings.pairWindowW,
+    forceAllPairs,
+    avgMatchKeypoints,
+  );
+  if (matchPlan.changed) {
+    console.info('[matchGraph-plan]', matchPlan.summary, {
+      workloadScore: Number(matchPlan.workloadScore.toFixed(1)),
+      avgKeypoints: Number(avgMatchKeypoints.toFixed(0)),
+    });
+  }
+
+  const edgesPromise = waitForMatchGraphEdges({
+    wm: workerManager!,
+    candidatePairs: matchPlan.candidatePairs,
+    activeCount: active.length,
+    avgKeypoints: avgMatchKeypoints,
+    timeoutLabel: 'matchGraph',
+    onProgress: (pct) => {
+      setStatus(`Matching image pairs (${pct}%)…`);
+      updateProgress('matching', pct / 100);
+    },
+  });
 
   workerManager!.sendCV({
     type: 'matchGraph',
-    windowW: effectiveSettings.pairWindowW,
+    windowW: matchPlan.windowW,
     ratio: effectiveSettings.ratioTest,
     ransacThreshPx: effectiveSettings.ransacThreshPx,
     minInliers: adaptiveMinInliers,
-    matchAllPairs: forceAllPairs,
+    matchAllPairs: matchPlan.matchAllPairs,
   });
 
-  let edgesMsg: CVEdgesMsg;
-  try {
-    edgesMsg = await edgesPromise;
-  } finally {
-    matchProgressUnsub(); // always clean up the progress listener
-  }
+  const edgesMsg = await edgesPromise;
   updateProgress('matching', 1);
   lastEdges = edgesMsg.edges.map((e: CVEdge) => ({
     i: e.i,
