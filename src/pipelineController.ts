@@ -23,6 +23,7 @@ import { createWorkerManager, type WorkerManager } from './workers/workerManager
 import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg, CVSaliencyMsg, CVVignettingMsg, CVQualityAssessmentOutMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
+import type { PipelineSettings } from './presets';
 import { setStatus, startProgress, endProgress, updateProgress } from './ui';
 
 let workerManager: WorkerManager | null = null;
@@ -294,6 +295,348 @@ async function detectFaces(
   }
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function roundToStep(value: number, step: number): number {
+  return Math.round(value / step) * step;
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) return (sorted[mid - 1] + sorted[mid]) / 2;
+  return sorted[mid];
+}
+
+function countConnectedComponents(ids: string[], edges: Array<{ i: string; j: string }>): number {
+  if (ids.length === 0) return 0;
+
+  const adj = new Map<string, Set<string>>();
+  for (const id of ids) adj.set(id, new Set());
+  for (const e of edges) {
+    if (!adj.has(e.i) || !adj.has(e.j)) continue;
+    adj.get(e.i)!.add(e.j);
+    adj.get(e.j)!.add(e.i);
+  }
+
+  const visited = new Set<string>();
+  let components = 0;
+  for (const id of ids) {
+    if (visited.has(id)) continue;
+    components++;
+    const stack = [id];
+    visited.add(id);
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      for (const next of adj.get(cur) || []) {
+        if (!visited.has(next)) {
+          visited.add(next);
+          stack.push(next);
+        }
+      }
+    }
+  }
+  return components;
+}
+
+interface FeaturePassOptions {
+  stage: string;
+  statusPrefix: string;
+  progressStart: number;
+  progressEnd: number;
+}
+
+async function runFeaturePass(
+  wm: WorkerManager,
+  active: ImageEntry[],
+  orbFeatures: number,
+  options: FeaturePassOptions,
+): Promise<Map<string, CVFeaturesMsg>> {
+  const out = new Map<string, CVFeaturesMsg>();
+  if (active.length === 0) return out;
+
+  const span = Math.max(0, options.progressEnd - options.progressStart);
+  updateProgress(options.stage, options.progressStart);
+
+  const featureResolvers = new Map<string, {
+    resolve: (m: CVFeaturesMsg) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  const featurePromises = new Map<string, Promise<CVFeaturesMsg>>();
+  for (const img of active) {
+    featurePromises.set(
+      img.id,
+      new Promise<CVFeaturesMsg>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          featureResolvers.delete(img.id);
+          reject(new Error(`Timeout waiting for features of ${img.name}`));
+        }, 60000);
+        featureResolvers.set(img.id, { resolve, reject, timer });
+      }),
+    );
+  }
+
+  const featUnsub = wm.onCV((msg) => {
+    if (msg.type === 'features' && featureResolvers.has(msg.imageId)) {
+      const r = featureResolvers.get(msg.imageId)!;
+      clearTimeout(r.timer);
+      featureResolvers.delete(msg.imageId);
+      r.resolve(msg as CVFeaturesMsg);
+    } else if (msg.type === 'error') {
+      for (const [, r] of featureResolvers) {
+        clearTimeout(r.timer);
+        r.reject(new Error((msg as any).message || 'Feature extraction failed'));
+      }
+      featureResolvers.clear();
+    }
+  });
+
+  wm.sendCV({
+    type: 'computeFeatures',
+    orbParams: { nFeatures: orbFeatures },
+  });
+
+  try {
+    let done = 0;
+    for (const img of active) {
+      const featMsg = await featurePromises.get(img.id)!;
+      out.set(img.id, featMsg);
+      done++;
+      const numKp = new Float32Array(featMsg.keypointsBuffer).length / 2;
+      setStatus(`${options.statusPrefix}: ${img.name} — ${numKp} keypoints (${done}/${active.length})`);
+      updateProgress(options.stage, options.progressStart + span * (done / active.length));
+    }
+  } finally {
+    featUnsub();
+  }
+
+  return out;
+}
+
+function countCandidatePairs(imageCount: number, windowW: number, matchAllPairs: boolean): number {
+  if (imageCount <= 1) return 0;
+  if (matchAllPairs) return (imageCount * (imageCount - 1)) / 2;
+  let pairs = 0;
+  for (let i = 0; i < imageCount; i++) {
+    pairs += Math.max(0, Math.min(imageCount - i - 1, windowW));
+  }
+  return pairs;
+}
+
+interface MatchingProbeMetrics {
+  probeOrbFeatures: number;
+  probeMinInliers: number;
+  avgAlignedDim: number;
+  avgKeypoints: number;
+  minKeypoints: number;
+  maxKeypoints: number;
+  candidatePairCount: number;
+  usableEdgeCount: number;
+  usableEdgeDensity: number;
+  componentCount: number;
+  medianInliers: number;
+  duplicatePairCount: number;
+}
+
+interface MatchingProbeResult {
+  tunedSettings: PipelineSettings;
+  recommendedMinInliers: number;
+  summary: string;
+  metrics: MatchingProbeMetrics;
+}
+
+function estimateMatchingSettings(
+  baseSettings: PipelineSettings,
+  activeCount: number,
+  metrics: MatchingProbeMetrics,
+): MatchingProbeResult {
+  const tuned: PipelineSettings = { ...baseSettings };
+
+  let orbScale = 1;
+  if (metrics.avgKeypoints < metrics.probeOrbFeatures * 0.45) orbScale += 0.2;
+  if (metrics.minKeypoints < metrics.probeOrbFeatures * 0.25) orbScale += 0.2;
+  if (metrics.componentCount > 1) orbScale += 0.2;
+  if (metrics.usableEdgeDensity < 0.12) orbScale += 0.2;
+  if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.35 && metrics.avgKeypoints > metrics.probeOrbFeatures * 0.75) orbScale -= 0.1;
+  tuned.orbFeatures = clamp(roundToStep(baseSettings.orbFeatures * orbScale, 500), 500, 10000);
+
+  let ratioDelta = 0;
+  if (metrics.componentCount > 1 || metrics.medianInliers < 18) ratioDelta += 0.04;
+  if (metrics.duplicatePairCount > 0) ratioDelta -= 0.03;
+  if (metrics.usableEdgeDensity > 0.40 && metrics.medianInliers > 35) ratioDelta -= 0.02;
+  tuned.ratioTest = clamp(Number((baseSettings.ratioTest + ratioDelta).toFixed(2)), 0.55, 0.90);
+
+  let ransac = baseSettings.ransacThreshPx;
+  if (metrics.componentCount > 1 || metrics.medianInliers < 12) ransac += 0.5;
+  if (metrics.medianInliers > 50 && metrics.usableEdgeDensity > 0.25) ransac -= 0.5;
+  tuned.ransacThreshPx = clamp(roundToStep(ransac, 0.5), 1, 10);
+
+  let pairWindow = baseSettings.pairWindowW;
+  if (metrics.componentCount > 1 && !baseSettings.matchAllPairs) {
+    pairWindow = Math.max(pairWindow, Math.min(20, Math.ceil(activeCount / 2)));
+  } else if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.25 && activeCount > 16) {
+    pairWindow = Math.max(3, Math.min(pairWindow, Math.ceil(activeCount / 4)));
+  }
+  tuned.pairWindowW = clamp(Math.round(pairWindow), 2, 20);
+
+  let matchAllPairs = baseSettings.matchAllPairs;
+  if (activeCount <= 12) {
+    matchAllPairs = true;
+  } else if (metrics.componentCount > 1 && activeCount <= 25) {
+    matchAllPairs = true;
+  } else if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.22 && activeCount > 18) {
+    matchAllPairs = false;
+  }
+  tuned.matchAllPairs = matchAllPairs;
+
+  let refineIters = baseSettings.refineIters;
+  if (metrics.componentCount > 1 || metrics.medianInliers < 20) refineIters += 10;
+  if (metrics.medianInliers > 60 && metrics.usableEdgeDensity > 0.25) refineIters -= 5;
+  tuned.refineIters = clamp(roundToStep(refineIters, 5), 0, 100);
+
+  let recommendedMinInliers = Math.max(4, Math.min(15, Math.round(metrics.avgAlignedDim / 70)));
+  if (metrics.componentCount > 1 || metrics.medianInliers < 16) recommendedMinInliers = Math.max(4, recommendedMinInliers - 2);
+  if (metrics.usableEdgeDensity > 0.35 && metrics.medianInliers > 40) recommendedMinInliers = Math.min(18, recommendedMinInliers + 1);
+
+  const changed: string[] = [];
+  const maybeAdd = (label: string, before: number | boolean, after: number | boolean, fmt: (v: number | boolean) => string = v => String(v)) => {
+    if (before !== after) changed.push(`${label} ${fmt(before)}→${fmt(after)}`);
+  };
+  maybeAdd('ORB', baseSettings.orbFeatures, tuned.orbFeatures);
+  maybeAdd('PairWin', baseSettings.pairWindowW, tuned.pairWindowW);
+  maybeAdd('AllPairs', baseSettings.matchAllPairs, tuned.matchAllPairs);
+  maybeAdd('Ratio', baseSettings.ratioTest, tuned.ratioTest, v => Number(v).toFixed(2));
+  maybeAdd('RANSAC', baseSettings.ransacThreshPx, tuned.ransacThreshPx, v => Number(v).toFixed(1));
+  maybeAdd('Refine', baseSettings.refineIters, tuned.refineIters);
+
+  const probeDetail = `probe edges ${metrics.usableEdgeCount}/${metrics.candidatePairCount}, components ${metrics.componentCount}, median inliers ${metrics.medianInliers.toFixed(0)}, avg kp ${metrics.avgKeypoints.toFixed(0)}`;
+  const summary = changed.length > 0
+    ? `First pass tuning applied: ${changed.join(', ')} (${probeDetail}).`
+    : `First pass tuning kept current matching settings (${probeDetail}).`;
+
+  return {
+    tunedSettings: tuned,
+    recommendedMinInliers,
+    summary,
+    metrics,
+  };
+}
+
+async function runMatchingProbe(
+  wm: WorkerManager,
+  active: ImageEntry[],
+  baseSettings: PipelineSettings,
+  scaleFactors: Record<string, number>,
+): Promise<MatchingProbeResult> {
+  const probeOrbFeatures = clamp(
+    roundToStep(baseSettings.orbFeatures * 0.35, 500),
+    500,
+    Math.min(4000, baseSettings.orbFeatures),
+  );
+
+  setStatus(`First pass: extracting probe features (0/${active.length})…`);
+  const probeFeatures = await runFeaturePass(
+    wm,
+    active,
+    probeOrbFeatures,
+    {
+      stage: 'prepass',
+      statusPrefix: 'First pass features',
+      progressStart: 0,
+      progressEnd: 0.45,
+    },
+  );
+
+  const keypointCounts = active.map((img) => {
+    const feat = probeFeatures.get(img.id);
+    if (!feat) return 0;
+    return new Float32Array(feat.keypointsBuffer).length / 2;
+  });
+  const avgKeypoints = keypointCounts.reduce((s, n) => s + n, 0) / Math.max(1, keypointCounts.length);
+  const minKeypoints = keypointCounts.length > 0 ? Math.min(...keypointCounts) : 0;
+  const maxKeypoints = keypointCounts.length > 0 ? Math.max(...keypointCounts) : 0;
+
+  const avgAlignedDim = active.reduce((sum, img) => {
+    const sf = scaleFactors[img.id] ?? 1;
+    return sum + Math.max(img.width * sf, img.height * sf);
+  }, 0) / active.length;
+  const probeMinInliers = Math.max(4, Math.min(12, Math.round(avgAlignedDim / 85)));
+  const probeMatchAllPairs = active.length <= 10 || baseSettings.matchAllPairs;
+  const candidatePairCount = countCandidatePairs(active.length, baseSettings.pairWindowW, probeMatchAllPairs);
+
+  setStatus('First pass: probing pair matches (0%)…');
+  updateProgress('prepass', 0.45);
+  const matchProgressUnsub = wm.onCV((msg) => {
+    if (msg.type === 'progress' && msg.stage === 'matching' && msg.percent !== undefined) {
+      const pct = msg.percent;
+      setStatus(`First pass: probing pair matches (${pct}%)…`);
+      updateProgress('prepass', 0.45 + (pct / 100) * 0.45);
+    }
+  });
+
+  const edgesPromise = new Promise<CVEdgesMsg>((resolve, reject) => {
+    let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (unsub) unsub();
+      reject(new Error('Timeout waiting for first-pass edges'));
+    }, 120000);
+    const handler = (msg: import('./workers/workerTypes').CVOutMsg) => {
+      if (msg.type === 'edges') {
+        clearTimeout(timer);
+        if (unsub) unsub();
+        resolve(msg as CVEdgesMsg);
+      } else if (msg.type === 'error') {
+        clearTimeout(timer);
+        if (unsub) unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
+      }
+    };
+    unsub = wm.onCV(handler);
+  });
+
+  wm.sendCV({
+    type: 'matchGraph',
+    windowW: baseSettings.pairWindowW,
+    ratio: baseSettings.ratioTest,
+    ransacThreshPx: baseSettings.ransacThreshPx,
+    minInliers: probeMinInliers,
+    matchAllPairs: probeMatchAllPairs,
+  });
+
+  let edgesMsg: CVEdgesMsg;
+  try {
+    edgesMsg = await edgesPromise;
+  } finally {
+    matchProgressUnsub();
+  }
+  updateProgress('prepass', 0.90);
+
+  const usableEdges = edgesMsg.edges.filter((e) => !e.isDuplicate && e.inlierCount >= probeMinInliers);
+  const usableEdgeDensity = candidatePairCount > 0 ? usableEdges.length / candidatePairCount : 0;
+  const componentCount = countConnectedComponents(active.map((i) => i.id), usableEdges.map((e) => ({ i: e.i, j: e.j })));
+  const medianInliers = median(usableEdges.map((e) => e.inlierCount));
+  const duplicatePairCount = edgesMsg.duplicatePairs?.length ?? edgesMsg.edges.filter((e) => e.isDuplicate).length;
+
+  return estimateMatchingSettings(baseSettings, active.length, {
+    probeOrbFeatures,
+    probeMinInliers,
+    avgAlignedDim,
+    avgKeypoints,
+    minKeypoints,
+    maxKeypoints,
+    candidatePairCount,
+    usableEdgeCount: usableEdges.length,
+    usableEdgeDensity,
+    componentCount,
+    medianInliers,
+    duplicatePairCount,
+  });
+}
+
 /** Run the full stitch preview pipeline. */
 export async function runStitchPreview(): Promise<void> {
   const { images, settings } = getState();
@@ -308,6 +651,7 @@ export async function runStitchPreview(): Promise<void> {
     setStatus('Settings not loaded.');
     return;
   }
+  let effectiveSettings: PipelineSettings = { ...settings };
 
   // Prevent re-entry while pipeline is already running
   if (getState().pipelineStatus === 'running') {
@@ -322,6 +666,7 @@ export async function runStitchPreview(): Promise<void> {
   startProgress([
     { name: 'init', weight: 5 },
     { name: 'sendImages', weight: 2 },
+    { name: 'prepass', weight: 7 },
     { name: 'features', weight: 15 },
     { name: 'saliency', weight: 5 },
     { name: 'vignetting', weight: 3 },
@@ -340,8 +685,8 @@ export async function runStitchPreview(): Promise<void> {
   setStatus('Initializing OpenCV worker…');
   updateProgress('init', 0);
   const ready = await initWorkers({
-    enableDepth: settings.depthEnabled,
-    enableSeam: settings.seamMethod === 'graphcut',
+    enableDepth: effectiveSettings.depthEnabled,
+    enableSeam: effectiveSettings.seamMethod === 'graphcut',
   });
   updateProgress('init', 1);
   if (!ready.cv) {
@@ -376,7 +721,7 @@ export async function runStitchPreview(): Promise<void> {
   for (let i = 0; i < active.length; i++) {
     const img = active[i];
     setStatus(`Preparing image ${i + 1}/${active.length}: ${img.name}`);
-    const { gray, rgbSmall, width, height, scaleFactor } = await imageToGray(img, settings.alignScale);
+    const { gray, rgbSmall, width, height, scaleFactor } = await imageToGray(img, effectiveSettings.alignScale);
     scaleFactors[img.id] = scaleFactor;
     const buf = gray.buffer as ArrayBuffer;
     const rgbBuf = rgbSmall.buffer as ArrayBuffer;
@@ -409,74 +754,53 @@ export async function runStitchPreview(): Promise<void> {
     updateProgress('sendImages', (i + 1) / active.length);
   }
 
-  // Step 3: Compute features (ORB)
-  setStatus(`Extracting features (0/${active.length})…`);
-  updateProgress('features', 0);
-
-  // Collect features messages as they arrive.
-  // Uses a single CV handler to dispatch per-image results, avoiding
-  // the broadcast-error problem where one error rejects all promises.
-  const featureResolvers = new Map<string, {
-    resolve: (m: CVFeaturesMsg) => void;
-    reject: (e: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
-  const featurePromises = new Map<string, Promise<CVFeaturesMsg>>();
-  for (const img of active) {
-    featurePromises.set(
-      img.id,
-      new Promise<CVFeaturesMsg>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          featureResolvers.delete(img.id);
-          reject(new Error(`Timeout waiting for features of ${img.name}`));
-        }, 60000);
-        featureResolvers.set(img.id, { resolve, reject, timer });
-      }),
-    );
-  }
-  const featUnsub = workerManager!.onCV((msg) => {
-    if (msg.type === 'features' && featureResolvers.has(msg.imageId)) {
-      const r = featureResolvers.get(msg.imageId)!;
-      clearTimeout(r.timer);
-      featureResolvers.delete(msg.imageId);
-      r.resolve(msg as CVFeaturesMsg);
-    } else if (msg.type === 'error') {
-      // Only reject remaining promises on a fatal worker error
-      for (const [id, r] of featureResolvers) {
-        clearTimeout(r.timer);
-        r.reject(new Error((msg as any).message || 'Feature extraction failed'));
-      }
-      featureResolvers.clear();
+  // Step 2.5: First-pass matching probe to tune runtime parameters
+  let tunedMinInliers: number | null = null;
+  updateProgress('prepass', 0);
+  if (effectiveSettings.firstPassMatchTuning) {
+    try {
+      const probe = await runMatchingProbe(workerManager!, active, effectiveSettings, scaleFactors);
+      effectiveSettings = probe.tunedSettings;
+      tunedMinInliers = probe.recommendedMinInliers;
+      setStatus(probe.summary);
+      console.info('[prepass]', probe.summary, probe.metrics);
+    } catch (e) {
+      console.warn('First-pass tuning failed; continuing with configured settings:', e);
+      setStatus('First pass tuning failed; continuing with configured settings.');
     }
-  });
+  }
+  updateProgress('prepass', 1);
 
-  workerManager!.sendCV({
-    type: 'computeFeatures',
-    orbParams: { nFeatures: settings.orbFeatures },
-  });
+  // Step 3: Compute features (ORB) with tuned settings
+  setStatus(`Extracting features (0/${active.length})…`);
+  const featureMsgs = await runFeaturePass(
+    workerManager!,
+    active,
+    effectiveSettings.orbFeatures,
+    {
+      stage: 'features',
+      statusPrefix: 'Features',
+      progressStart: 0,
+      progressEnd: 1,
+    },
+  );
 
-  // Wait for all features
+  // Build cached feature store for downstream stages and rendering
   lastFeatures = new Map();
-  let featIdx = 0;
+  let totalKp = 0;
   for (const img of active) {
-    const featMsg = await featurePromises.get(img.id)!;
+    const featMsg = featureMsgs.get(img.id);
+    if (!featMsg) throw new Error(`Missing feature result for ${img.name}`);
+    const keypoints = new Float32Array(featMsg.keypointsBuffer);
     lastFeatures.set(img.id, {
       imageId: img.id,
-      keypoints: new Float32Array(featMsg.keypointsBuffer),
+      keypoints,
       descriptors: new Uint8Array(featMsg.descriptorsBuffer),
       descCols: featMsg.descCols,
       scaleFactor: scaleFactors[img.id],
     });
-    featIdx++;
-    const numKp = new Float32Array(featMsg.keypointsBuffer).length / 2;
-    setStatus(`Features: ${img.name} — ${numKp} keypoints (${featIdx}/${active.length})`);
-    updateProgress('features', featIdx / active.length);
+    totalKp += keypoints.length / 2;
   }
-
-  const totalKp = Array.from(lastFeatures.values()).reduce(
-    (s, f) => s + f.keypoints.length / 2, 0,
-  );
-  featUnsub(); // unsubscribe the feature collection handler
   setStatus(`Feature extraction complete — ${totalKp} keypoints across ${active.length} images.`);
 
   // Dispatch custom event so main.ts can draw keypoint overlay
@@ -484,7 +808,7 @@ export async function runStitchPreview(): Promise<void> {
 
   // Step 3a: Saliency computation (AI object/texture/blur detection)
   lastSaliency = new Map();
-  if (settings.saliencyEnabled) {
+  if (effectiveSettings.saliencyEnabled) {
     setStatus('Computing saliency maps…');
     updateProgress('saliency', 0);
 
@@ -549,7 +873,7 @@ export async function runStitchPreview(): Promise<void> {
 
   // Step 3b-pre: Vignetting estimation (PTGui-style polynomial radial model)
   lastVignette = new Map();
-  if (settings.vignetteCorrection) {
+  if (effectiveSettings.vignetteCorrection) {
     setStatus('Estimating vignetting…');
     updateProgress('vignetting', 0);
 
@@ -564,7 +888,7 @@ export async function runStitchPreview(): Promise<void> {
       }
     });
 
-    workerManager!.sendCV({ type: 'computeVignetting', pooled: settings.sameCameraSettings });
+    workerManager!.sendCV({ type: 'computeVignetting', pooled: effectiveSettings.sameCameraSettings });
 
     // Wait for vignetting progress complete
     await new Promise<void>((resolve, reject) => {
@@ -643,19 +967,20 @@ export async function runStitchPreview(): Promise<void> {
     const sf = feat?.scaleFactor ?? 1;
     return s + Math.max(img.width * sf, img.height * sf);
   }, 0) / active.length;
-  const adaptiveMinInliers = Math.max(4, Math.min(15, Math.round(avgDim / 70)));
+  const baselineMinInliers = Math.max(4, Math.min(15, Math.round(avgDim / 70)));
+  const adaptiveMinInliers = tunedMinInliers ?? baselineMinInliers;
   console.log(`Adaptive minInliers: ${adaptiveMinInliers} (avg dimension ${avgDim.toFixed(0)}px)`);
 
   // ── Force all-pairs matching for small image sets ──────────────
   // With ≤ 12 images, the O(n²) matching cost is low and ensuring
   // full connectivity (especially in grid-layout tiles) is critical.
-  const forceAllPairs = active.length <= 12 || settings.matchAllPairs;
+  const forceAllPairs = active.length <= 12 || effectiveSettings.matchAllPairs;
 
   workerManager!.sendCV({
     type: 'matchGraph',
-    windowW: settings.pairWindowW,
-    ratio: settings.ratioTest,
-    ransacThreshPx: settings.ransacThreshPx,
+    windowW: effectiveSettings.pairWindowW,
+    ratio: effectiveSettings.ratioTest,
+    ransacThreshPx: effectiveSettings.ransacThreshPx,
     minInliers: adaptiveMinInliers,
     matchAllPairs: forceAllPairs,
   });
@@ -784,10 +1109,10 @@ export async function runStitchPreview(): Promise<void> {
 
   workerManager!.sendCV({
     type: 'refine',
-    maxIters: settings.refineIters,
+    maxIters: effectiveSettings.refineIters,
     huberDeltaPx: 2.0,
     lambdaInit: 0.01,
-    sameCameraSettings: settings.sameCameraSettings,
+    sameCameraSettings: effectiveSettings.sameCameraSettings,
   });
 
   const refinedMsg = await refineTransformPromise;
@@ -865,10 +1190,10 @@ export async function runStitchPreview(): Promise<void> {
 
     workerManager!.sendCV({
       type: 'refine',
-      maxIters: settings.refineIters,
+      maxIters: effectiveSettings.refineIters,
       huberDeltaPx: 2.0,
       lambdaInit: 0.01,
-      sameCameraSettings: settings.sameCameraSettings,
+      sameCameraSettings: effectiveSettings.sameCameraSettings,
     });
 
     const reRefinedMsg = await reRefinePromise;
@@ -912,7 +1237,7 @@ export async function runStitchPreview(): Promise<void> {
 
   // Step 6b: Exposure compensation (per-image scalar gain)
   lastGains = new Map();
-  if (settings.exposureComp) {
+  if (effectiveSettings.exposureComp) {
     setStatus('Computing exposure gains…');
     updateProgress('exposure', 0);
 
@@ -933,7 +1258,7 @@ export async function runStitchPreview(): Promise<void> {
       unsub = workerManager!.onCV(handler);
     });
 
-    workerManager!.sendCV({ type: 'computeExposure', sameCameraSettings: settings.sameCameraSettings });
+    workerManager!.sendCV({ type: 'computeExposure', sameCameraSettings: effectiveSettings.sameCameraSettings });
 
     const exposureMsg = await exposurePromise;
     for (const g of exposureMsg.gains) {
@@ -952,14 +1277,14 @@ export async function runStitchPreview(): Promise<void> {
 
   // Step 7: Depth inference (optional, best-effort)
   lastDepthMaps = new Map();
-  if (settings.depthEnabled && ready.depth) {
+  if (effectiveSettings.depthEnabled && ready.depth) {
     setStatus('Running depth estimation…');
     for (let idx = 0; idx < active.length; idx++) {
       const img = active[idx];
       try {
         // Decode image to RGBA at depth input size
         const bmp = await createImageBitmap(img.file);
-        const depthSize = settings.depthInputSize;
+        const depthSize = effectiveSettings.depthInputSize;
         const offscreen = new OffscreenCanvas(depthSize, depthSize);
         const ctx = offscreen.getContext('2d')!;
         ctx.drawImage(bmp, 0, 0, depthSize, depthSize);
@@ -997,7 +1322,7 @@ export async function runStitchPreview(): Promise<void> {
 
   // Step 8: APAP local mesh computation (if meshGrid > 0)
   lastMeshes = new Map();
-  if (settings.meshGrid > 0 && lastMstOrder.length > 0) {
+  if (effectiveSettings.meshGrid > 0 && lastMstOrder.length > 0) {
     setStatus('Computing adaptive meshes (0%)…');
     updateProgress('apap', 0);
 
@@ -1058,12 +1383,12 @@ export async function runStitchPreview(): Promise<void> {
         type: 'computeLocalMesh',
         imageId: nodeId,
         parentId: parentId,
-        meshGrid: settings.meshGrid,
+        meshGrid: effectiveSettings.meshGrid,
         sigma: 100,       // spatial sigma in alignment pixels
         depthSigma: 0.1,  // depth sigma (normalized)
         minSupport: 4,
         faceRects: lastFaces.get(nodeId) || [],
-        sameCameraSettings: settings.sameCameraSettings,
+        sameCameraSettings: effectiveSettings.sameCameraSettings,
       });
 
       const meshMsg = await meshPromise;

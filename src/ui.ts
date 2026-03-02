@@ -500,6 +500,7 @@ export function buildSettingsPanel(): void {
   section('Matching');
   slider('Pair Window', 'pairWindowW', 2, 20, 1);
   toggle('Match All Pairs', 'matchAllPairs');
+  toggle('First-pass Match Tuning', 'firstPassMatchTuning');
   slider('LM Iterations', 'refineIters', 0, 100, 5);
   slider('APAP Grid', 'meshGrid', 0, 24, 2);
 

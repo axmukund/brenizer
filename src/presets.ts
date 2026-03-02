@@ -7,6 +7,7 @@ export interface PipelineSettings {
   orbFeatures: number;
   pairWindowW: number;
   matchAllPairs: boolean;
+  firstPassMatchTuning: boolean;
   ratioTest: number;
   ransacThreshPx: number;
   refineIters: number;
@@ -50,6 +51,7 @@ const DESKTOP_HQ: PipelineSettings = {
   orbFeatures: 5000,
   pairWindowW: 6,
   matchAllPairs: false,
+  firstPassMatchTuning: true,
   ratioTest: 0.75,
   ransacThreshPx: 3,
   refineIters: 30,
@@ -81,6 +83,7 @@ const MOBILE_QUALITY: PipelineSettings = {
   orbFeatures: 3500,
   pairWindowW: 4,
   matchAllPairs: false,
+  firstPassMatchTuning: true,
   ratioTest: 0.75,
   ransacThreshPx: 3,
   refineIters: 15,
@@ -112,6 +115,7 @@ const MOBILE_SAFE: PipelineSettings = {
   orbFeatures: 2000,
   pairWindowW: 3,
   matchAllPairs: false,
+  firstPassMatchTuning: true,
   ratioTest: 0.75,
   ransacThreshPx: 3,
   refineIters: 8,
@@ -143,6 +147,7 @@ const MOBILE_LITE: PipelineSettings = {
   orbFeatures: 1500,
   pairWindowW: 3,
   matchAllPairs: false,
+  firstPassMatchTuning: true,
   ratioTest: 0.75,
   ransacThreshPx: 3,
   refineIters: 4,
