@@ -406,7 +406,7 @@ async function runFeaturePass(
       const featMsg = await featurePromises.get(img.id)!;
       out.set(img.id, featMsg);
       done++;
-      const numKp = new Float32Array(featMsg.keypointsBuffer).length / 2;
+      const numKp = featMsg.keypointsBuffer.byteLength / 8;
       setStatus(`${options.statusPrefix}: ${img.name} — ${numKp} keypoints (${done}/${active.length})`);
       updateProgress(options.stage, options.progressStart + span * (done / active.length));
     }
@@ -415,6 +415,74 @@ async function runFeaturePass(
   }
 
   return out;
+}
+
+interface PrepareImagesOptions {
+  stage: string;
+  statusPrefix: string;
+}
+
+async function clearWorkerImages(wm: WorkerManager): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => { unsub(); reject(new Error('Timeout waiting for clearImages')); }, 15000);
+    const unsub = wm.onCV((msg) => {
+      if (msg.type === 'progress' && msg.stage === 'clearImages') {
+        clearTimeout(timer);
+        unsub();
+        resolve();
+      } else if (msg.type === 'error') {
+        clearTimeout(timer);
+        unsub();
+        reject(new Error((msg as any).message || 'Worker error'));
+      }
+    });
+    wm.sendCV({ type: 'clearImages' });
+  });
+}
+
+async function prepareImagesForCV(
+  wm: WorkerManager,
+  active: ImageEntry[],
+  alignScale: number,
+  options: PrepareImagesOptions,
+): Promise<Record<string, number>> {
+  const scaleFactors: Record<string, number> = {};
+  updateProgress(options.stage, 0);
+  for (let i = 0; i < active.length; i++) {
+    const img = active[i];
+    setStatus(`${options.statusPrefix} ${i + 1}/${active.length}: ${img.name}`);
+    const { gray, rgbSmall, width, height, scaleFactor } = await imageToGray(img, alignScale);
+    scaleFactors[img.id] = scaleFactor;
+    const buf = gray.buffer as ArrayBuffer;
+    const rgbBuf = rgbSmall.buffer as ArrayBuffer;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { unsub(); reject(new Error(`Timeout waiting for addImage ack: ${img.name}`)); }, 30000);
+      const unsub = wm.onCV((msg) => {
+        if (msg.type === 'progress' && msg.stage === 'addImage' && msg.info?.includes(img.id)) {
+          clearTimeout(timer);
+          unsub();
+          resolve();
+        } else if (msg.type === 'error') {
+          clearTimeout(timer);
+          unsub();
+          reject(new Error((msg as any).message || 'Worker error'));
+        }
+      });
+      wm.sendCV(
+        {
+          type: 'addImage',
+          imageId: img.id,
+          grayBuffer: buf,
+          rgbSmallBuffer: rgbBuf,
+          width,
+          height,
+        },
+        [buf, rgbBuf],
+      );
+    });
+    updateProgress(options.stage, (i + 1) / active.length);
+  }
+  return scaleFactors;
 }
 
 function countCandidatePairs(imageCount: number, windowW: number, matchAllPairs: boolean): number {
@@ -501,6 +569,18 @@ function estimateMatchingSettings(
   let recommendedMinInliers = Math.max(4, Math.min(15, Math.round(metrics.avgAlignedDim / 70)));
   if (metrics.componentCount > 1 || metrics.medianInliers < 16) recommendedMinInliers = Math.max(4, recommendedMinInliers - 2);
   if (metrics.usableEdgeDensity > 0.35 && metrics.medianInliers > 40) recommendedMinInliers = Math.min(18, recommendedMinInliers + 1);
+  tuned.minInliers = clamp(Math.round(recommendedMinInliers), 0, 18);
+
+  const complexityScore = activeCount * (metrics.avgAlignedDim / 1024);
+  if (complexityScore >= 18 && metrics.componentCount === 1 && metrics.avgKeypoints > metrics.probeOrbFeatures * 0.60) {
+    tuned.alignScale = clamp(roundToStep(baseSettings.alignScale - 128, 128), 512, 3072);
+    if (baseSettings.meshGrid > 0) tuned.meshGrid = clamp(baseSettings.meshGrid - 2, 0, 24);
+    if (baseSettings.multibandLevels > 0) tuned.multibandLevels = clamp(baseSettings.multibandLevels - 1, 2, 7);
+    if (baseSettings.seamMethod === 'graphcut') tuned.seamBlockSize = clamp(baseSettings.seamBlockSize + 4, 4, 64);
+  } else if (metrics.componentCount > 1 && metrics.avgKeypoints < metrics.probeOrbFeatures * 0.50) {
+    tuned.alignScale = clamp(roundToStep(baseSettings.alignScale + 128, 128), 512, 3072);
+    if (baseSettings.meshGrid > 0) tuned.meshGrid = clamp(baseSettings.meshGrid + 2, 0, 24);
+  }
 
   const changed: string[] = [];
   const maybeAdd = (label: string, before: number | boolean, after: number | boolean, fmt: (v: number | boolean) => string = v => String(v)) => {
@@ -512,6 +592,11 @@ function estimateMatchingSettings(
   maybeAdd('Ratio', baseSettings.ratioTest, tuned.ratioTest, v => Number(v).toFixed(2));
   maybeAdd('RANSAC', baseSettings.ransacThreshPx, tuned.ransacThreshPx, v => Number(v).toFixed(1));
   maybeAdd('Refine', baseSettings.refineIters, tuned.refineIters);
+  maybeAdd('MinInliers', baseSettings.minInliers, tuned.minInliers);
+  maybeAdd('AlignScale', baseSettings.alignScale, tuned.alignScale);
+  maybeAdd('MeshGrid', baseSettings.meshGrid, tuned.meshGrid);
+  maybeAdd('Block', baseSettings.seamBlockSize, tuned.seamBlockSize);
+  maybeAdd('Bands', baseSettings.multibandLevels, tuned.multibandLevels);
 
   const probeDetail = `probe edges ${metrics.usableEdgeCount}/${metrics.candidatePairCount}, components ${metrics.componentCount}, median inliers ${metrics.medianInliers.toFixed(0)}, avg kp ${metrics.avgKeypoints.toFixed(0)}`;
   const summary = changed.length > 0
@@ -554,7 +639,7 @@ async function runMatchingProbe(
   const keypointCounts = active.map((img) => {
     const feat = probeFeatures.get(img.id);
     if (!feat) return 0;
-    return new Float32Array(feat.keypointsBuffer).length / 2;
+    return feat.keypointsBuffer.byteLength / 8;
   });
   const avgKeypoints = keypointCounts.reduce((s, n) => s + n, 0) / Math.max(1, keypointCounts.length);
   const minKeypoints = keypointCounts.length > 0 ? Math.min(...keypointCounts) : 0;
@@ -615,11 +700,18 @@ async function runMatchingProbe(
   }
   updateProgress('prepass', 0.90);
 
-  const usableEdges = edgesMsg.edges.filter((e) => !e.isDuplicate && e.inlierCount >= probeMinInliers);
+  const usableEdges: CVEdge[] = [];
+  let duplicatePairCount = edgesMsg.duplicatePairs?.length ?? 0;
+  for (const e of edgesMsg.edges) {
+    if (e.isDuplicate) {
+      if (!edgesMsg.duplicatePairs) duplicatePairCount++;
+      continue;
+    }
+    if (e.inlierCount >= probeMinInliers) usableEdges.push(e);
+  }
   const usableEdgeDensity = candidatePairCount > 0 ? usableEdges.length / candidatePairCount : 0;
   const componentCount = countConnectedComponents(active.map((i) => i.id), usableEdges.map((e) => ({ i: e.i, j: e.j })));
   const medianInliers = median(usableEdges.map((e) => e.inlierCount));
-  const duplicatePairCount = edgesMsg.duplicatePairs?.length ?? edgesMsg.edges.filter((e) => e.isDuplicate).length;
 
   return estimateMatchingSettings(baseSettings, active.length, {
     probeOrbFeatures,
@@ -635,6 +727,63 @@ async function runMatchingProbe(
     medianInliers,
     duplicatePairCount,
   });
+}
+
+/** Run only the first-pass analysis and apply optimized settings. */
+export async function runFirstPassOptimization(): Promise<void> {
+  const { images, settings } = getState();
+  const active = images.filter(i => !i.excluded);
+
+  if (active.length < 2) {
+    setStatus('Need at least 2 images to optimize settings.');
+    return;
+  }
+  if (!settings) {
+    setStatus('Settings not loaded.');
+    return;
+  }
+  if (getState().pipelineStatus === 'running') {
+    setStatus('Pipeline already running.');
+    return;
+  }
+
+  setState({ pipelineStatus: 'running' });
+  setStatus('Starting first-pass optimization…');
+
+  startProgress([
+    { name: 'init', weight: 15 },
+    { name: 'sendImages', weight: 35 },
+    { name: 'prepass', weight: 50 },
+  ]);
+
+  try {
+    updateProgress('init', 0);
+    const ready = await initWorkers({ enableDepth: false, enableSeam: false });
+    updateProgress('init', 1);
+    if (!ready.cv) throw new Error('CV worker failed to initialize. Cannot optimize settings.');
+
+    setStatus('Preparing images for first pass…');
+    await clearWorkerImages(workerManager!);
+    const scaleFactors = await prepareImagesForCV(workerManager!, active, settings.alignScale, {
+      stage: 'sendImages',
+      statusPrefix: 'First pass: preparing image',
+    });
+
+    const probe = await runMatchingProbe(workerManager!, active, settings, scaleFactors);
+    setState({ settings: probe.tunedSettings });
+    updateProgress('prepass', 1);
+    setStatus(`Optimization complete. ${probe.summary}`);
+    console.info('[prepass]', probe.summary, probe.metrics);
+  } catch (err) {
+    console.error('First-pass optimization error:', err);
+    setStatus(`First-pass optimization error: ${err instanceof Error ? err.message : String(err)}`);
+    setState({ pipelineStatus: 'error' });
+  } finally {
+    endProgress();
+    if (getState().pipelineStatus === 'running') {
+      setState({ pipelineStatus: 'idle' });
+    }
+  }
 }
 
 /** Run the full stitch preview pipeline. */
@@ -666,7 +815,6 @@ export async function runStitchPreview(): Promise<void> {
   startProgress([
     { name: 'init', weight: 5 },
     { name: 'sendImages', weight: 2 },
-    { name: 'prepass', weight: 7 },
     { name: 'features', weight: 15 },
     { name: 'saliency', weight: 5 },
     { name: 'vignetting', weight: 3 },
@@ -697,79 +845,11 @@ export async function runStitchPreview(): Promise<void> {
   }
 
   setStatus('Preparing images…');
-  updateProgress('sendImages', 0);
-
-  // Clear old images from worker state
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { unsub(); reject(new Error('Timeout waiting for clearImages')); }, 15000);
-    const unsub = workerManager!.onCV((msg) => {
-      if (msg.type === 'progress' && msg.stage === 'clearImages') {
-        clearTimeout(timer);
-        unsub();
-        resolve();
-      } else if (msg.type === 'error') {
-        clearTimeout(timer);
-        unsub();
-        reject(new Error((msg as any).message || 'Worker error'));
-      }
-    });
-    workerManager!.sendCV({ type: 'clearImages' });
+  await clearWorkerImages(workerManager!);
+  const scaleFactors = await prepareImagesForCV(workerManager!, active, effectiveSettings.alignScale, {
+    stage: 'sendImages',
+    statusPrefix: 'Preparing image',
   });
-
-  // Step 2: Convert images to grayscale and send to cv-worker
-  const scaleFactors: Record<string, number> = {};
-  for (let i = 0; i < active.length; i++) {
-    const img = active[i];
-    setStatus(`Preparing image ${i + 1}/${active.length}: ${img.name}`);
-    const { gray, rgbSmall, width, height, scaleFactor } = await imageToGray(img, effectiveSettings.alignScale);
-    scaleFactors[img.id] = scaleFactor;
-    const buf = gray.buffer as ArrayBuffer;
-    const rgbBuf = rgbSmall.buffer as ArrayBuffer;
-    // Send and wait for ack
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { unsub(); reject(new Error(`Timeout waiting for addImage ack: ${img.name}`)); }, 30000);
-      const unsub = workerManager!.onCV((msg) => {
-        if (msg.type === 'progress' && msg.stage === 'addImage' && msg.info?.includes(img.id)) {
-          clearTimeout(timer);
-          unsub();
-          resolve();
-        } else if (msg.type === 'error') {
-          clearTimeout(timer);
-          unsub();
-          reject(new Error((msg as any).message || 'Worker error'));
-        }
-      });
-      workerManager!.sendCV(
-        {
-          type: 'addImage',
-          imageId: img.id,
-          grayBuffer: buf,
-          rgbSmallBuffer: rgbBuf,
-          width,
-          height,
-        },
-        [buf, rgbBuf],
-      );
-    });
-    updateProgress('sendImages', (i + 1) / active.length);
-  }
-
-  // Step 2.5: First-pass matching probe to tune runtime parameters
-  let tunedMinInliers: number | null = null;
-  updateProgress('prepass', 0);
-  if (effectiveSettings.firstPassMatchTuning) {
-    try {
-      const probe = await runMatchingProbe(workerManager!, active, effectiveSettings, scaleFactors);
-      effectiveSettings = probe.tunedSettings;
-      tunedMinInliers = probe.recommendedMinInliers;
-      setStatus(probe.summary);
-      console.info('[prepass]', probe.summary, probe.metrics);
-    } catch (e) {
-      console.warn('First-pass tuning failed; continuing with configured settings:', e);
-      setStatus('First pass tuning failed; continuing with configured settings.');
-    }
-  }
-  updateProgress('prepass', 1);
 
   // Step 3: Compute features (ORB) with tuned settings
   setStatus(`Extracting features (0/${active.length})…`);
@@ -968,7 +1048,9 @@ export async function runStitchPreview(): Promise<void> {
     return s + Math.max(img.width * sf, img.height * sf);
   }, 0) / active.length;
   const baselineMinInliers = Math.max(4, Math.min(15, Math.round(avgDim / 70)));
-  const adaptiveMinInliers = tunedMinInliers ?? baselineMinInliers;
+  const adaptiveMinInliers = effectiveSettings.minInliers > 0
+    ? clamp(Math.round(effectiveSettings.minInliers), 4, 18)
+    : baselineMinInliers;
   console.log(`Adaptive minInliers: ${adaptiveMinInliers} (avg dimension ${avgDim.toFixed(0)}px)`);
 
   // ── Force all-pairs matching for small image sets ──────────────
@@ -1005,13 +1087,12 @@ export async function runStitchPreview(): Promise<void> {
   // Handle near-duplicates: mark one image in each duplicate pair as excluded
   if (edgesMsg.duplicatePairs && edgesMsg.duplicatePairs.length > 0) {
     const toExclude = new Set<string>();
+    const activeIndexById = new Map(active.map((img, idx) => [img.id, idx]));
     for (const [idA, idB] of edgesMsg.duplicatePairs) {
       // Prefer to keep the image that appears earlier in the list
-      const imgA = active.find(i => i.id === idA);
-      const imgB = active.find(i => i.id === idB);
-      if (imgA && imgB) {
-        const idxA = active.indexOf(imgA);
-        const idxB = active.indexOf(imgB);
+      const idxA = activeIndexById.get(idA);
+      const idxB = activeIndexById.get(idB);
+      if (idxA !== undefined && idxB !== undefined) {
         const excludeId = idxA < idxB ? idB : idA;
         toExclude.add(excludeId);
       }
@@ -1073,7 +1154,8 @@ export async function runStitchPreview(): Promise<void> {
   lastRefId = mstMsg.refId;
   lastMstOrder = mstMsg.order;
   lastMstParent = mstMsg.parent;
-  setStatus(`Alignment graph built — ref: ${active.find(i => i.id === lastRefId)?.name ?? lastRefId}, ${lastMstOrder.length} images`);
+  const activeNameById = new Map(active.map((img) => [img.id, img.name]));
+  setStatus(`Alignment graph built — ref: ${activeNameById.get(lastRefId || '') ?? lastRefId}, ${lastMstOrder.length} images`);
   updateProgress('mst', 0.5);
 
   const transformsMsg = await transformsPromise;
@@ -1333,8 +1415,9 @@ export async function runStitchPreview(): Promise<void> {
     // For now, depth weighting requires depth maps to be part of the image in cv-worker.
     // We'll resend the depth data for images that have it.
     if (lastDepthMaps.size > 0) {
+      const imageById = new Map(images.map(img => [img.id, img]));
       for (const [id, dm] of lastDepthMaps) {
-        const img = images.find(i => i.id === id);
+        const img = imageById.get(id);
         if (!img) continue;
         const feat = lastFeatures.get(id);
         if (!feat) continue;

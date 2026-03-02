@@ -35,6 +35,7 @@ import {
 } from './gl';
 import {
   runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
+  runFirstPassOptimization,
   getLastGains, getLastMeshes, getLastMstOrder, getLastMstParent, getWorkerManager,
   getLastFaces, getLastSaliency, getLastVignette,
 } from './pipelineController';
@@ -474,6 +475,16 @@ async function boot(): Promise<void> {
     });
   });
 
+  // Wire first-pass optimization button
+  document.getElementById('btn-optimize')!.addEventListener('click', () => {
+    runFirstPassOptimization()
+      .then(() => buildSettingsPanel())
+      .catch(err => {
+        console.error('Optimization error:', err);
+        setStatus(`Optimization error: ${err.message}`);
+      });
+  });
+
   // Wire Export button
   document.getElementById('btn-export')!.addEventListener('click', () => {
     exportComposite().catch(err => {
@@ -545,12 +556,13 @@ async function boot(): Promise<void> {
     const { images } = getState();
     const active = images.filter(i => !i.excluded);
     if (edges.length === 0) return;
+    const activeNameById = new Map(active.map((img) => [img.id, img.name]));
 
     // Log match matrix to console for diagnostics
     console.group('Match Graph');
     for (const e of edges) {
-      const nameI = active.find(i => i.id === e.i)?.name ?? e.i;
-      const nameJ = active.find(i => i.id === e.j)?.name ?? e.j;
+      const nameI = activeNameById.get(e.i) ?? e.i;
+      const nameJ = activeNameById.get(e.j) ?? e.j;
       console.log(`${nameI} ↔ ${nameJ}: ${e.inlierCount} inliers, RMS=${e.rms.toFixed(2)}`);
     }
     console.groupEnd();
@@ -1116,9 +1128,10 @@ async function renderWarpedPreview(
   const _compPixels = new Uint8Array(compW * compH * 4);
   const _newPixels = new Uint8Array(compW * compH * 4);
   const saliencyMaps = getLastSaliency();
+  const imageById = new Map(images.map((img) => [img.id, img]));
 
   for (const imgId of mstOrder) {
-    const img = images.find(i => i.id === imgId);
+    const img = imageById.get(imgId);
     if (!img) continue;
     const t = transforms.get(imgId);
     if (!t) continue;
@@ -2094,8 +2107,9 @@ async function exportComposite(): Promise<void> {
     }
   };
 
+  const activeById = new Map(active.map((img) => [img.id, img]));
   for (const imgId of mstOrder) {
-    const img = active.find(i => i.id === imgId);
+    const img = activeById.get(imgId);
     if (!img) continue;
     const t = transforms.get(imgId);
     if (!t) continue;

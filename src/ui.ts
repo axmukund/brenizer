@@ -392,9 +392,13 @@ function updateCanvasPlaceholder(): void {
   }
 }
 
-function updateStitchButton(): void {
-  const active = getState().images.filter(i => !i.excluded);
-  ($('btn-stitch') as HTMLButtonElement).disabled = active.length < 2;
+function updateActionButtons(): void {
+  const st = getState();
+  const activeCount = st.images.reduce((n, img) => n + (img.excluded ? 0 : 1), 0);
+  const disabled = activeCount < 2 || st.pipelineStatus === 'running';
+  ($('btn-stitch') as HTMLButtonElement).disabled = disabled;
+  const optimizeBtn = document.getElementById('btn-optimize') as HTMLButtonElement | null;
+  if (optimizeBtn) optimizeBtn.disabled = disabled;
 }
 
 // ── Settings panel ───────────────────────────────────────
@@ -500,7 +504,7 @@ export function buildSettingsPanel(): void {
   section('Matching');
   slider('Pair Window', 'pairWindowW', 2, 20, 1);
   toggle('Match All Pairs', 'matchAllPairs');
-  toggle('First-pass Match Tuning', 'firstPassMatchTuning');
+  slider('Min Inliers (0=auto)', 'minInliers', 0, 18, 1);
   slider('LM Iterations', 'refineIters', 0, 100, 5);
   slider('APAP Grid', 'meshGrid', 0, 24, 2);
 
@@ -601,13 +605,13 @@ export function initUI(): void {
   subscribe(() => {
     renderImageList();
     updateCanvasPlaceholder();
-    updateStitchButton();
+    updateActionButtons();
   });
 
   // Initial render
   renderImageList();
   updateCanvasPlaceholder();
-  updateStitchButton();
+  updateActionButtons();
   buildSettingsPanel();
 }
 
