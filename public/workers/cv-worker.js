@@ -621,38 +621,53 @@ self.addEventListener('message', async (ev) => {
       const ids = Object.keys(images);
       edges = [];
 
-      // Build candidate pairs
-      const pairs = [];
+      const idOrder = new Map(ids.map((id, idx) => [id, idx]));
+      const pairKeys = new Set();
+
+      const makePairKey = (idA, idB) => {
+        const ia = idOrder.get(idA) ?? 0;
+        const ib = idOrder.get(idB) ?? 0;
+        return ia <= ib ? `${idA}\u0000${idB}` : `${idB}\u0000${idA}`;
+      };
+
+      const addUniquePair = (pairList, idA, idB) => {
+        if (idA === idB) return false;
+        const key = makePairKey(idA, idB);
+        if (pairKeys.has(key)) return false;
+        pairKeys.add(key);
+        pairList.push([idA, idB]);
+        return true;
+      };
+
+      // Build first-pass candidate pairs.
+      const initialPairs = [];
       for (let a = 0; a < ids.length; a++) {
         for (let b = a + 1; b < ids.length; b++) {
           if (matchAllPairs || (b - a) <= windowW) {
-            pairs.push([ids[a], ids[b]]);
+            addUniquePair(initialPairs, ids[a], ids[b]);
           }
         }
       }
 
-      let done = 0;
-      for (const [idI, idJ] of pairs) {
+      const tryMatchPair = (idI, idJ, params) => {
         const imgI = images[idI];
         const imgJ = images[idJ];
-
+        if (!imgI || !imgJ) return null;
         if (!imgI.descriptors || !imgJ.descriptors ||
-            imgI.descriptors.length === 0 || imgJ.descriptors.length === 0) {
-          done++;
-          continue;
+            imgI.descriptors.length === 0 || imgJ.descriptors.length === 0 ||
+            !imgI.keypoints || !imgJ.keypoints) {
+          return null;
         }
 
         const descColsI = imgI.descCols || 32;
         const descColsJ = imgJ.descCols || 32;
         const numI = imgI.descriptors.length / descColsI;
         const numJ = imgJ.descriptors.length / descColsJ;
-
-        if (numI < 4 || numJ < 4) { done++; continue; }
+        const minInliersForPair = Math.max(4, Math.round(params.minInliers));
+        if (numI < 4 || numJ < 4) return null;
 
         let matI = null, matJ = null;
-        let bf = null, matches = null;
-        let matchesRev = null;
-
+        let bf = null, matches = null, matchesRev = null;
         try {
           matI = cv.matFromArray(numI, descColsI, cv.CV_8UC1, imgI.descriptors);
           matJ = cv.matFromArray(numJ, descColsJ, cv.CV_8UC1, imgJ.descriptors);
@@ -661,180 +676,176 @@ self.addEventListener('message', async (ev) => {
           matches = new cv.DMatchVectorVector();
           bf.knnMatch(matI, matJ, matches, 2);
 
-          // Forward ratio test: I → J
-          const fwdBest = new Map(); // queryIdx → {trainIdx, distance}
+          const fwdBest = new Map();
           for (let m = 0; m < matches.size(); m++) {
             const match = matches.get(m);
-            if (match.size() >= 2) {
-              const m1 = match.get(0);
-              const m2 = match.get(1);
-              if (m1.distance < ratio * m2.distance) {
-                const qi = m1.queryIdx;
-                const ti = m1.trainIdx;
-                if (qi < numI && ti < numJ) {
-                  fwdBest.set(qi, {trainIdx: ti, distance: m1.distance});
-                }
+            if (match.size() < 2) continue;
+            const m1 = match.get(0);
+            const m2 = match.get(1);
+            if (m1.distance < params.ratio * m2.distance) {
+              const qi = m1.queryIdx;
+              const ti = m1.trainIdx;
+              if (qi < numI && ti < numJ) {
+                fwdBest.set(qi, {trainIdx: ti, distance: m1.distance});
               }
             }
           }
 
-          // Reverse match: J → I for cross-check
           matchesRev = new cv.DMatchVectorVector();
           bf.knnMatch(matJ, matI, matchesRev, 2);
-          const revBest = new Map(); // queryIdx(J) → trainIdx(I)
+          const revBest = new Map();
           for (let m = 0; m < matchesRev.size(); m++) {
             const match = matchesRev.get(m);
-            if (match.size() >= 2) {
-              const m1 = match.get(0);
-              const m2 = match.get(1);
-              if (m1.distance < ratio * m2.distance) {
-                revBest.set(m1.queryIdx, m1.trainIdx);
-              }
+            if (match.size() < 2) continue;
+            const m1 = match.get(0);
+            const m2 = match.get(1);
+            if (m1.distance < params.ratio * m2.distance) {
+              revBest.set(m1.queryIdx, m1.trainIdx);
             }
           }
-          matchesRev.delete();
-          matchesRev = null;
 
-          // Cross-check filter: keep only mutual best matches
           const goodPtsI = [];
           const goodPtsJ = [];
           for (const [qi, fwd] of fwdBest) {
             const revTrain = revBest.get(fwd.trainIdx);
-            if (revTrain === qi) {
-              // Mutual best match confirmed
-              goodPtsI.push(imgI.keypoints[qi * 2], imgI.keypoints[qi * 2 + 1]);
-              goodPtsJ.push(imgJ.keypoints[fwd.trainIdx * 2], imgJ.keypoints[fwd.trainIdx * 2 + 1]);
-            }
+            if (revTrain !== qi) continue;
+            goodPtsI.push(imgI.keypoints[qi * 2], imgI.keypoints[qi * 2 + 1]);
+            goodPtsJ.push(imgJ.keypoints[fwd.trainIdx * 2], imgJ.keypoints[fwd.trainIdx * 2 + 1]);
           }
+          if (goodPtsI.length / 2 < minInliersForPair) return null;
 
-          if (goodPtsI.length / 2 < minInliers) { done++; continue; }
+          // Dataset-adapted pre-filter for burst/bokeh sets: retain the dominant
+          // displacement consensus before homography fitting.
+          const filtered = filterCorrespondencesByMotion(
+            goodPtsI,
+            goodPtsJ,
+            imgI.width,
+            imgI.height,
+            imgJ.width,
+            imgJ.height,
+            minInliersForPair,
+          );
+          const fitPtsI = filtered.pointsI;
+          const fitPtsJ = filtered.pointsJ;
+          if (fitPtsI.length / 2 < minInliersForPair) return null;
 
-          // ── MAGSAC++-style RANSAC with marginalized scoring ──────────
-          // Run OpenCV RANSAC to get an initial homography, then re-score
-          // every correspondence using a σ-consensus score that marginalizes
-          // over unknown noise scale σ ∈ (0, σ_max]. Points with lower
-          // reprojection error contribute more, giving a soft inlier count
-          // that is more discriminative than a fixed-threshold hard count.
-          // Reference: Baráth & Matas, "MAGSAC++", CVPR 2020.
           let srcPts = null, dstPts = null, inlierMask = null, H = null;
           try {
-          srcPts = cv.matFromArray(goodPtsI.length / 2, 1, cv.CV_32FC2, new Float32Array(goodPtsI));
-          dstPts = cv.matFromArray(goodPtsJ.length / 2, 1, cv.CV_32FC2, new Float32Array(goodPtsJ));
-          inlierMask = new cv.Mat();
-          H = cv.findHomography(srcPts, dstPts, cv.RANSAC, ransacThreshPx, inlierMask);
+            srcPts = cv.matFromArray(fitPtsI.length / 2, 1, cv.CV_32FC2, new Float32Array(fitPtsI));
+            dstPts = cv.matFromArray(fitPtsJ.length / 2, 1, cv.CV_32FC2, new Float32Array(fitPtsJ));
+            inlierMask = new cv.Mat();
+            H = cv.findHomography(srcPts, dstPts, cv.RANSAC, params.ransacThreshPx, inlierMask);
+            if (!H || H.rows !== 3 || H.cols !== 3) return null;
 
-          if (H.rows === 3 && H.cols === 3) {
             const hd = H.data64F;
-            const nPts = goodPtsI.length / 2;
-
-            // Compute per-point reprojection errors² for MAGSAC scoring
+            const nPts = fitPtsI.length / 2;
             const reproj2 = new Float64Array(nPts);
             for (let k = 0; k < nPts; k++) {
-              const xi = goodPtsI[k * 2], yi = goodPtsI[k * 2 + 1];
-              const xj = goodPtsJ[k * 2], yj = goodPtsJ[k * 2 + 1];
+              const xi = fitPtsI[k * 2];
+              const yi = fitPtsI[k * 2 + 1];
+              const xj = fitPtsJ[k * 2];
+              const yj = fitPtsJ[k * 2 + 1];
               const d = hd[6] * xi + hd[7] * yi + hd[8];
-              if (Math.abs(d) < 1e-10) { reproj2[k] = 1e6; continue; }
+              if (Math.abs(d) < 1e-10) {
+                reproj2[k] = 1e6;
+                continue;
+              }
               const px = (hd[0] * xi + hd[1] * yi + hd[2]) / d;
               const py = (hd[3] * xi + hd[4] * yi + hd[5]) / d;
               reproj2[k] = (px - xj) ** 2 + (py - yj) ** 2;
             }
 
-            // MAGSAC++ σ-consensus score: for each point, integrate the
-            // probability of being an inlier over σ ∈ (0, σ_max].
-            // Weight_k = max(0, 1 − (err_k² / σ_max²))^2  (Epanechnikov-like kernel)
-            // This gives soft weights ∈ [0,1] — no hard threshold needed.
-            // σ_max = 3× RANSAC threshold: empirically captures 99%+ of true inliers
-            // while still rejecting gross outliers (Baráth & Matas, CVPR 2020).
-            const sigmaMax = ransacThreshPx * 3; // σ_max ≈ 3× RANSAC threshold
+            const sigmaMax = params.ransacThreshPx * 3;
             const sigmaMax2 = sigmaMax * sigmaMax;
-            const magsacWeights = new Float64Array(nPts);
             let magsacInlierCount = 0;
             const inliers = [];
-
+            const inlierPtsI = [];
+            const inlierPtsJ = [];
+            const softInlierThresh2 = params.ransacThreshPx * params.ransacThreshPx * 4;
             for (let k = 0; k < nPts; k++) {
               const u = reproj2[k] / sigmaMax2;
-              if (u >= 1.0) {
-                magsacWeights[k] = 0;
-                continue; // hard outlier beyond σ_max
-              }
-              // Epanechnikov kernel: w = (1 − u)²
+              if (u >= 1.0) continue;
               const w = (1.0 - u) * (1.0 - u);
-              magsacWeights[k] = w;
-              // Collect inliers at 2× RANSAC threshold (4× in squared space) for
-              // backward-compat with LM and APAP which expect a discrete inlier set.
-              if (reproj2[k] <= ransacThreshPx * ransacThreshPx * 4) {
+              if (reproj2[k] <= softInlierThresh2) {
                 magsacInlierCount++;
-                inliers.push({
-                  xi: goodPtsI[k * 2], yi: goodPtsI[k * 2 + 1],
-                  xj: goodPtsJ[k * 2], yj: goodPtsJ[k * 2 + 1],
-                  magsacWeight: w,
-                  origIdx: k  // original index into reproj2 for correct RMS lookup
-                });
+                const xi = fitPtsI[k * 2];
+                const yi = fitPtsI[k * 2 + 1];
+                const xj = fitPtsJ[k * 2];
+                const yj = fitPtsJ[k * 2 + 1];
+                inliers.push({ xi, yi, xj, yj, magsacWeight: w, origIdx: k });
+                inlierPtsI.push(xi, yi);
+                inlierPtsJ.push(xj, yj);
               }
             }
+            if (magsacInlierCount < minInliersForPair) return null;
 
-            if (magsacInlierCount >= minInliers) {
-              // Compute weighted RMS using MAGSAC weights (better quality metric)
-              let wRmsSum = 0, wSum = 0;
+            let wRmsSum = 0;
+            let wSum = 0;
+            for (const inl of inliers) {
+              wRmsSum += inl.magsacWeight * reproj2[inl.origIdx];
+              wSum += inl.magsacWeight;
+            }
+            let rms;
+            if (wSum > 1e-6) {
+              rms = Math.sqrt(wRmsSum / wSum);
+            } else {
+              let rmsSum = 0;
               for (const inl of inliers) {
-                wRmsSum += inl.magsacWeight * reproj2[inl.origIdx];
-                wSum += inl.magsacWeight;
+                const d = hd[6] * inl.xi + hd[7] * inl.yi + hd[8];
+                if (Math.abs(d) < 1e-10) continue;
+                const px = (hd[0] * inl.xi + hd[1] * inl.yi + hd[2]) / d;
+                const py = (hd[3] * inl.xi + hd[4] * inl.yi + hd[5]) / d;
+                rmsSum += (px - inl.xj) ** 2 + (py - inl.yj) ** 2;
               }
-              // Fallback to unweighted if weights sum to ~0
-              let rms;
-              if (wSum > 1e-6) {
-                rms = Math.sqrt(wRmsSum / wSum);
-              } else {
-                let rmsSum = 0;
-                for (const inl of inliers) {
-                  const d = hd[6] * inl.xi + hd[7] * inl.yi + hd[8];
-                  if (Math.abs(d) < 1e-10) continue; // skip degenerate point
-                  const px = (hd[0] * inl.xi + hd[1] * inl.yi + hd[2]) / d;
-                  const py = (hd[3] * inl.xi + hd[4] * inl.yi + hd[5]) / d;
-                  rmsSum += (px - inl.xj) ** 2 + (py - inl.yj) ** 2;
-                }
-                rms = magsacInlierCount > 0 ? Math.sqrt(rmsSum / magsacInlierCount) : 1e6;
-              }
-
-              const HBuf = new Float64Array(9);
-              HBuf.set(hd.slice(0, 9));
-
-              // CRITICAL: Validate homography for physical plausibility
-              if (!isHomographyValid(HBuf, imgI.width, imgI.height)) {
-                console.warn(`  Rejected pair: ${idI} ↔ ${idJ} (${magsacInlierCount} inliers, RMS=${rms.toFixed(2)})`);
-                done++; continue;
-              }
-
-              // Detect near-duplicates: images that overlap almost completely with
-              // minimal translation are likely duplicate shots and should be flagged.
-              // Thresholds: RMS < 2px (very tight alignment), >80% inliers (most
-              // points match), translation < 5% of image size (nearly stationary).
-              const inlierRatio = magsacInlierCount / nPts;
-              const tx = HBuf[2], ty = HBuf[5];
-              const maxDim = Math.max(imgI.width, imgI.height);
-              const translation = Math.sqrt(tx * tx + ty * ty);
-              const translationRatio = translation / maxDim;
-              const isDuplicate = (rms < 2.0 && inlierRatio > 0.8 && translationRatio < 0.05);
-
-              const inliersBuf = new Float32Array(magsacInlierCount * 4);
-              for (let k = 0; k < magsacInlierCount; k++) {
-                inliersBuf[k * 4] = inliers[k].xi;
-                inliersBuf[k * 4 + 1] = inliers[k].yi;
-                inliersBuf[k * 4 + 2] = inliers[k].xj;
-                inliersBuf[k * 4 + 3] = inliers[k].yj;
-              }
-
-              edges.push({
-                i: idI, j: idJ,
-                H: HBuf,
-                inliers: inliers,
-                inliersBuf: inliersBuf,
-                rms,
-                inlierCount: magsacInlierCount,
-                isDuplicate
-              });
+              rms = magsacInlierCount > 0 ? Math.sqrt(rmsSum / magsacInlierCount) : 1e6;
             }
-          }
+
+            const HBuf = new Float64Array(9);
+            HBuf.set(hd.slice(0, 9));
+            if (!isHomographyValid(HBuf, imgI.width, imgI.height)) return null;
+
+            const spread = computeInlierSpread(
+              inlierPtsI, inlierPtsJ,
+              imgI.width, imgI.height,
+              imgJ.width, imgJ.height,
+            );
+            const strongSupport = magsacInlierCount >= Math.max(minInliersForPair + 6, Math.round(minInliersForPair * 1.7));
+            const mediumSupport = magsacInlierCount >= Math.max(minInliersForPair + 3, Math.round(minInliersForPair * 1.35));
+            if ((spread.minBBoxCoverage < 0.006 || spread.minCellCoverage < 0.08) && !strongSupport) {
+              return null;
+            }
+            if (!params.relaxedSpread && (spread.minBBoxCoverage < 0.012 || spread.minCellCoverage < 0.14) && !mediumSupport) {
+              return null;
+            }
+            if (filtered.keptRatio < 0.20 && !strongSupport) {
+              return null;
+            }
+
+            const inlierRatio = magsacInlierCount / nPts;
+            const tx = HBuf[2], ty = HBuf[5];
+            const maxDim = Math.max(imgI.width, imgI.height);
+            const translation = Math.sqrt(tx * tx + ty * ty);
+            const translationRatio = translation / Math.max(1, maxDim);
+            const isDuplicate = (rms < 2.0 && inlierRatio > 0.8 && translationRatio < 0.05);
+
+            const inliersBuf = new Float32Array(magsacInlierCount * 4);
+            for (let k = 0; k < magsacInlierCount; k++) {
+              inliersBuf[k * 4] = inliers[k].xi;
+              inliersBuf[k * 4 + 1] = inliers[k].yi;
+              inliersBuf[k * 4 + 2] = inliers[k].xj;
+              inliersBuf[k * 4 + 3] = inliers[k].yj;
+            }
+
+            return {
+              i: idI,
+              j: idJ,
+              H: HBuf,
+              inliers,
+              inliersBuf,
+              rms,
+              inlierCount: magsacInlierCount,
+              isDuplicate,
+            };
           } finally {
             if (srcPts) srcPts.delete();
             if (dstPts) dstPts.delete();
@@ -848,11 +859,113 @@ self.addEventListener('message', async (ev) => {
           if (matches) matches.delete();
           if (matchesRev) matchesRev.delete();
         }
-        done++;
-        postMessage({type:'progress', stage:'matching', percent: Math.round(100 * done / pairs.length), info: `${done}/${pairs.length}`});
+      };
+
+      let totalPairs = initialPairs.length;
+      let donePairs = 0;
+      const postMatchingProgress = (info) => {
+        const percent = totalPairs > 0 ? Math.round(100 * donePairs / totalPairs) : 100;
+        postMessage({type:'progress', stage:'matching', percent, info});
+      };
+      const runPairBatch = (pairBatch, params, label) => {
+        let added = 0;
+        for (const [idI, idJ] of pairBatch) {
+          postMatchingProgress(`${donePairs}/${totalPairs} ${label}: ${idI} ↔ ${idJ}`);
+          const edge = tryMatchPair(idI, idJ, params);
+          if (edge) {
+            edges.push(edge);
+            added++;
+          }
+          donePairs++;
+          postMatchingProgress(`${donePairs}/${totalPairs}`);
+        }
+        return added;
+      };
+
+      const initialParams = {
+        ratio,
+        ransacThreshPx,
+        minInliers,
+        relaxedSpread: false,
+      };
+      const initialEdgeCount = runPairBatch(initialPairs, initialParams, 'pass1');
+
+      let recoveryEdgeCount = 0;
+      if (!matchAllPairs && ids.length >= 4) {
+        const graphInfo = analyzeConnectivity(ids, edges);
+        const weakNodes = ids.filter(id => (graphInfo.degree[id] || 0) <= 1);
+        const shouldRecover = graphInfo.components.length > 1 || weakNodes.length > Math.max(2, Math.floor(ids.length * 0.25));
+
+        if (shouldRecover) {
+          const recoveryPairs = [];
+          const maxRecoveryPairs = Math.min(80, Math.max(12, ids.length * 4));
+
+          if (graphInfo.components.length > 1) {
+            const sortedComponents = [...graphInfo.components].sort((a, b) => b.length - a.length);
+            const anchorComponent = sortedComponents[0];
+            const anchorSet = new Set(anchorComponent);
+            for (let ci = 1; ci < sortedComponents.length; ci++) {
+              const comp = sortedComponents[ci];
+              let bestPair = null;
+              let bestDist = Infinity;
+              for (const a of comp) {
+                const ia = idOrder.get(a) ?? 0;
+                for (const b of anchorComponent) {
+                  const ib = idOrder.get(b) ?? 0;
+                  const d = Math.abs(ia - ib);
+                  if (d < bestDist) {
+                    bestDist = d;
+                    bestPair = [a, b];
+                  }
+                }
+              }
+              if (bestPair) {
+                addUniquePair(recoveryPairs, bestPair[0], bestPair[1]);
+              }
+              for (const a of comp) {
+                if (recoveryPairs.length >= maxRecoveryPairs) break;
+                const ia = idOrder.get(a) ?? 0;
+                for (let off = 1; off <= Math.max(4, windowW + 2); off++) {
+                  const left = ids[ia - off];
+                  const right = ids[ia + off];
+                  if (left && anchorSet.has(left) && addUniquePair(recoveryPairs, a, left)) break;
+                  if (right && anchorSet.has(right) && addUniquePair(recoveryPairs, a, right)) break;
+                }
+              }
+              if (recoveryPairs.length >= maxRecoveryPairs) break;
+            }
+          }
+
+          const expandedWindow = Math.min(ids.length - 1, Math.max(windowW + 4, Math.ceil(ids.length / 3)));
+          for (const id of weakNodes) {
+            if (recoveryPairs.length >= maxRecoveryPairs) break;
+            const i0 = idOrder.get(id) ?? 0;
+            let addedForNode = 0;
+            for (let off = 1; off <= expandedWindow && addedForNode < 3; off++) {
+              const left = ids[i0 - off];
+              const right = ids[i0 + off];
+              if (left && addUniquePair(recoveryPairs, id, left)) addedForNode++;
+              if (right && addedForNode < 3 && addUniquePair(recoveryPairs, id, right)) addedForNode++;
+            }
+          }
+
+          if (recoveryPairs.length > 0) {
+            totalPairs += recoveryPairs.length;
+            postMatchingProgress(
+              `Running recovery pass on ${recoveryPairs.length} additional pair(s) ` +
+              `(components ${graphInfo.components.length}, weak nodes ${weakNodes.length}).`,
+            );
+            const recoveryParams = {
+              ratio: clampScalar(ratio + 0.08, 0.55, 0.98),
+              ransacThreshPx: Math.max(ransacThreshPx + 0.8, ransacThreshPx * 1.35),
+              minInliers: Math.max(4, Math.round(minInliers * 0.75)),
+              relaxedSpread: true,
+            };
+            recoveryEdgeCount = runPairBatch(recoveryPairs, recoveryParams, 'recovery');
+          }
+        }
       }
 
-      // If graph is disconnected and we didn't match all pairs, retry with all pairs
       if (!matchAllPairs && edges.length > 0) {
         const connected = checkConnectivity(ids, edges);
         if (!connected) {
@@ -861,13 +974,20 @@ self.addEventListener('message', async (ev) => {
         }
       }
 
-      // Detect and report near-duplicates
+      if (recoveryEdgeCount > 0) {
+        postMessage({
+          type:'progress',
+          stage:'matching',
+          percent:100,
+          info:`Recovery pass added ${recoveryEdgeCount} edge(s); total edges ${edges.length} (initial ${initialEdgeCount}).`,
+        });
+      }
+
       const duplicatePairs = edges.filter(e => e.isDuplicate).map(e => [e.i, e.j]);
       if (duplicatePairs.length > 0) {
         postMessage({type:'progress', stage:'matching', percent:100, info:`Found ${duplicatePairs.length} near-duplicate pair(s)`});
       }
 
-      // Send edges
       const edgeMessages = edges.map(e => ({
         i: e.i,
         j: e.j,
@@ -2361,24 +2481,170 @@ self.addEventListener('message', async (ev) => {
 
 // ── Utility functions ──────────────────────────────────
 
-function checkConnectivity(ids, edges) {
-  if (ids.length <= 1) return true;
-  const adj = {};
-  for (const id of ids) adj[id] = [];
-  for (const e of edges) {
-    adj[e.i].push(e.j);
-    adj[e.j].push(e.i);
+function clampScalar(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function medianOfValues(values) {
+  if (!values || values.length === 0) return 0;
+  const sorted = Array.from(values).sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return 0.5 * (sorted[mid - 1] + sorted[mid]);
   }
-  const visited = new Set();
-  const queue = [ids[0]];
-  visited.add(ids[0]);
-  while (queue.length > 0) {
-    const n = queue.shift();
-    for (const nb of adj[n]) {
-      if (!visited.has(nb)) { visited.add(nb); queue.push(nb); }
+  return sorted[mid];
+}
+
+function madOfValues(values, med) {
+  if (!values || values.length === 0) return 0;
+  const dev = new Float64Array(values.length);
+  for (let i = 0; i < values.length; i++) {
+    dev[i] = Math.abs(values[i] - med);
+  }
+  return medianOfValues(dev);
+}
+
+function filterCorrespondencesByMotion(pointsI, pointsJ, wI, hI, wJ, hJ, minKeep) {
+  const n = Math.min(pointsI.length, pointsJ.length) / 2;
+  if (n <= Math.max(minKeep * 2, 24)) {
+    return { pointsI, pointsJ, kept: n, total: n, keptRatio: 1 };
+  }
+
+  const invWI = 1 / Math.max(1, wI);
+  const invHI = 1 / Math.max(1, hI);
+  const invWJ = 1 / Math.max(1, wJ);
+  const invHJ = 1 / Math.max(1, hJ);
+  const dx = new Float64Array(n);
+  const dy = new Float64Array(n);
+  for (let k = 0; k < n; k++) {
+    const xi = pointsI[k * 2] * invWI;
+    const yi = pointsI[k * 2 + 1] * invHI;
+    const xj = pointsJ[k * 2] * invWJ;
+    const yj = pointsJ[k * 2 + 1] * invHJ;
+    dx[k] = xj - xi;
+    dy[k] = yj - yi;
+  }
+
+  const medDx = medianOfValues(dx);
+  const medDy = medianOfValues(dy);
+  const madDx = madOfValues(dx, medDx);
+  const madDy = madOfValues(dy, medDy);
+  const gateDx = Math.max(0.010, 4.5 * madDx + 0.005);
+  const gateDy = Math.max(0.010, 4.5 * madDy + 0.005);
+
+  const keep = [];
+  for (let k = 0; k < n; k++) {
+    if (Math.abs(dx[k] - medDx) <= gateDx && Math.abs(dy[k] - medDy) <= gateDy) {
+      keep.push(k);
     }
   }
-  return visited.size === ids.length;
+
+  if (keep.length < minKeep) {
+    return { pointsI, pointsJ, kept: n, total: n, keptRatio: 1 };
+  }
+
+  const outI = new Float32Array(keep.length * 2);
+  const outJ = new Float32Array(keep.length * 2);
+  for (let idx = 0; idx < keep.length; idx++) {
+    const k = keep[idx];
+    outI[idx * 2] = pointsI[k * 2];
+    outI[idx * 2 + 1] = pointsI[k * 2 + 1];
+    outJ[idx * 2] = pointsJ[k * 2];
+    outJ[idx * 2 + 1] = pointsJ[k * 2 + 1];
+  }
+  return {
+    pointsI: outI,
+    pointsJ: outJ,
+    kept: keep.length,
+    total: n,
+    keptRatio: keep.length / n,
+  };
+}
+
+function computePointSpread(flatPoints, imgW, imgH, gridSize = 5) {
+  const n = flatPoints.length / 2;
+  if (n <= 0) {
+    return { bboxCoverage: 0, cellCoverage: 0 };
+  }
+
+  const w = Math.max(1, imgW);
+  const h = Math.max(1, imgH);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const occ = new Uint8Array(gridSize * gridSize);
+  let occupied = 0;
+  for (let i = 0; i < n; i++) {
+    const x = flatPoints[i * 2];
+    const y = flatPoints[i * 2 + 1];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+
+    const gx = clampScalar(Math.floor((x / w) * gridSize), 0, gridSize - 1);
+    const gy = clampScalar(Math.floor((y / h) * gridSize), 0, gridSize - 1);
+    const gi = gy * gridSize + gx;
+    if (!occ[gi]) {
+      occ[gi] = 1;
+      occupied++;
+    }
+  }
+
+  const bboxW = Math.max(0, maxX - minX);
+  const bboxH = Math.max(0, maxY - minY);
+  const bboxCoverage = (bboxW * bboxH) / (w * h);
+  const cellCoverage = occupied / (gridSize * gridSize);
+  return { bboxCoverage, cellCoverage };
+}
+
+function computeInlierSpread(pointsI, pointsJ, wI, hI, wJ, hJ) {
+  const sI = computePointSpread(pointsI, wI, hI);
+  const sJ = computePointSpread(pointsJ, wJ, hJ);
+  return {
+    minBBoxCoverage: Math.min(sI.bboxCoverage, sJ.bboxCoverage),
+    minCellCoverage: Math.min(sI.cellCoverage, sJ.cellCoverage),
+  };
+}
+
+function analyzeConnectivity(ids, edges) {
+  const adj = {};
+  const degree = {};
+  for (const id of ids) {
+    adj[id] = [];
+    degree[id] = 0;
+  }
+  for (const e of edges) {
+    if (!adj[e.i] || !adj[e.j]) continue;
+    adj[e.i].push(e.j);
+    adj[e.j].push(e.i);
+    degree[e.i] = (degree[e.i] || 0) + 1;
+    degree[e.j] = (degree[e.j] || 0) + 1;
+  }
+
+  const visited = new Set();
+  const components = [];
+  for (const id of ids) {
+    if (visited.has(id)) continue;
+    const comp = [];
+    const queue = [id];
+    visited.add(id);
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      comp.push(cur);
+      for (const nb of adj[cur]) {
+        if (visited.has(nb)) continue;
+        visited.add(nb);
+        queue.push(nb);
+      }
+    }
+    components.push(comp);
+  }
+  return { degree, components };
+}
+
+function checkConnectivity(ids, edges) {
+  if (ids.length <= 1) return true;
+  const { components } = analyzeConnectivity(ids, edges);
+  return components.length <= 1;
 }
 
 /**

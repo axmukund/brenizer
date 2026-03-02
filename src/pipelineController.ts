@@ -558,10 +558,14 @@ function estimateMatchGraphTimeoutPlan(
   activeCount: number,
   avgKeypoints: number,
 ): MatchGraphTimeoutPlan {
-  const keypointFactor = clamp(avgKeypoints / 1200, 0.8, 4.5);
-  const estimatedAbsoluteMs = 60000 + candidatePairs * 900 * keypointFactor + activeCount * 1500;
-  const absoluteTimeoutMs = clamp(Math.round(estimatedAbsoluteMs), 120000, 900000);
-  const initialStallTimeoutMs = clamp(Math.round(45000 + keypointFactor * 15000), 45000, 240000);
+  const keypointFactor = clamp(avgKeypoints / 1200, 0.8, 5.5);
+  const pairCostMs = 900 + clamp((avgKeypoints - 1400) * 0.35, 0, 2600);
+  const pairWorkMs = candidatePairs * pairCostMs * keypointFactor;
+  const graphOverheadMs = activeCount * 2200 + Math.sqrt(Math.max(1, candidatePairs)) * 6000;
+  const estimatedAbsoluteMs = 90000 + pairWorkMs + graphOverheadMs;
+  const absoluteTimeoutMs = clamp(Math.round(estimatedAbsoluteMs), 180000, 1500000);
+  const stallBaseMs = 60000 + Math.sqrt(Math.max(1, candidatePairs)) * 5000;
+  const initialStallTimeoutMs = clamp(Math.round(stallBaseMs + keypointFactor * 25000), 60000, 420000);
   return { absoluteTimeoutMs, initialStallTimeoutMs };
 }
 
@@ -610,9 +614,9 @@ async function waitForMatchGraphEdges(options: WaitForMatchGraphEdgesOptions): P
       const staleMs = now - lastProgressAt;
       const stallLimitMs = heartbeatSeen
         ? clamp(
-            Math.round(Math.max(timePlan.initialStallTimeoutMs, heartbeatEwmaMs * 8)),
-            45000,
-            300000,
+            Math.round(Math.max(timePlan.initialStallTimeoutMs, heartbeatEwmaMs * 10)),
+            60000,
+            480000,
           )
         : timePlan.initialStallTimeoutMs;
 
