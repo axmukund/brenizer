@@ -37,9 +37,10 @@ export function createWorkerManager(): WorkerManager {
   const seamHandlers: MsgHandler<SeamOutMsg>[] = [];
 
   function getBaseUrl(): string {
-    // Use Vite's compile-time base path so GH Pages subpath deploys work
-    // even when the page is opened without a trailing slash.
-    return new URL(import.meta.env.BASE_URL, window.location.origin).toString();
+    // Resolve Vite base URL against the current page URL so both
+    // root-hosted and subpath-hosted deployments can load worker assets.
+    const base = import.meta.env.BASE_URL || './';
+    return new URL(base, window.location.href).toString();
   }
 
   function createCV(): Worker {

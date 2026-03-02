@@ -250,10 +250,12 @@ and fails if the pipeline errors/times out.
 
 ## Deploy to GitHub Pages
 
-The Vite config supports subpath deployment via the `GH_PAGES_BASE` env variable:
+The Vite config uses a relative base (`./`) so the built app can be served from:
+- a root domain (for example `https://yourname.github.io/`)
+- a project subpath (for example `https://yourname.github.io/repo-name/`)
 
 ```bash
-GH_PAGES_BASE=/your-repo-name/ npm run build
+npm run build
 ```
 
 ### GitHub Actions
@@ -269,8 +271,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      GH_PAGES_BASE: /${{ github.event.repository.name }}/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
