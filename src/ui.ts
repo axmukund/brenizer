@@ -171,6 +171,7 @@ function renderImageList(): void {
   // Clear children except empty-state
   list.innerHTML = '';
   if (images.length === 0) {
+    window.dispatchEvent(new CustomEvent('preview-image-hover', { detail: { imageId: null } }));
     const el = document.createElement('div');
     el.className = 'empty-state';
     el.id = 'empty-state';
@@ -186,6 +187,14 @@ function renderImageList(): void {
     item.className = 'img-item' + (img.excluded ? ' excluded' : '');
     item.draggable = true;
     item.dataset.idx = String(idx);
+    item.dataset.imageId = img.id;
+
+    item.addEventListener('mouseenter', () => {
+      window.dispatchEvent(new CustomEvent('preview-image-hover', { detail: { imageId: img.id } }));
+    });
+    item.addEventListener('mouseleave', () => {
+      window.dispatchEvent(new CustomEvent('preview-image-hover', { detail: { imageId: null } }));
+    });
 
     // Drag handlers
     item.addEventListener('dragstart', (e) => {

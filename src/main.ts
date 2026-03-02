@@ -56,6 +56,19 @@ let editorPanStartY = 0.0;
 let editorPanBaseX = 0.0;
 let editorPanBaseY = 0.0;
 
+interface PreviewOutlinePolygon {
+  points: Array<[number, number]>; // display-content coordinates (before canvas fit)
+}
+
+interface PreviewDisplayRegion {
+  dispW: number;
+  dispH: number;
+}
+
+let previewImageOutlines = new Map<string, PreviewOutlinePolygon>();
+let previewDisplayRegion: PreviewDisplayRegion | null = null;
+let hoveredPreviewImageId: string | null = null;
+
 const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
 const EXPORT_SEAM_HARD_GRID_NODES = 90000;
 const EXPORT_SEAM_MAX_BLOCK_SIZE = 256;
@@ -287,10 +300,17 @@ function safeGainVal(v: number): number {
 }
 
 function applyPreviewEditorTransform(): void {
+  const transform = `translate(${editorPanX.toFixed(1)}px, ${editorPanY.toFixed(1)}px) scale(${editorZoom.toFixed(3)}) rotate(${editorRotationDeg.toFixed(2)}deg)`;
   const canvas = document.getElementById('preview-canvas') as HTMLCanvasElement | null;
-  if (!canvas) return;
-  canvas.style.transformOrigin = '50% 50%';
-  canvas.style.transform = `translate(${editorPanX.toFixed(1)}px, ${editorPanY.toFixed(1)}px) scale(${editorZoom.toFixed(3)}) rotate(${editorRotationDeg.toFixed(2)}deg)`;
+  if (canvas) {
+    canvas.style.transformOrigin = '50% 50%';
+    canvas.style.transform = transform;
+  }
+  const overlay = document.getElementById('preview-overlay') as HTMLCanvasElement | null;
+  if (overlay) {
+    overlay.style.transformOrigin = '50% 50%';
+    overlay.style.transform = transform;
+  }
 }
 
 function setPanCursorState(isPanning: boolean): void {
@@ -298,6 +318,62 @@ function setPanCursorState(isPanning: boolean): void {
   if (!container) return;
   container.classList.add('pan-enabled');
   container.classList.toggle('panning', isPanning);
+}
+
+function clearPreviewHoverOverlay(): void {
+  const overlay = document.getElementById('preview-overlay') as HTMLCanvasElement | null;
+  if (!overlay) return;
+  const ctx = overlay.getContext('2d');
+  if (!ctx) return;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  overlay.style.display = 'none';
+}
+
+function drawPreviewHoverOverlay(): void {
+  const overlay = document.getElementById('preview-overlay') as HTMLCanvasElement | null;
+  if (!overlay) return;
+  const ctx = overlay.getContext('2d');
+  if (!ctx) return;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+  if (!hoveredPreviewImageId || !previewDisplayRegion) {
+    overlay.style.display = 'none';
+    return;
+  }
+  const poly = previewImageOutlines.get(hoveredPreviewImageId);
+  if (!poly || poly.points.length < 3) {
+    overlay.style.display = 'none';
+    return;
+  }
+
+  const { dispW, dispH } = previewDisplayRegion;
+  const scale = Math.min(overlay.width / Math.max(1, dispW), overlay.height / Math.max(1, dispH));
+  const offX = (overlay.width - dispW * scale) * 0.5;
+  const offY = (overlay.height - dispH * scale) * 0.5;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 48, 48, 0.95)';
+  ctx.fillStyle = 'rgba(255, 48, 48, 0.12)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 5]);
+  ctx.beginPath();
+  for (let i = 0; i < poly.points.length; i++) {
+    const [px, py] = poly.points[i];
+    const sx = offX + px * scale;
+    const sy = offY + py * scale;
+    if (i === 0) ctx.moveTo(sx, sy);
+    else ctx.lineTo(sx, sy);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+  overlay.style.display = 'block';
+}
+
+function setHoveredPreviewImage(imageId: string | null): void {
+  hoveredPreviewImageId = imageId;
+  drawPreviewHoverOverlay();
 }
 
 function refreshEditorControlLabels(): void {
@@ -428,6 +504,15 @@ export async function renderImagePreview(imageEntry: { file: File; width: number
   canvas.width = container.clientWidth;
   canvas.height = container.clientHeight;
   canvas.style.display = 'block';
+  const overlay = document.getElementById('preview-overlay') as HTMLCanvasElement | null;
+  if (overlay) {
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+  }
+  previewImageOutlines.clear();
+  previewDisplayRegion = null;
+  hoveredPreviewImageId = null;
+  clearPreviewHoverOverlay();
   document.getElementById('canvas-placeholder')!.style.display = 'none';
 
   // Decode the image
@@ -494,6 +579,12 @@ async function boot(): Promise<void> {
   // Init UI first so elements are wired
   initUI();
   setRenderImagePreview(renderImagePreview);
+
+  // Hovering image list items highlights their stitched footprint in preview.
+  window.addEventListener('preview-image-hover', (ev: Event) => {
+    const detail = (ev as CustomEvent<{ imageId?: string | null }>).detail;
+    setHoveredPreviewImage(detail?.imageId ?? null);
+  });
 
   // Detect capabilities
   setStatus('Detecting capabilities…');
@@ -945,6 +1036,14 @@ async function renderWarpedPreview(
   canvas.width = container.clientWidth;
   canvas.height = container.clientHeight;
   canvas.style.display = 'block';
+  const overlay = document.getElementById('preview-overlay') as HTMLCanvasElement | null;
+  if (overlay) {
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+  }
+  previewImageOutlines.clear();
+  previewDisplayRegion = null;
+  clearPreviewHoverOverlay();
   document.getElementById('canvas-placeholder')!.style.display = 'none';
 
   // Determine which images are reachable from the reference in the MST.
@@ -1216,6 +1315,7 @@ async function renderWarpedPreview(
 
   const gridN = 8;
   let imgIdx = 0;
+  const rawImageOutlines = new Map<string, Array<[number, number]>>();
 
   // ── Project faces into composite coordinates for face-aware seam placement ──
   const allFaces = getLastFaces();
@@ -1314,6 +1414,26 @@ async function renderWarpedPreview(
       }
       baseMesh.positions = warpedPositions;
       mesh = baseMesh;
+    }
+
+    // Track a simple footprint polygon (AABB in composite-space) for hover highlighting.
+    let pMinX = Infinity, pMinY = Infinity, pMaxX = -Infinity, pMaxY = -Infinity;
+    for (let i = 0; i < mesh.positions.length; i += 2) {
+      const px = mesh.positions[i];
+      const py = mesh.positions[i + 1];
+      if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+      pMinX = Math.min(pMinX, px);
+      pMinY = Math.min(pMinY, py);
+      pMaxX = Math.max(pMaxX, px);
+      pMaxY = Math.max(pMaxY, py);
+    }
+    if (Number.isFinite(pMinX) && pMaxX > pMinX && pMaxY > pMinY) {
+      rawImageOutlines.set(imgId, [
+        [pMinX, pMinY],
+        [pMaxX, pMinY],
+        [pMaxX, pMaxY],
+        [pMinX, pMaxY],
+      ]);
     }
 
     // Decode image and create texture
@@ -1911,6 +2031,43 @@ async function renderWarpedPreview(
     }
   }
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
+  const uMin = hasCrop ? cropL / compW : 0;
+  const uMax = hasCrop ? (cropR + 1) / compW : 1;
+  const vMin = hasCrop ? cropB / compH : 0;
+  const vMax = hasCrop ? (cropT + 1) / compH : 1;
+  const uSpan = Math.max(1e-6, uMax - uMin);
+  const vSpan = Math.max(1e-6, vMax - vMin);
+  const cosA = Math.cos(levelAngle);
+  const sinA = Math.sin(levelAngle);
+  const centerX = compW * 0.5;
+  const centerY = compH * 0.5;
+
+  const displayOutlines = new Map<string, PreviewOutlinePolygon>();
+  for (const [imageId, poly] of rawImageOutlines) {
+    const mapped: Array<[number, number]> = [];
+    for (const [x0, y0] of poly) {
+      let x = x0;
+      let y = y0;
+      if (Math.abs(levelAngle) > 0.001) {
+        const dx = x0 - centerX;
+        const dy = y0 - centerY;
+        x = cosA * dx - sinA * dy + centerX;
+        y = sinA * dx + cosA * dy + centerY;
+      }
+
+      const u = x / compW;
+      const v = 1 - (y / compH);
+      const dispX = ((u - uMin) / uSpan) * dispW;
+      const dispY = ((vMax - v) / vSpan) * dispH;
+      mapped.push([dispX, dispY]);
+    }
+    if (mapped.length >= 3) {
+      displayOutlines.set(imageId, { points: mapped });
+    }
+  }
+  previewImageOutlines = displayOutlines;
+  previewDisplayRegion = { dispW, dispH };
+  drawPreviewHoverOverlay();
   applyPreviewEditorTransform();
 
   // Cleanup FBOs
