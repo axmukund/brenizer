@@ -10,7 +10,7 @@ import type {
 } from './workerTypes';
 
 export interface WorkerManager {
-  initAll(opts?: { enableDepth?: boolean; enableSeam?: boolean }): Promise<{ cv: boolean; depth: boolean; seam: boolean }>;
+  initAll(opts?: { enableDepth?: boolean; enableSeam?: boolean; depthInitTimeoutMs?: number }): Promise<{ cv: boolean; depth: boolean; seam: boolean }>;
   sendCV(msg: CVInMsg, transfer?: Transferable[]): void;
   sendDepth(msg: DepthInMsg, transfer?: Transferable[]): void;
   sendSeam(msg: SeamInMsg, transfer?: Transferable[]): void;
@@ -122,6 +122,7 @@ export function createWorkerManager(): WorkerManager {
     async initAll(opts = {}) {
       const enableDepth = opts.enableDepth !== false;
       const enableSeam = opts.enableSeam !== false;
+      const depthInitTimeoutMs = Math.max(1000, opts.depthInitTimeoutMs ?? 60000);
       const baseUrl = getBaseUrl();
       const results = { cv: false, depth: false, seam: false };
 
@@ -147,7 +148,7 @@ export function createWorkerManager(): WorkerManager {
             preferWebGPU: true,
             targetSize: 256,
           });
-          await waitForMsg(depthHandlers, 'progress', 60000);
+          await waitForMsg(depthHandlers, 'progress', depthInitTimeoutMs);
           results.depth = true;
           console.log('depth-worker ready');
         } catch (e) {

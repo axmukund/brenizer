@@ -24,7 +24,7 @@ import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMe
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import type { PipelineSettings } from './presets';
-import { setStatus, startProgress, endProgress, updateProgress } from './ui';
+import { setStatus, startProgress, endProgress, updateProgress, buildSettingsPanel } from './ui';
 
 let workerManager: WorkerManager | null = null;
 
@@ -185,7 +185,7 @@ export function getWorkerManager(): WorkerManager | null {
 }
 
 /** Initialize all workers. Returns readiness status. */
-export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: boolean } = {}): Promise<{ cv: boolean; depth: boolean; seam: boolean }> {
+export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: boolean; depthInitTimeoutMs?: number } = {}): Promise<{ cv: boolean; depth: boolean; seam: boolean }> {
   if (workerManager) {
     workerManager.dispose();
   }
@@ -507,6 +507,7 @@ interface MatchingProbeMetrics {
   usableEdgeDensity: number;
   componentCount: number;
   medianInliers: number;
+  medianRms: number;
   duplicatePairCount: number;
 }
 
@@ -515,6 +516,273 @@ interface MatchingProbeResult {
   recommendedMinInliers: number;
   summary: string;
   metrics: MatchingProbeMetrics;
+}
+
+interface DepthSampleMetrics {
+  imageId: string;
+  stdNorm: number;
+  gradientNorm: number;
+}
+
+interface DepthProbeResult {
+  attempted: number;
+  succeeded: number;
+  avgStdNorm: number;
+  avgGradientNorm: number;
+}
+
+interface DepthTuneResult {
+  tunedSettings: PipelineSettings;
+  summary: string;
+  depthProbe: DepthProbeResult | null;
+}
+
+function pickProbeIndices(total: number, maxSamples: number): number[] {
+  if (total <= 0 || maxSamples <= 0) return [];
+  if (total <= maxSamples) {
+    const all: number[] = [];
+    for (let i = 0; i < total; i++) all.push(i);
+    return all;
+  }
+  const out = new Set<number>();
+  out.add(0);
+  out.add(total - 1);
+  while (out.size < maxSamples) {
+    const t = out.size / (maxSamples - 1);
+    const idx = Math.round(t * (total - 1));
+    out.add(clamp(idx, 0, total - 1));
+  }
+  return Array.from(out).sort((a, b) => a - b);
+}
+
+function computeDepthProbeStats(depth: Uint16Array, depthW: number, depthH: number): { stdNorm: number; gradientNorm: number } {
+  if (depth.length === 0 || depthW <= 1 || depthH <= 1) {
+    return { stdNorm: 0, gradientNorm: 0 };
+  }
+
+  let mean = 0;
+  let m2 = 0;
+  let n = 0;
+  for (let i = 0; i < depth.length; i++) {
+    const x = depth[i] / 65535;
+    n++;
+    const delta = x - mean;
+    mean += delta / n;
+    m2 += delta * (x - mean);
+  }
+  const variance = n > 1 ? m2 / (n - 1) : 0;
+  const stdNorm = Math.sqrt(Math.max(0, variance));
+
+  let gradSum = 0;
+  let gradCount = 0;
+  for (let y = 0; y < depthH - 1; y++) {
+    const row = y * depthW;
+    const nextRow = (y + 1) * depthW;
+    for (let x = 0; x < depthW - 1; x++) {
+      const idx = row + x;
+      const dx = Math.abs(depth[idx + 1] - depth[idx]) / 65535;
+      const dy = Math.abs(depth[nextRow + x] - depth[idx]) / 65535;
+      gradSum += dx + dy;
+      gradCount += 2;
+    }
+  }
+  const gradientNorm = gradCount > 0 ? gradSum / gradCount : 0;
+  return { stdNorm, gradientNorm };
+}
+
+async function waitDepthResultForImage(
+  wm: WorkerManager,
+  imageId: string,
+  timeoutMs: number,
+): Promise<DepthResultMsg> {
+  return await new Promise<DepthResultMsg>((resolve, reject) => {
+    let unsub: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      if (unsub) unsub();
+      reject(new Error(`Timeout waiting for depth result: ${imageId}`));
+    }, timeoutMs);
+    const handler = (msg: import('./workers/workerTypes').DepthOutMsg) => {
+      if (msg.type === 'result') {
+        if (msg.imageId !== imageId) return;
+        clearTimeout(timer);
+        if (unsub) unsub();
+        resolve(msg as DepthResultMsg);
+      } else if (msg.type === 'error') {
+        if (msg.imageId && msg.imageId !== imageId) return;
+        clearTimeout(timer);
+        if (unsub) unsub();
+        reject(new Error(msg.message || `Depth worker error for ${imageId}`));
+      }
+    };
+    unsub = wm.onDepth(handler);
+  });
+}
+
+async function runDepthProbe(
+  wm: WorkerManager,
+  active: ImageEntry[],
+  stage: string,
+): Promise<DepthProbeResult> {
+  const indices = pickProbeIndices(active.length, 3);
+  if (indices.length === 0) {
+    updateProgress(stage, 1);
+    return {
+      attempted: 0,
+      succeeded: 0,
+      avgStdNorm: 0,
+      avgGradientNorm: 0,
+    };
+  }
+
+  const probeInputSize = 128;
+  const samples: DepthSampleMetrics[] = [];
+  updateProgress(stage, 0);
+
+  for (let i = 0; i < indices.length; i++) {
+    const img = active[indices[i]];
+    setStatus(`First pass: probing depth ${i + 1}/${indices.length} — ${img.name}`);
+    try {
+      const bmp = await createImageBitmap(img.file);
+      const offscreen = new OffscreenCanvas(probeInputSize, probeInputSize);
+      const ctx = offscreen.getContext('2d')!;
+      ctx.drawImage(bmp, 0, 0, probeInputSize, probeInputSize);
+      bmp.close();
+
+      const imgData = ctx.getImageData(0, 0, probeInputSize, probeInputSize);
+      const rgbaBuf = imgData.data.buffer as ArrayBuffer;
+      wm.sendDepth(
+        {
+          type: 'infer',
+          imageId: img.id,
+          rgbaBuffer: rgbaBuf,
+          width: probeInputSize,
+          height: probeInputSize,
+        },
+        [rgbaBuf],
+      );
+      const result = await waitDepthResultForImage(wm, img.id, 20000);
+      const depth = new Uint16Array(result.depthUint16Buffer);
+      const stats = computeDepthProbeStats(depth, result.depthW, result.depthH);
+      samples.push({
+        imageId: img.id,
+        stdNorm: stats.stdNorm,
+        gradientNorm: stats.gradientNorm,
+      });
+    } catch (e) {
+      console.warn(`Depth probe failed for ${img.name}:`, e);
+    }
+    updateProgress(stage, (i + 1) / indices.length);
+  }
+
+  const succeeded = samples.length;
+  const avgStdNorm = succeeded > 0
+    ? samples.reduce((s, m) => s + m.stdNorm, 0) / succeeded
+    : 0;
+  const avgGradientNorm = succeeded > 0
+    ? samples.reduce((s, m) => s + m.gradientNorm, 0) / succeeded
+    : 0;
+
+  return {
+    attempted: indices.length,
+    succeeded,
+    avgStdNorm,
+    avgGradientNorm,
+  };
+}
+
+function optimizeDepthSettings(
+  tunedFromMatching: PipelineSettings,
+  matchingMetrics: MatchingProbeMetrics,
+  activeCount: number,
+  depthWorkerReady: boolean,
+  depthProbe: DepthProbeResult | null,
+  isMobile: boolean,
+): DepthTuneResult {
+  const tuned: PipelineSettings = { ...tunedFromMatching };
+
+  if (!depthWorkerReady) {
+    const beforeEnabled = tuned.depthEnabled;
+    const beforeInput = tuned.depthInputSize;
+    tuned.depthEnabled = false;
+    tuned.depthInputSize = clamp(roundToStep(Math.min(tuned.depthInputSize, 192), 64), 64, 512);
+    const changes: string[] = [];
+    if (beforeEnabled !== tuned.depthEnabled) changes.push(`Depth ${beforeEnabled ? 'on' : 'off'}→off`);
+    if (beforeInput !== tuned.depthInputSize) changes.push(`DepthSize ${beforeInput}→${tuned.depthInputSize}`);
+    const summary = changes.length > 0
+      ? `Depth tuning applied: ${changes.join(', ')} (depth worker unavailable).`
+      : 'Depth tuning kept current settings (depth worker unavailable).';
+    return {
+      tunedSettings: tuned,
+      summary,
+      depthProbe,
+    };
+  }
+
+  // Depth currently affects APAP local mesh weighting only, so keep it off when meshing is off.
+  if (tuned.meshGrid <= 0) {
+    const changed = tuned.depthEnabled;
+    tuned.depthEnabled = false;
+    return {
+      tunedSettings: tuned,
+      summary: changed ? 'Depth disabled because APAP grid is off.' : 'Depth kept off (APAP grid disabled).',
+      depthProbe,
+    };
+  }
+
+  let signal = 0;
+  if (matchingMetrics.medianRms >= 2.0) signal += 1;
+  if (matchingMetrics.medianRms >= 2.8) signal += 1;
+  if (matchingMetrics.componentCount === 1 && matchingMetrics.usableEdgeDensity >= 0.10) signal += 1;
+  if (matchingMetrics.avgAlignedDim >= 900) signal += 1;
+  if (matchingMetrics.avgKeypoints < matchingMetrics.probeOrbFeatures * 0.35) signal -= 1;
+  if (activeCount > 22) signal -= 1;
+
+  if (depthProbe && depthProbe.succeeded > 0) {
+    if (depthProbe.avgGradientNorm >= 0.045) signal += 2;
+    else if (depthProbe.avgGradientNorm >= 0.03) signal += 1;
+    if (depthProbe.avgStdNorm >= 0.20) signal += 1;
+  } else if (depthProbe) {
+    signal -= 1;
+  }
+
+  const enableThreshold = tunedFromMatching.depthEnabled ? 2 : 3;
+  const recommendedDepthEnabled = signal >= enableThreshold;
+  tuned.depthEnabled = recommendedDepthEnabled;
+
+  if (recommendedDepthEnabled) {
+    let targetSize = 128;
+    if (matchingMetrics.avgAlignedDim >= 1400 && activeCount <= 16 && signal >= 4) {
+      targetSize = 256;
+    } else if (matchingMetrics.avgAlignedDim >= 900 && activeCount <= 24) {
+      targetSize = 192;
+    }
+    if (isMobile) targetSize = Math.min(targetSize, 192);
+    tuned.depthInputSize = clamp(roundToStep(targetSize, 64), 64, 512);
+  } else {
+    // Keep disabled runs lighter; no need to hold a high input size.
+    tuned.depthInputSize = clamp(roundToStep(Math.min(tuned.depthInputSize, 192), 64), 64, 512);
+  }
+
+  const changes: string[] = [];
+  if (tunedFromMatching.depthEnabled !== tuned.depthEnabled) {
+    changes.push(`Depth ${tunedFromMatching.depthEnabled ? 'on' : 'off'}→${tuned.depthEnabled ? 'on' : 'off'}`);
+  }
+  if (tunedFromMatching.depthInputSize !== tuned.depthInputSize) {
+    changes.push(`DepthSize ${tunedFromMatching.depthInputSize}→${tuned.depthInputSize}`);
+  }
+
+  const probeText = depthProbe
+    ? `depth probe ${depthProbe.succeeded}/${depthProbe.attempted}, grad ${depthProbe.avgGradientNorm.toFixed(3)}, std ${depthProbe.avgStdNorm.toFixed(3)}`
+    : 'depth probe unavailable';
+  const summary = changes.length > 0
+    ? `Depth tuning applied: ${changes.join(', ')} (${probeText}, signal ${signal}).`
+    : `Depth tuning kept current settings (${probeText}, signal ${signal}).`;
+
+  return {
+    tunedSettings: tuned,
+    summary,
+    depthProbe,
+  };
 }
 
 function estimateMatchingSettings(
@@ -598,7 +866,7 @@ function estimateMatchingSettings(
   maybeAdd('Block', baseSettings.seamBlockSize, tuned.seamBlockSize);
   maybeAdd('Bands', baseSettings.multibandLevels, tuned.multibandLevels);
 
-  const probeDetail = `probe edges ${metrics.usableEdgeCount}/${metrics.candidatePairCount}, components ${metrics.componentCount}, median inliers ${metrics.medianInliers.toFixed(0)}, avg kp ${metrics.avgKeypoints.toFixed(0)}`;
+  const probeDetail = `probe edges ${metrics.usableEdgeCount}/${metrics.candidatePairCount}, components ${metrics.componentCount}, median inliers ${metrics.medianInliers.toFixed(0)}, median rms ${metrics.medianRms.toFixed(2)}, avg kp ${metrics.avgKeypoints.toFixed(0)}`;
   const summary = changed.length > 0
     ? `First pass tuning applied: ${changed.join(', ')} (${probeDetail}).`
     : `First pass tuning kept current matching settings (${probeDetail}).`;
@@ -712,6 +980,7 @@ async function runMatchingProbe(
   const usableEdgeDensity = candidatePairCount > 0 ? usableEdges.length / candidatePairCount : 0;
   const componentCount = countConnectedComponents(active.map((i) => i.id), usableEdges.map((e) => ({ i: e.i, j: e.j })));
   const medianInliers = median(usableEdges.map((e) => e.inlierCount));
+  const medianRms = median(usableEdges.map((e) => e.rms));
 
   return estimateMatchingSettings(baseSettings, active.length, {
     probeOrbFeatures,
@@ -725,14 +994,16 @@ async function runMatchingProbe(
     usableEdgeDensity,
     componentCount,
     medianInliers,
+    medianRms,
     duplicatePairCount,
   });
 }
 
 /** Run only the first-pass analysis and apply optimized settings. */
 export async function runFirstPassOptimization(): Promise<void> {
-  const { images, settings } = getState();
+  const { images, settings, capabilities } = getState();
   const active = images.filter(i => !i.excluded);
+  const wantDepthProbe = settings?.meshGrid !== undefined && settings.meshGrid > 0;
 
   if (active.length < 2) {
     setStatus('Need at least 2 images to optimize settings.');
@@ -750,15 +1021,25 @@ export async function runFirstPassOptimization(): Promise<void> {
   setState({ pipelineStatus: 'running' });
   setStatus('Starting first-pass optimization…');
 
-  startProgress([
+  const prepassWeight = wantDepthProbe ? 40 : 50;
+  const depthProbeWeight = wantDepthProbe ? 10 : 0;
+  const stages = [
     { name: 'init', weight: 15 },
     { name: 'sendImages', weight: 35 },
-    { name: 'prepass', weight: 50 },
-  ]);
+    { name: 'prepass', weight: prepassWeight },
+  ];
+  if (depthProbeWeight > 0) {
+    stages.push({ name: 'depthProbe', weight: depthProbeWeight });
+  }
+  startProgress(stages);
 
   try {
     updateProgress('init', 0);
-    const ready = await initWorkers({ enableDepth: false, enableSeam: false });
+    const ready = await initWorkers({
+      enableDepth: wantDepthProbe,
+      enableSeam: false,
+      depthInitTimeoutMs: 15000,
+    });
     updateProgress('init', 1);
     if (!ready.cv) throw new Error('CV worker failed to initialize. Cannot optimize settings.');
 
@@ -770,10 +1051,35 @@ export async function runFirstPassOptimization(): Promise<void> {
     });
 
     const probe = await runMatchingProbe(workerManager!, active, settings, scaleFactors);
-    setState({ settings: probe.tunedSettings });
+    let tuned = probe.tunedSettings;
+    let depthSummary = 'Depth tuning skipped.';
+    let depthProbeMetrics: DepthProbeResult | null = null;
+
+    if (wantDepthProbe) {
+      if (ready.depth) {
+        depthProbeMetrics = await runDepthProbe(workerManager!, active, 'depthProbe');
+      } else {
+        updateProgress('depthProbe', 1);
+        depthProbeMetrics = null;
+      }
+
+      const depthResult = optimizeDepthSettings(
+        tuned,
+        probe.metrics,
+        active.length,
+        ready.depth,
+        depthProbeMetrics,
+        !!capabilities?.isMobile,
+      );
+      tuned = depthResult.tunedSettings;
+      depthSummary = depthResult.summary;
+    }
+
+    setState({ settings: tuned });
+    buildSettingsPanel();
     updateProgress('prepass', 1);
-    setStatus(`Optimization complete. ${probe.summary}`);
-    console.info('[prepass]', probe.summary, probe.metrics);
+    setStatus(`Optimization complete. ${probe.summary} ${depthSummary}`);
+    console.info('[prepass]', probe.summary, probe.metrics, depthSummary, depthProbeMetrics);
   } catch (err) {
     console.error('First-pass optimization error:', err);
     setStatus(`First-pass optimization error: ${err instanceof Error ? err.message : String(err)}`);
