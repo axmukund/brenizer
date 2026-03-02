@@ -1,0 +1,30 @@
+{
+  "generatedBy": "scripts/generate-test-images.mjs",
+  "license": "CC0-1.0",
+  "deterministic": true,
+  "set": "synth_market_4x3",
+  "seed": 9001,
+  "rows": 3,
+  "cols": 4,
+  "tileWidth": 448,
+  "tileHeight": 320,
+  "overlap": 0.3,
+  "panorama": {
+    "width": 1390,
+    "height": 768
+  },
+  "tiles": [
+    "tile_r1_c1.png",
+    "tile_r1_c2.png",
+    "tile_r1_c3.png",
+    "tile_r1_c4.png",
+    "tile_r2_c1.png",
+    "tile_r2_c2.png",
+    "tile_r2_c3.png",
+    "tile_r2_c4.png",
+    "tile_r3_c1.png",
+    "tile_r3_c2.png",
+    "tile_r3_c3.png",
+    "tile_r3_c4.png"
+  ]
+}

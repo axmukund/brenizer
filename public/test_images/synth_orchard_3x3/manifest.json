@@ -1,0 +1,27 @@
+{
+  "generatedBy": "scripts/generate-test-images.mjs",
+  "license": "CC0-1.0",
+  "deterministic": true,
+  "set": "synth_orchard_3x3",
+  "seed": 1337,
+  "rows": 3,
+  "cols": 3,
+  "tileWidth": 512,
+  "tileHeight": 384,
+  "overlap": 0.35,
+  "panorama": {
+    "width": 1178,
+    "height": 884
+  },
+  "tiles": [
+    "tile_r1_c1.png",
+    "tile_r1_c2.png",
+    "tile_r1_c3.png",
+    "tile_r2_c1.png",
+    "tile_r2_c2.png",
+    "tile_r2_c3.png",
+    "tile_r3_c1.png",
+    "tile_r3_c2.png",
+    "tile_r3_c3.png"
+  ]
+}

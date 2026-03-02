@@ -5,6 +5,7 @@
   "license": "MIT",
   "scripts": {
     "prepare:opencv": "node scripts/prepare-opencv.mjs",
+    "generate:test-images": "node scripts/generate-test-images.mjs",
     "predev": "npm run prepare:opencv",
     "dev": "vite",
     "prebuild": "npm run prepare:opencv",

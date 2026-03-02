@@ -5,3 +5,12 @@ test_images/
 # Landscape test images (ground-truth original + 3x3 overlapping tiles)
 lnd_test/
 .DS_Store
+
+# Keep only license-safe synthetic fixture assets under public/test_images tracked.
+!public/test_images/
+public/test_images/*
+!public/test_images/LICENSE.md
+!public/test_images/synth_orchard_3x3/
+!public/test_images/synth_orchard_3x3/**
+!public/test_images/synth_market_4x3/
+!public/test_images/synth_market_4x3/**

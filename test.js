@@ -34,6 +34,18 @@ const AXM_CENTER_OUT = [
   'AXM_1761.jpeg', 'AXM_1754.jpeg', 'AXM_1762.jpeg',
 ];
 
+const SYNTH_ORCHARD_ROW_MAJOR = [
+  'synth_orchard_3x3/tile_r1_c1.png', 'synth_orchard_3x3/tile_r1_c2.png', 'synth_orchard_3x3/tile_r1_c3.png',
+  'synth_orchard_3x3/tile_r2_c1.png', 'synth_orchard_3x3/tile_r2_c2.png', 'synth_orchard_3x3/tile_r2_c3.png',
+  'synth_orchard_3x3/tile_r3_c1.png', 'synth_orchard_3x3/tile_r3_c2.png', 'synth_orchard_3x3/tile_r3_c3.png',
+];
+
+const SYNTH_MARKET_SNAKE = [
+  'synth_market_4x3/tile_r1_c1.png', 'synth_market_4x3/tile_r1_c2.png', 'synth_market_4x3/tile_r1_c3.png', 'synth_market_4x3/tile_r1_c4.png',
+  'synth_market_4x3/tile_r2_c4.png', 'synth_market_4x3/tile_r2_c3.png', 'synth_market_4x3/tile_r2_c2.png', 'synth_market_4x3/tile_r2_c1.png',
+  'synth_market_4x3/tile_r3_c1.png', 'synth_market_4x3/tile_r3_c2.png', 'synth_market_4x3/tile_r3_c3.png', 'synth_market_4x3/tile_r3_c4.png',
+];
+
 const SCENARIOS = [
   {
     id: 'landscape-row-major',
@@ -84,6 +96,32 @@ const SCENARIOS = [
       bboxCoverageMin: 0.09,
       largestComponentMin: 0.78,
       luminanceVarianceMin: 0.0018,
+      edgeEnergyMin: 0.0060,
+    },
+  },
+  {
+    id: 'synth-orchard-row-major',
+    files: SYNTH_ORCHARD_ROW_MAJOR,
+    runOptimizeFirst: false,
+    thresholds: {
+      minBlended: 9,
+      coverageMin: 0.75,
+      bboxCoverageMin: 0.80,
+      largestComponentMin: 0.98,
+      luminanceVarianceMin: 0.0060,
+      edgeEnergyMin: 0.0060,
+    },
+  },
+  {
+    id: 'synth-market-snake',
+    files: SYNTH_MARKET_SNAKE,
+    runOptimizeFirst: false,
+    thresholds: {
+      minBlended: 12,
+      coverageMin: 0.70,
+      bboxCoverageMin: 0.78,
+      largestComponentMin: 0.98,
+      luminanceVarianceMin: 0.0060,
       edgeEnergyMin: 0.0060,
     },
   },

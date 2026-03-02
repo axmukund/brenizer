@@ -245,8 +245,19 @@ Output goes to `dist/`.
 npm run test:e2e
 ```
 
-The E2E runner starts Vite on port `5176`, uploads test tiles, runs a full stitch,
-and fails if the pipeline errors/times out.
+The E2E runner starts Vite on port `5176`, uploads multiple fixture sets, runs full
+stitching scenarios, and fails on pipeline errors/timeouts or composite-quality
+regressions.
+
+License-safe synthetic fixtures are generated in-repo (no third-party source
+images required):
+
+```bash
+npm run generate:test-images
+```
+
+Generated sets live under `public/test_images/synth_*` and are dedicated to the
+public domain (CC0-1.0). See `public/test_images/LICENSE.md`.
 
 ## Deploy to GitHub Pages
 
