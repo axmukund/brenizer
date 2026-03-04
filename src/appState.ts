@@ -14,6 +14,7 @@ export interface ImageEntry {
 
 export interface AppState {
   images: ImageEntry[];
+  keyImageId: string | null;
   capabilities: Capabilities | null;
   userMode: ModeName;
   mobileSafeFlag: boolean;
@@ -25,6 +26,7 @@ export interface AppState {
 
 let _state: AppState = {
   images: [],
+  keyImageId: null,
   capabilities: null,
   userMode: 'auto',
   mobileSafeFlag: false,

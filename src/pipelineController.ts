@@ -59,6 +59,7 @@ export interface MatchEdge {
   rms: number;
   inlierCount: number;
   isDuplicate: boolean;
+  objectScore: number;
 }
 let lastEdges: MatchEdge[] = [];
 
@@ -1120,6 +1121,7 @@ async function runMatchingProbe(
     ransacThreshPx: baseSettings.ransacThreshPx,
     minInliers: probeMinInliers,
     matchAllPairs: matchPlan.matchAllPairs,
+    objectAware: baseSettings.objectAwareAlignment,
   });
 
   const edgesMsg = await edgesPromise;
@@ -1253,6 +1255,10 @@ export async function runFirstPassOptimization(): Promise<void> {
 export async function runStitchPreview(): Promise<void> {
   const { images, settings } = getState();
   let active = images.filter(i => !i.excluded);
+  const requestedKeyImageId = getState().keyImageId;
+  const keyImageId = requestedKeyImageId && active.some((img) => img.id === requestedKeyImageId)
+    ? requestedKeyImageId
+    : null;
 
   if (active.length < 2) {
     setStatus('Need at least 2 images to stitch.');
@@ -1531,6 +1537,7 @@ export async function runStitchPreview(): Promise<void> {
     ransacThreshPx: effectiveSettings.ransacThreshPx,
     minInliers: adaptiveMinInliers,
     matchAllPairs: matchPlan.matchAllPairs,
+    objectAware: effectiveSettings.objectAwareAlignment,
   });
 
   const edgesMsg = await edgesPromise;
@@ -1543,6 +1550,7 @@ export async function runStitchPreview(): Promise<void> {
     rms: e.rms,
     inlierCount: e.inlierCount,
     isDuplicate: e.isDuplicate || false,
+    objectScore: e.objectScore ?? 0,
   }));
 
   // Handle near-duplicates: mark one image in each duplicate pair as excluded
@@ -1554,7 +1562,10 @@ export async function runStitchPreview(): Promise<void> {
       const idxA = activeIndexById.get(idA);
       const idxB = activeIndexById.get(idB);
       if (idxA !== undefined && idxB !== undefined) {
-        const excludeId = idxA < idxB ? idB : idA;
+        let excludeId = idxA < idxB ? idB : idA;
+        if (keyImageId && excludeId === keyImageId) {
+          excludeId = excludeId === idA ? idB : idA;
+        }
         toExclude.add(excludeId);
       }
     }
@@ -1609,7 +1620,7 @@ export async function runStitchPreview(): Promise<void> {
     unsub = workerManager!.onCV(handler);
   });
 
-  workerManager!.sendCV({ type: 'buildMST' });
+  workerManager!.sendCV({ type: 'buildMST', keyImageId });
 
   const mstMsg = await mstPromise as CVMSTMsg;
   lastRefId = mstMsg.refId;
@@ -1693,8 +1704,9 @@ export async function runStitchPreview(): Promise<void> {
   const qualityMsg = await qualityPromise;
 
   // Auto-exclude recommended images
-  if (qualityMsg.excludeIds.length > 0 && qualityMsg.excludeIds.length < active.length - 1) {
-    const excludeSet = new Set(qualityMsg.excludeIds);
+  const qualityExcludeIds = qualityMsg.excludeIds.filter((id) => id !== keyImageId);
+  if (qualityExcludeIds.length > 0 && qualityExcludeIds.length < active.length - 1) {
+    const excludeSet = new Set(qualityExcludeIds);
     const reasons = qualityMsg.quality
       .filter(q => q.isOutlier)
       .map(q => `${q.imageId}: ${q.reason}`)
@@ -1766,13 +1778,13 @@ export async function runStitchPreview(): Promise<void> {
       unsub = workerManager!.onCV(handler);
     });
 
-    workerManager!.sendCV({ type: 'buildMST' });
+    workerManager!.sendCV({ type: 'buildMST', keyImageId });
     const reMstMsg = await reMSTPromise;
     lastMstOrder = reMstMsg.order;
     lastMstParent = reMstMsg.parent;
     lastRefId = reMstMsg.refId;
     setStatus(`Rebuilt MST for ${active.length} images (ref=${reMstMsg.refId})`);
-  } else if (qualityMsg.excludeIds.length >= active.length - 1) {
+  } else if (qualityExcludeIds.length >= active.length - 1) {
     console.warn('[quality] Skipping exclusion — would remove all images');
   }
 

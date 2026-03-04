@@ -93,6 +93,7 @@ export interface CVMatchGraphMsg {
   ransacThreshPx: number;
   minInliers: number;
   matchAllPairs: boolean;
+  objectAware?: boolean;
 }
 
 export interface CVBuildGraphMsg {
@@ -119,6 +120,7 @@ export interface CVComputeExposureMsg {
 
 export interface CVBuildMSTMsg {
   type: 'buildMST';
+  keyImageId?: string | null;
 }
 
 export interface CVComputeLocalMeshMsg {
@@ -186,6 +188,7 @@ export interface CVEdge {
   rms: number;
   inlierCount: number;
   isDuplicate?: boolean;
+  objectScore?: number;
 }
 
 export interface CVEdgesMsg {

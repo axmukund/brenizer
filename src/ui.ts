@@ -166,7 +166,7 @@ let dragSrcIdx: number | null = null;
 
 function renderImageList(): void {
   const list = $('image-list');
-  const { images } = getState();
+  const { images, keyImageId } = getState();
 
   // Clear children except empty-state
   list.innerHTML = '';
@@ -234,12 +234,17 @@ function renderImageList(): void {
     info.className = 'img-info';
     const nameEl = document.createElement('div');
     nameEl.className = 'name';
-    nameEl.textContent = img.name;
+    nameEl.textContent = img.id === keyImageId ? `${img.name} ★` : img.name;
     const dimsEl = document.createElement('div');
     dimsEl.className = 'dims';
     dimsEl.textContent = `${img.width} × ${img.height}`;
     info.appendChild(nameEl);
     info.appendChild(dimsEl);
+
+    const keyBtn = document.createElement('button');
+    keyBtn.className = 'exclude-btn';
+    keyBtn.textContent = img.id === keyImageId ? 'Unset Key' : 'Set Key';
+    keyBtn.onclick = () => setKeyImage(img.id === keyImageId ? null : img.id);
 
     const excBtn = document.createElement('button');
     excBtn.className = 'exclude-btn';
@@ -254,10 +259,33 @@ function renderImageList(): void {
 
     item.appendChild(thumb);
     item.appendChild(info);
+    item.appendChild(keyBtn);
     item.appendChild(excBtn);
     item.appendChild(rmBtn);
     list.appendChild(item);
   });
+}
+
+function setKeyImage(imageId: string | null): void {
+  const st = getState();
+  if (imageId === null) {
+    if (st.keyImageId !== null) {
+      setState({ keyImageId: null });
+      setStatus('Key image cleared.');
+    }
+    return;
+  }
+
+  const target = st.images.find((img) => img.id === imageId);
+  if (!target) return;
+
+  const images = st.images.map((img) =>
+    img.id === imageId && img.excluded
+      ? { ...img, excluded: false }
+      : img,
+  );
+  setState({ images, keyImageId: imageId });
+  setStatus(`Key image set: ${target.name}`);
 }
 
 function reorder(from: number, to: number): void {
@@ -268,15 +296,27 @@ function reorder(from: number, to: number): void {
 }
 
 function toggleExclude(idx: number): void {
-  const images = [...getState().images];
+  const st = getState();
+  const images = [...st.images];
   images[idx] = { ...images[idx], excluded: !images[idx].excluded };
-  setState({ images });
+  let keyImageId = st.keyImageId;
+  if (images[idx].excluded && images[idx].id === st.keyImageId) {
+    keyImageId = null;
+    setStatus('Key image cleared because it was excluded.');
+  }
+  setState({ images, keyImageId });
 }
 
 function removeImage(idx: number): void {
-  const images = [...getState().images];
+  const st = getState();
+  const removed = st.images[idx];
+  const images = [...st.images];
   images.splice(idx, 1);
-  setState({ images });
+  const keyImageId = removed && removed.id === st.keyImageId ? null : st.keyImageId;
+  setState({ images, keyImageId });
+  if (removed && removed.id === st.keyImageId) {
+    setStatus('Key image cleared because it was removed.');
+  }
 }
 
 // ── capabilities UI ──────────────────────────────────────
@@ -516,6 +556,7 @@ export function buildSettingsPanel(): void {
   slider('Min Inliers (0=auto)', 'minInliers', 0, 18, 1);
   slider('LM Iterations', 'refineIters', 0, 100, 5);
   slider('APAP Grid', 'meshGrid', 0, 24, 2);
+  toggle('Object-aware Alignment', 'objectAwareAlignment');
 
   // ── Compositing ──
   section('Compositing');
@@ -594,7 +635,7 @@ export function initUI(): void {
 
   // Clear all
   $('btn-clear-all').addEventListener('click', () => {
-    setState({ images: [] });
+    setState({ images: [], keyImageId: null });
     setStatus('All images cleared.');
   });
 

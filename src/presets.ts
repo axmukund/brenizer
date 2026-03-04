@@ -32,6 +32,8 @@ export interface PipelineSettings {
   maxResExport: boolean;
   /** Blur-aware feature weighting for Brenizer method. */
   blurAwareStitching: boolean;
+  /** Object-proposal-aware pair expansion and scoring in match graph construction. */
+  objectAwareAlignment: boolean;
   /** Reserved for future cylindrical pre-warp integration. */
   cylindricalProjection: boolean;
   /** Reserved for future Brown-Conrady correction pass. */
@@ -72,6 +74,7 @@ const DESKTOP_HQ: PipelineSettings = {
   vignetteCorrection: true,
   maxResExport: false,
   blurAwareStitching: true,
+  objectAwareAlignment: true,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
@@ -104,6 +107,7 @@ const MOBILE_QUALITY: PipelineSettings = {
   vignetteCorrection: true,
   maxResExport: false,
   blurAwareStitching: true,
+  objectAwareAlignment: true,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
@@ -136,6 +140,7 @@ const MOBILE_SAFE: PipelineSettings = {
   vignetteCorrection: false,
   maxResExport: false,
   blurAwareStitching: false,
+  objectAwareAlignment: true,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
@@ -168,6 +173,7 @@ const MOBILE_LITE: PipelineSettings = {
   vignetteCorrection: false,
   maxResExport: false,
   blurAwareStitching: false,
+  objectAwareAlignment: false,
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,

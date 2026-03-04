@@ -20,11 +20,11 @@
  *  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?}
  *  - {type:'computeFeatures', orbParams}
  *  - {type:'computeSaliency'}
- *  - {type:'matchGraph', windowW, ratio, ransacThreshPx, minInliers, matchAllPairs}
+ *  - {type:'matchGraph', windowW, ratio, ransacThreshPx, minInliers, matchAllPairs, objectAware?}
  *  - {type:'buildGraph'}
  *  - {type:'refine', maxIters, huberDeltaPx, lambdaInit}
  *  - {type:'computeExposure', robustHuber?}
- *  - {type:'buildMST'}
+ *  - {type:'buildMST', keyImageId?}
  *  - {type:'computeLocalMesh', imageId, parentId, meshGrid, sigma, depthSigma, minSupport}
  *  - {type:'computeVignetting'}
  *
@@ -42,7 +42,7 @@
  */
 
 let cvReady = false;
-let images = {}; // imageId -> {width, height, gray:Uint8ClampedArray, depth?:Uint16Array, keypoints:Float32Array, descriptors:Uint8Array, descCols:number}
+let images = {}; // imageId -> {width,height,gray,rgbSmall?,depth?,keypoints,descriptors,descCols,objectProposals?}
 let edges = [];  // [{i, j, H:Float64Array, inliers:[{xi,yi,xj,yj}], rms, inlierCount}]
 let transforms = {}; // imageId -> Float64Array(9) col-major 3x3
 let refId = null;
@@ -123,7 +123,15 @@ self.addEventListener('message', async (ev) => {
           descCols: 0
         };
       }
-      postMessage({type:'progress', stage:'addImage', percent:100, info:`added ${imageId}`});
+      const rec = images[imageId];
+      rec.objectProposals = detectObjectProposals(rec.gray, rec.rgbSmall, rec.width, rec.height);
+      const objectCount = rec.objectProposals.length;
+      postMessage({
+        type:'progress',
+        stage:'addImage',
+        percent:100,
+        info:`added ${imageId} (${objectCount} object region${objectCount === 1 ? '' : 's'})`,
+      });
       return;
     }
 
@@ -618,6 +626,7 @@ self.addEventListener('message', async (ev) => {
 
     if (msg.type === 'matchGraph') {
       const {windowW, ratio, ransacThreshPx, minInliers, matchAllPairs} = msg;
+      const objectAware = !!msg.objectAware;
       const ids = Object.keys(images);
       edges = [];
 
@@ -639,6 +648,28 @@ self.addEventListener('message', async (ev) => {
         return true;
       };
 
+      const objectPairScores = new Map();
+      const getObjectPairScore = (idA, idB) => {
+        if (!objectAware) return 0;
+        return objectPairScores.get(makePairKey(idA, idB)) || 0;
+      };
+
+      if (objectAware && ids.length >= 2) {
+        for (let a = 0; a < ids.length; a++) {
+          for (let b = a + 1; b < ids.length; b++) {
+            const idA = ids[a];
+            const idB = ids[b];
+            const score = computeObjectPairSimilarity(
+              images[idA]?.objectProposals || [],
+              images[idB]?.objectProposals || [],
+            );
+            if (score > 0) {
+              objectPairScores.set(makePairKey(idA, idB), score);
+            }
+          }
+        }
+      }
+
       // Build first-pass candidate pairs.
       const initialPairs = [];
       for (let a = 0; a < ids.length; a++) {
@@ -646,6 +677,43 @@ self.addEventListener('message', async (ev) => {
           if (matchAllPairs || (b - a) <= windowW) {
             addUniquePair(initialPairs, ids[a], ids[b]);
           }
+        }
+      }
+
+      if (objectAware && !matchAllPairs && ids.length >= 3) {
+        const maxExtraPairs = Math.min(60, Math.max(6, ids.length * 2));
+        let addedExtra = 0;
+        for (const idA of ids) {
+          if (addedExtra >= maxExtraPairs) break;
+          const scored = [];
+          const ia = idOrder.get(idA) ?? 0;
+          for (const idB of ids) {
+            if (idA === idB) continue;
+            const key = makePairKey(idA, idB);
+            if (pairKeys.has(key)) continue;
+            const ib = idOrder.get(idB) ?? 0;
+            if (Math.abs(ia - ib) <= windowW) continue;
+            const score = getObjectPairScore(idA, idB);
+            if (score < 0.62) continue;
+            scored.push([idB, score]);
+          }
+          scored.sort((a, b) => b[1] - a[1]);
+          let used = 0;
+          for (const [idB] of scored) {
+            if (used >= 1 || addedExtra >= maxExtraPairs) break;
+            if (addUniquePair(initialPairs, idA, idB)) {
+              used++;
+              addedExtra++;
+            }
+          }
+        }
+        if (addedExtra > 0) {
+          postMessage({
+            type:'progress',
+            stage:'matching',
+            percent:0,
+            info:`Object-aware pairing added ${addedExtra} candidate pair(s).`,
+          });
         }
       }
 
@@ -663,6 +731,9 @@ self.addEventListener('message', async (ev) => {
         const descColsJ = imgJ.descCols || 32;
         const numI = imgI.descriptors.length / descColsI;
         const numJ = imgJ.descriptors.length / descColsJ;
+        const objectScore = clampScalar(params.objectScore || 0, 0, 1);
+        const effectiveRatio = params.ratio;
+        const effectiveRansacThresh = params.ransacThreshPx;
         const minInliersForPair = Math.max(4, Math.round(params.minInliers));
         if (numI < 4 || numJ < 4) return null;
 
@@ -682,7 +753,7 @@ self.addEventListener('message', async (ev) => {
             if (match.size() < 2) continue;
             const m1 = match.get(0);
             const m2 = match.get(1);
-            if (m1.distance < params.ratio * m2.distance) {
+            if (m1.distance < effectiveRatio * m2.distance) {
               const qi = m1.queryIdx;
               const ti = m1.trainIdx;
               if (qi < numI && ti < numJ) {
@@ -699,7 +770,7 @@ self.addEventListener('message', async (ev) => {
             if (match.size() < 2) continue;
             const m1 = match.get(0);
             const m2 = match.get(1);
-            if (m1.distance < params.ratio * m2.distance) {
+            if (m1.distance < effectiveRatio * m2.distance) {
               revBest.set(m1.queryIdx, m1.trainIdx);
             }
           }
@@ -734,7 +805,7 @@ self.addEventListener('message', async (ev) => {
             srcPts = cv.matFromArray(fitPtsI.length / 2, 1, cv.CV_32FC2, new Float32Array(fitPtsI));
             dstPts = cv.matFromArray(fitPtsJ.length / 2, 1, cv.CV_32FC2, new Float32Array(fitPtsJ));
             inlierMask = new cv.Mat();
-            H = cv.findHomography(srcPts, dstPts, cv.RANSAC, params.ransacThreshPx, inlierMask);
+            H = cv.findHomography(srcPts, dstPts, cv.RANSAC, effectiveRansacThresh, inlierMask);
             if (!H || H.rows !== 3 || H.cols !== 3) return null;
 
             const hd = H.data64F;
@@ -755,13 +826,13 @@ self.addEventListener('message', async (ev) => {
               reproj2[k] = (px - xj) ** 2 + (py - yj) ** 2;
             }
 
-            const sigmaMax = params.ransacThreshPx * 3;
+            const sigmaMax = effectiveRansacThresh * 3;
             const sigmaMax2 = sigmaMax * sigmaMax;
             let magsacInlierCount = 0;
             const inliers = [];
             const inlierPtsI = [];
             const inlierPtsJ = [];
-            const softInlierThresh2 = params.ransacThreshPx * params.ransacThreshPx * 4;
+            const softInlierThresh2 = effectiveRansacThresh * effectiveRansacThresh * 4;
             for (let k = 0; k < nPts; k++) {
               const u = reproj2[k] / sigmaMax2;
               if (u >= 1.0) continue;
@@ -845,6 +916,7 @@ self.addEventListener('message', async (ev) => {
               rms,
               inlierCount: magsacInlierCount,
               isDuplicate,
+              objectScore,
             };
           } finally {
             if (srcPts) srcPts.delete();
@@ -871,7 +943,11 @@ self.addEventListener('message', async (ev) => {
         let added = 0;
         for (const [idI, idJ] of pairBatch) {
           postMatchingProgress(`${donePairs}/${totalPairs} ${label}: ${idI} ↔ ${idJ}`);
-          const edge = tryMatchPair(idI, idJ, params);
+          const edge = tryMatchPair(idI, idJ, {
+            ...params,
+            objectAware,
+            objectScore: getObjectPairScore(idI, idJ),
+          });
           if (edge) {
             edges.push(edge);
             added++;
@@ -995,7 +1071,8 @@ self.addEventListener('message', async (ev) => {
         inliersBuffer: e.inliersBuf.buffer,
         rms: e.rms,
         inlierCount: e.inlierCount,
-        isDuplicate: e.isDuplicate || false
+        isDuplicate: e.isDuplicate || false,
+        objectScore: e.objectScore || 0,
       }));
       postMessage({type:'edges', edges: edgeMessages, duplicatePairs});
       return;
@@ -1009,8 +1086,12 @@ self.addEventListener('message', async (ev) => {
 
     if (msg.type === 'buildMST') {
       const ids = Object.keys(images);
+      const requestedKeyImageId = msg.keyImageId;
       if (edges.length === 0 || ids.length < 2) {
-        postMessage({type:'mst', refId: ids[0] || null, order: ids, parent: {}});
+        refId = (requestedKeyImageId && ids.includes(requestedKeyImageId))
+          ? requestedKeyImageId
+          : (ids[0] || null);
+        postMessage({type:'mst', refId, order: ids, parent: {}});
         return;
       }
 
@@ -1023,7 +1104,8 @@ self.addEventListener('message', async (ev) => {
       const degree = {};
       for (const id of ids) { weightSum[id] = 0; degree[id] = 0; }
       for (const e of edges) {
-        const w = e.inlierCount / (e.rms + 0.1);
+        const objectBoost = 1 + clampScalar(e.objectScore || 0, 0, 1) * 0.12;
+        const w = (e.inlierCount / (e.rms + 0.1)) * objectBoost;
         weightSum[e.i] = (weightSum[e.i] || 0) + w;
         weightSum[e.j] = (weightSum[e.j] || 0) + w;
         degree[e.i] = (degree[e.i] || 0) + 1;
@@ -1032,16 +1114,20 @@ self.addEventListener('message', async (ev) => {
       // Centrality bonus: prefer images connected to many others.
       // The combined score: weightSum * sqrt(degree) penalizes leaf nodes
       // and promotes images with many high-quality connections.
-      refId = ids.reduce((a, b) => {
-        const scoreA = (weightSum[a] || 0) * Math.sqrt(degree[a] || 1);
-        const scoreB = (weightSum[b] || 0) * Math.sqrt(degree[b] || 1);
-        return scoreA >= scoreB ? a : b;
-      });
+      if (requestedKeyImageId && ids.includes(requestedKeyImageId)) {
+        refId = requestedKeyImageId;
+      } else {
+        refId = ids.reduce((a, b) => {
+          const scoreA = (weightSum[a] || 0) * Math.sqrt(degree[a] || 1);
+          const scoreB = (weightSum[b] || 0) * Math.sqrt(degree[b] || 1);
+          return scoreA >= scoreB ? a : b;
+        });
+      }
 
       // Maximum spanning tree (Kruskal-like, descending edge weight)
       const sortedEdges = [...edges].sort((a, b) => {
-        const wa = a.inlierCount / (a.rms + 0.1);
-        const wb = b.inlierCount / (b.rms + 0.1);
+        const wa = (a.inlierCount / (a.rms + 0.1)) * (1 + clampScalar(a.objectScore || 0, 0, 1) * 0.12);
+        const wb = (b.inlierCount / (b.rms + 0.1)) * (1 + clampScalar(b.objectScore || 0, 0, 1) * 0.12);
         return wb - wa;
       });
 
@@ -2603,6 +2689,196 @@ function computeInlierSpread(pointsI, pointsJ, wI, hI, wJ, hJ) {
     minBBoxCoverage: Math.min(sI.bboxCoverage, sJ.bboxCoverage),
     minCellCoverage: Math.min(sI.cellCoverage, sJ.cellCoverage),
   };
+}
+
+function detectObjectProposals(gray, rgbSmall, width, height) {
+  if (!gray || !width || !height || width < 8 || height < 8) return [];
+
+  const maxDim = 160;
+  const scale = Math.min(1, maxDim / Math.max(width, height));
+  const w = Math.max(24, Math.round(width * scale));
+  const h = Math.max(24, Math.round(height * scale));
+  const n = w * h;
+  const graySmall = new Uint8Array(n);
+  const chromaSmall = new Float32Array(n);
+  const grad = new Float32Array(n);
+  const stepX = width / w;
+  const stepY = height / h;
+  const hasRgb = !!rgbSmall && rgbSmall.length >= width * height * 3;
+
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(height - 1, Math.floor((y + 0.5) * stepY));
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(width - 1, Math.floor((x + 0.5) * stepX));
+      const si = sy * width + sx;
+      const di = y * w + x;
+      graySmall[di] = gray[si];
+      if (hasRgb) {
+        const ro = si * 3;
+        const r = rgbSmall[ro];
+        const g = rgbSmall[ro + 1];
+        const b = rgbSmall[ro + 2];
+        const maxc = Math.max(r, g, b);
+        const minc = Math.min(r, g, b);
+        chromaSmall[di] = (maxc - minc) / 255;
+      }
+    }
+  }
+
+  let gradMax = 0;
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const idx = row + x;
+      const gx = graySmall[idx + 1] - graySmall[idx - 1];
+      const gy = graySmall[idx + w] - graySmall[idx - w];
+      const mag = Math.sqrt(gx * gx + gy * gy) / 255;
+      grad[idx] = mag;
+      if (mag > gradMax) gradMax = mag;
+    }
+  }
+  if (gradMax > 1e-6) {
+    const inv = 1 / gradMax;
+    for (let i = 0; i < grad.length; i++) grad[i] *= inv;
+  }
+
+  const score = new Float32Array(n);
+  let mean = 0;
+  let mean2 = 0;
+  for (let i = 0; i < n; i++) {
+    const v = 0.67 * grad[i] + 0.33 * chromaSmall[i];
+    score[i] = v;
+    mean += v;
+    mean2 += v * v;
+  }
+  mean /= n;
+  mean2 /= n;
+  const variance = Math.max(0, mean2 - mean * mean);
+  const std = Math.sqrt(variance);
+  const threshold = clampScalar(mean + 0.6 * std, 0.10, 0.55);
+
+  const mask = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    mask[i] = score[i] >= threshold ? 1 : 0;
+  }
+
+  const smooth = new Uint8Array(mask);
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const idx = row + x;
+      let neighbours = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const r = (y + dy) * w;
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          neighbours += mask[r + x + dx];
+        }
+      }
+      if (!mask[idx] && neighbours >= 6) smooth[idx] = 1;
+      else if (mask[idx] && neighbours <= 1) smooth[idx] = 0;
+    }
+  }
+
+  const visited = new Uint8Array(n);
+  const queue = new Int32Array(n);
+  const proposals = [];
+  const minArea = Math.max(18, Math.round(n * 0.003));
+  const maxArea = Math.round(n * 0.55);
+
+  for (let i = 0; i < n; i++) {
+    if (!smooth[i] || visited[i]) continue;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = i;
+    visited[i] = 1;
+    let area = 0;
+    let minX = w;
+    let minY = h;
+    let maxX = 0;
+    let maxY = 0;
+    let sumGray = 0;
+    let sumChroma = 0;
+    let sumGrad = 0;
+
+    while (head < tail) {
+      const idx = queue[head++];
+      const y = Math.floor(idx / w);
+      const x = idx - y * w;
+      area++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      sumGray += graySmall[idx];
+      sumChroma += chromaSmall[idx];
+      sumGrad += grad[idx];
+
+      const left = idx - 1;
+      const right = idx + 1;
+      const up = idx - w;
+      const down = idx + w;
+      if (x > 0 && smooth[left] && !visited[left]) { visited[left] = 1; queue[tail++] = left; }
+      if (x + 1 < w && smooth[right] && !visited[right]) { visited[right] = 1; queue[tail++] = right; }
+      if (y > 0 && smooth[up] && !visited[up]) { visited[up] = 1; queue[tail++] = up; }
+      if (y + 1 < h && smooth[down] && !visited[down]) { visited[down] = 1; queue[tail++] = down; }
+    }
+
+    if (area < minArea || area > maxArea) continue;
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+    if (bw < 3 || bh < 3) continue;
+    const bboxArea = Math.max(1, bw * bh);
+    proposals.push({
+      cx: (minX + maxX + 1) / (2 * w),
+      cy: (minY + maxY + 1) / (2 * h),
+      areaRatio: area / n,
+      aspect: bw / Math.max(1, bh),
+      luma: (sumGray / Math.max(1, area)) / 255,
+      chroma: sumChroma / Math.max(1, area),
+      edge: sumGrad / Math.max(1, area),
+      compactness: area / bboxArea,
+    });
+  }
+
+  proposals.sort((a, b) => b.areaRatio - a.areaRatio);
+  return proposals.slice(0, 10);
+}
+
+function objectDescriptorDistance(a, b) {
+  const areaTerm = Math.abs(Math.log((a.areaRatio + 1e-4) / (b.areaRatio + 1e-4)));
+  const aspectTerm = Math.abs(Math.log((a.aspect + 1e-3) / (b.aspect + 1e-3)));
+  const lumaTerm = Math.abs(a.luma - b.luma) / 0.35;
+  const chromaTerm = Math.abs(a.chroma - b.chroma) / 0.35;
+  const edgeTerm = Math.abs(a.edge - b.edge) / 0.35;
+  const compactTerm = Math.abs(a.compactness - b.compactness) / 0.45;
+  const posTerm = Math.hypot(a.cx - b.cx, a.cy - b.cy) * 0.35;
+  return areaTerm * 1.2 + aspectTerm * 0.7 + lumaTerm + chromaTerm + edgeTerm * 0.8 + compactTerm * 0.6 + posTerm;
+}
+
+function computeObjectPairSimilarity(objectsA, objectsB) {
+  if (!objectsA || !objectsB || objectsA.length === 0 || objectsB.length === 0) return 0;
+
+  const directional = (src, dst) => {
+    let weighted = 0;
+    let wsum = 0;
+    for (const a of src) {
+      let best = 0;
+      for (const b of dst) {
+        const sim = Math.exp(-objectDescriptorDistance(a, b));
+        if (sim > best) best = sim;
+      }
+      const w = Math.sqrt(Math.max(1e-4, a.areaRatio));
+      weighted += best * w;
+      wsum += w;
+    }
+    return wsum > 0 ? weighted / wsum : 0;
+  };
+
+  const fwd = directional(objectsA, objectsB);
+  const rev = directional(objectsB, objectsA);
+  const countScore = 1 - Math.abs(objectsA.length - objectsB.length) / Math.max(objectsA.length, objectsB.length);
+  return clampScalar(0.55 * ((fwd + rev) * 0.5) + 0.45 * countScore, 0, 1);
 }
 
 function analyzeConnectivity(ids, edges) {

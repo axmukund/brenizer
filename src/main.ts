@@ -299,6 +299,32 @@ function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
 }
 
+function forceKeyImageFirst(order: string[], keyImageId: string | null): string[] {
+  if (!keyImageId) return order;
+  const idx = order.indexOf(keyImageId);
+  if (idx <= 0) return order;
+  return [keyImageId, ...order.slice(0, idx), ...order.slice(idx + 1)];
+}
+
+function enforceKeyForegroundMask(
+  mask: Uint8Array,
+  keyCoverageMask: Uint8Array | null,
+  keyImageId: string | null,
+  currentImageId: string,
+  compPixels: Uint8Array,
+  newPixels: Uint8Array,
+): void {
+  if (!keyCoverageMask || !keyImageId || currentImageId === keyImageId) return;
+  const n = mask.length;
+  for (let px = 0; px < n; px++) {
+    if (keyCoverageMask[px] < 10) continue;
+    const off = px * 4;
+    if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
+      mask[px] = 0;
+    }
+  }
+}
+
 function applyPreviewEditorTransform(): void {
   const transform = `translate(${editorPanX.toFixed(1)}px, ${editorPanY.toFixed(1)}px) scale(${editorZoom.toFixed(3)}) rotate(${editorRotationDeg.toFixed(2)}deg)`;
   const canvas = document.getElementById('preview-canvas') as HTMLCanvasElement | null;
@@ -1028,6 +1054,10 @@ async function renderWarpedPreview(
   const vignettes = getLastVignette();
   const { settings } = getState();
   const refId = getLastRefId();
+  const selectedKeyImageId = getState().keyImageId;
+  const keyImageId = selectedKeyImageId && images.some((img) => img.id === selectedKeyImageId)
+    ? selectedKeyImageId
+    : null;
   const wm = getWorkerManager();
   const mstParent = getLastMstParent();
 
@@ -1195,7 +1225,7 @@ async function renderWarpedPreview(
   // best edge quality (highest inlier count / lowest RMS) to already-composited
   // images. This ensures high-confidence pairs blend first, producing a
   // better foundation for subsequent incremental additions.
-  const mstOrder = (() => {
+  let mstOrder = (() => {
     const baseOrder: string[] = getLastMstOrder();
     const order = baseOrder.length > 0
       ? baseOrder.filter(id => connectedIds.has(id))
@@ -1210,12 +1240,12 @@ async function renderWarpedPreview(
     if (order.length <= 2) return order;
 
     // Build edge quality index: for each pair, store best inlier count and RMS
-    const edgeQuality = new Map<string, { inlierCount: number; rms: number }>();
+    const edgeQuality = new Map<string, { inlierCount: number; rms: number; objectScore: number }>();
     const allEdges = getLastEdges();
     for (const e of allEdges) {
       const key1 = `${e.i}|${e.j}`;
       const key2 = `${e.j}|${e.i}`;
-      const q = { inlierCount: e.inlierCount, rms: e.rms };
+      const q = { inlierCount: e.inlierCount, rms: e.rms, objectScore: e.objectScore ?? 0 };
       edgeQuality.set(key1, q);
       edgeQuality.set(key2, q);
     }
@@ -1237,7 +1267,7 @@ async function renderWarpedPreview(
         for (const pid of placed) {
           const q = edgeQuality.get(`${pid}|${cand}`);
           if (q) {
-            const score = q.inlierCount / (q.rms + 1);
+            const score = (q.inlierCount / (q.rms + 1)) * (1 + q.objectScore * 0.35);
             candScore = Math.max(candScore, score);
           }
         }
@@ -1265,6 +1295,7 @@ async function renderWarpedPreview(
 
     return result;
   })();
+  mstOrder = forceKeyImageFirst(mstOrder, keyImageId);
 
   const blockSize = settings?.seamBlockSize ?? 16;
   const featherWidth = settings?.featherWidth ?? 60;
@@ -1366,6 +1397,7 @@ async function renderWarpedPreview(
   // Pre-allocate readback buffers for compositing (reused each iteration)
   const _compPixels = new Uint8Array(compW * compH * 4);
   const _newPixels = new Uint8Array(compW * compH * 4);
+  let keyCoverageMask: Uint8Array | null = null;
   const saliencyMaps = getLastSaliency();
   const imageById = new Map(images.map((img) => [img.id, img]));
 
@@ -1461,6 +1493,17 @@ async function renderWarpedPreview(
     warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, vigA, vigB, needsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
+
+    if (imgId === keyImageId && !keyCoverageMask) {
+      const keyPixels = _newPixels;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+      gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, keyPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      keyCoverageMask = new Uint8Array(compW * compH);
+      for (let px = 0; px < compW * compH; px++) {
+        keyCoverageMask[px] = keyPixels[px * 4 + 3];
+      }
+    }
 
     if (imgIdx === 0) {
       // First image: copy directly to composite
@@ -1704,6 +1747,8 @@ async function renderWarpedPreview(
         }
       }
 
+      enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
+
       // Upload mask as texture
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
@@ -1759,6 +1804,7 @@ async function renderWarpedPreview(
           feathered[px] = 255;
         }
       }
+      enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
       if (useMultiband) {
@@ -2108,6 +2154,10 @@ async function exportComposite(): Promise<void> {
   const gains = getLastGains();
   const meshes = getLastMeshes();
   const refId = getLastRefId();
+  const selectedKeyImageId = getState().keyImageId;
+  const keyImageId = selectedKeyImageId && active.some((img) => img.id === selectedKeyImageId)
+    ? selectedKeyImageId
+    : null;
 
   if (active.length === 0 || transforms.size === 0 || !settings) {
     setStatus('Nothing to export. Run Stitch Preview first.');
@@ -2246,13 +2296,14 @@ async function exportComposite(): Promise<void> {
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  const mstOrder = (() => {
+  let mstOrder = (() => {
     const order = getLastMstOrder();
     if (order.length > 0) return order.filter(id => connectedIds.has(id));
     const ids = active.map(i => i.id).filter(id => connectedIds.has(id));
     if (refId && ids.includes(refId)) return [refId, ...ids.filter(id => id !== refId)];
     return ids;
   })();
+  mstOrder = forceKeyImageFirst(mstOrder, keyImageId);
 
   const blockSize = settings.seamBlockSize;
   const featherWidth = settings.featherWidth;
@@ -2351,6 +2402,7 @@ async function exportComposite(): Promise<void> {
   const exportSaliencyMaps = getLastSaliency();
   const _expCompPixels = useGraphCutForExport ? new Uint8Array(outW * outH * 4) : null;
   const _expNewPixels = new Uint8Array(outW * outH * 4);
+  let keyCoverageMask: Uint8Array | null = null;
   const exportFeatherWidth = Math.max(1, Math.round(featherWidth * compositeScale));
 
   const blendWithMask = (maskPixels: Uint8Array): void => {
@@ -2365,10 +2417,22 @@ async function exportComposite(): Promise<void> {
     [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
   };
 
-  const blendFeatherFromNewPixels = (newPixels: Uint8Array): void => {
+  const blendFeatherFromNewPixels = (
+    currentImageId: string,
+    newPixels: Uint8Array,
+    compPixels: Uint8Array | null,
+  ): void => {
     const alphaMask = new Uint8Array(outW * outH);
     for (let i = 0; i < outW * outH; i++) alphaMask[i] = newPixels[i * 4 + 3];
     const feathered = featherMask(alphaMask, outW, outH, exportFeatherWidth);
+    let comp = compPixels;
+    if (!comp) {
+      comp = new Uint8Array(outW * outH * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
+      gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, comp);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+    enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, currentImageId, comp, newPixels);
     blendWithMask(feathered);
   };
 
@@ -2482,6 +2546,17 @@ async function exportComposite(): Promise<void> {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 
+    if (imgId === keyImageId && !keyCoverageMask) {
+      const keyPixels = _expNewPixels;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+      gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, keyPixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      keyCoverageMask = new Uint8Array(outW * outH);
+      for (let px = 0; px < outW * outH; px++) {
+        keyCoverageMask[px] = keyPixels[px * 4 + 3];
+      }
+    }
+
     if (imgIdx === 0) {
       // First image — just copy
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, newImageFBO.fbo);
@@ -2533,6 +2608,7 @@ async function exportComposite(): Promise<void> {
         const blockLabels = new Uint8Array(seamResult.labelsBuffer);
         const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, seamBlockSize, outW, outH);
         const feathered = featherMask(pixelMask, outW, outH, exportFeatherWidth);
+        enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
         blendWithMask(feathered);
       } catch (err) {
         if (err instanceof ExportSeamTimeoutError) {
@@ -2542,7 +2618,7 @@ async function exportComposite(): Promise<void> {
           console.warn(`Export seam solve failed for ${imgId}; falling back to feather blend.`, err);
           setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam failed, using feather fallback`);
         }
-        blendFeatherFromNewPixels(newPixels);
+        blendFeatherFromNewPixels(imgId, newPixels, compPixels);
       }
     } else {
       // Feather-only fallback — reuse pre-allocated buffer
@@ -2551,7 +2627,7 @@ async function exportComposite(): Promise<void> {
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      blendFeatherFromNewPixels(newPixels);
+      blendFeatherFromNewPixels(imgId, newPixels, null);
     }
 
     imgIdx++;
