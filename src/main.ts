@@ -299,6 +299,140 @@ function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
 }
 
+function computeTriangleDoubleArea(
+  ax: number, ay: number,
+  bx: number, by: number,
+  cx: number, cy: number,
+): number {
+  return Math.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay));
+}
+
+function meshSanityReport(
+  mesh: import('./gl').MeshData,
+  outW: number,
+  outH: number,
+): { tooDistorted: boolean; offscreenFraction: number; extremeTriangleFraction: number } {
+  const pos = mesh.positions;
+  const idx = mesh.indices;
+  if (!pos || pos.length < 6 || !idx || idx.length < 3) {
+    return { tooDistorted: false, offscreenFraction: 0, extremeTriangleFraction: 0 };
+  }
+
+  const guardExtent = Math.max(outW, outH) * 0.75;
+  let offscreenCount = 0;
+  let vertexCount = 0;
+  for (let i = 0; i < pos.length; i += 2) {
+    const x = pos[i];
+    const y = pos[i + 1];
+    if (!Number.isFinite(x) || !Number.isFinite(y)
+      || x < -guardExtent || x > outW + guardExtent
+      || y < -guardExtent || y > outH + guardExtent) {
+      offscreenCount++;
+    }
+    vertexCount++;
+  }
+  const offscreenFraction = vertexCount > 0 ? offscreenCount / vertexCount : 0;
+
+  const areas: number[] = [];
+  for (let i = 0; i < idx.length; i += 3) {
+    const ia = idx[i] * 2;
+    const ib = idx[i + 1] * 2;
+    const ic = idx[i + 2] * 2;
+    if (ic + 1 >= pos.length) continue;
+    const area2 = computeTriangleDoubleArea(
+      pos[ia], pos[ia + 1],
+      pos[ib], pos[ib + 1],
+      pos[ic], pos[ic + 1],
+    );
+    if (Number.isFinite(area2) && area2 > 1e-3) {
+      areas.push(area2);
+    }
+  }
+  if (areas.length < 6) {
+    return { tooDistorted: offscreenFraction > 0.45, offscreenFraction, extremeTriangleFraction: 0 };
+  }
+  const sorted = [...areas].sort((a, b) => a - b);
+  const med = sorted[Math.floor(sorted.length / 2)];
+  const lo = med / 80;
+  const hi = med * 80;
+  let extreme = 0;
+  for (const a of areas) {
+    if (a < lo || a > hi) extreme++;
+  }
+  const extremeTriangleFraction = extreme / areas.length;
+  const tooDistorted = offscreenFraction > 0.50 || extremeTriangleFraction > 0.60;
+  return { tooDistorted, offscreenFraction, extremeTriangleFraction };
+}
+
+function clampMeshPositions(
+  mesh: import('./gl').MeshData,
+  outW: number,
+  outH: number,
+): void {
+  const pos = mesh.positions;
+  const guardExtent = Math.max(outW, outH) * 0.75;
+  const minX = -guardExtent;
+  const maxX = outW + guardExtent;
+  const minY = -guardExtent;
+  const maxY = outH + guardExtent;
+  for (let i = 0; i < pos.length; i += 2) {
+    let x = pos[i];
+    let y = pos[i + 1];
+    if (!Number.isFinite(x)) x = 0;
+    if (!Number.isFinite(y)) y = 0;
+    pos[i] = Math.max(minX, Math.min(maxX, x));
+    pos[i + 1] = Math.max(minY, Math.min(maxY, y));
+  }
+}
+
+function buildGlobalWarpMesh(
+  alignW: number,
+  alignH: number,
+  gridN: number,
+  T: Float64Array,
+  minX: number,
+  minY: number,
+  compositeScale: number,
+  outW: number,
+  outH: number,
+): import('./gl').MeshData {
+  const baseMesh = createIdentityMesh(alignW, alignH, gridN, gridN);
+  const warpedPositions = new Float32Array(baseMesh.positions.length);
+  const affineDen = Math.abs(T[8]) > 1e-8 ? T[8] : 1;
+  const guardExtent = Math.max(outW, outH) * 0.75;
+  const clampXMin = -guardExtent;
+  const clampXMax = outW + guardExtent;
+  const clampYMin = -guardExtent;
+  const clampYMax = outH + guardExtent;
+
+  for (let i = 0; i < baseMesh.positions.length; i += 2) {
+    const x = baseMesh.positions[i];
+    const y = baseMesh.positions[i + 1];
+
+    let gx: number;
+    let gy: number;
+    const denom = T[6] * x + T[7] * y + T[8];
+    if (denom > 1e-4) {
+      gx = (T[0] * x + T[1] * y + T[2]) / denom;
+      gy = (T[3] * x + T[4] * y + T[5]) / denom;
+    } else {
+      // Perspective denominator became unstable; fall back to affine prediction.
+      gx = (T[0] * x + T[1] * y + T[2]) / affineDen;
+      gy = (T[3] * x + T[4] * y + T[5]) / affineDen;
+    }
+
+    let px = (gx - minX) * compositeScale;
+    let py = (gy - minY) * compositeScale;
+    if (!Number.isFinite(px)) px = 0;
+    if (!Number.isFinite(py)) py = 0;
+    warpedPositions[i] = Math.max(clampXMin, Math.min(clampXMax, px));
+    warpedPositions[i + 1] = Math.max(clampYMin, Math.min(clampYMax, py));
+  }
+
+  baseMesh.positions = warpedPositions;
+  return baseMesh;
+}
+
 function forceKeyImageFirst(order: string[], keyImageId: string | null): string[] {
   if (!keyImageId) return order;
   const idx = order.indexOf(keyImageId);
@@ -1240,12 +1374,17 @@ async function renderWarpedPreview(
     if (order.length <= 2) return order;
 
     // Build edge quality index: for each pair, store best inlier count and RMS
-    const edgeQuality = new Map<string, { inlierCount: number; rms: number; objectScore: number }>();
+    const edgeQuality = new Map<string, { inlierCount: number; rms: number; objectScore: number; exifScore: number }>();
     const allEdges = getLastEdges();
     for (const e of allEdges) {
       const key1 = `${e.i}|${e.j}`;
       const key2 = `${e.j}|${e.i}`;
-      const q = { inlierCount: e.inlierCount, rms: e.rms, objectScore: e.objectScore ?? 0 };
+      const q = {
+        inlierCount: e.inlierCount,
+        rms: e.rms,
+        objectScore: e.objectScore ?? 0,
+        exifScore: e.exifScore ?? 0,
+      };
       edgeQuality.set(key1, q);
       edgeQuality.set(key2, q);
     }
@@ -1267,7 +1406,7 @@ async function renderWarpedPreview(
         for (const pid of placed) {
           const q = edgeQuality.get(`${pid}|${cand}`);
           if (q) {
-            const score = (q.inlierCount / (q.rms + 1)) * (1 + q.objectScore * 0.35);
+            const score = (q.inlierCount / (q.rms + 1)) * (1 + q.objectScore * 0.35 + q.exifScore * 0.04);
             candScore = Math.max(candScore, score);
           }
         }
@@ -1416,36 +1555,54 @@ async function renderWarpedPreview(
       ? [safeGainVal(gainObj.gainR), safeGainVal(gainObj.gainG), safeGainVal(gainObj.gainB)]
       : [1.0, 1.0, 1.0];
 
-    // Build warped mesh (APAP if available, else global transform)
+    // Build warped mesh with sanity fallback to avoid extreme geometric distortion.
     let mesh: import('./gl').MeshData;
+    let globalMesh: import('./gl').MeshData | null = null;
+    const ensureGlobalMesh = (): import('./gl').MeshData => {
+      if (!globalMesh) {
+        globalMesh = buildGlobalWarpMesh(
+          alignW, alignH, gridN, T, minX, minY, compositeScale, compW, compH,
+        );
+      }
+      return globalMesh;
+    };
     const apap = meshes.get(imgId);
     if (apap) {
-      // Use APAP mesh (already in global coords), offset by -minX, -minY and scale
+      // Use APAP mesh (already in global coords), offset by -minX, -minY and scale.
       const warpedPos = new Float32Array(apap.vertices.length);
       for (let i = 0; i < apap.vertices.length; i += 2) {
         warpedPos[i] = (apap.vertices[i] - minX) * compositeScale;
         warpedPos[i + 1] = (apap.vertices[i + 1] - minY) * compositeScale;
       }
-      mesh = { positions: warpedPos, uvs: new Float32Array(apap.uvs), indices: new Uint32Array(apap.indices) };
-    } else {
-      // Global homography mesh — use dense grid and clamp vertices behind camera
-      const baseMesh = createIdentityMesh(alignW, alignH, gridN, gridN);
-      const warpedPositions = new Float32Array(baseMesh.positions.length);
-      for (let i = 0; i < baseMesh.positions.length; i += 2) {
-        const x = baseMesh.positions[i];
-        const y = baseMesh.positions[i + 1];
-        const denom = T[6] * x + T[7] * y + T[8];
-        if (denom < 1e-4) {
-          // Behind camera or near-singular — clamp to nearest valid position
-          warpedPositions[i] = 0;
-          warpedPositions[i + 1] = 0;
-        } else {
-          warpedPositions[i] = ((T[0] * x + T[1] * y + T[2]) / denom - minX) * compositeScale;
-          warpedPositions[i + 1] = ((T[3] * x + T[4] * y + T[5]) / denom - minY) * compositeScale;
-        }
+      const apapMesh: import('./gl').MeshData = {
+        positions: warpedPos,
+        uvs: new Float32Array(apap.uvs),
+        indices: new Uint32Array(apap.indices),
+      };
+      const apapSanity = meshSanityReport(apapMesh, compW, compH);
+      if (apapSanity.tooDistorted) {
+        console.warn(
+          `APAP mesh sanity fallback for ${imgId}: offscreen=${(apapSanity.offscreenFraction * 100).toFixed(1)}% ` +
+          `extreme=${(apapSanity.extremeTriangleFraction * 100).toFixed(1)}%`,
+        );
+        mesh = ensureGlobalMesh();
+      } else {
+        mesh = apapMesh;
       }
-      baseMesh.positions = warpedPositions;
-      mesh = baseMesh;
+    } else {
+      mesh = ensureGlobalMesh();
+    }
+
+    const meshSanity = meshSanityReport(mesh, compW, compH);
+    if (meshSanity.tooDistorted) {
+      clampMeshPositions(mesh, compW, compH);
+      const clampedSanity = meshSanityReport(mesh, compW, compH);
+      if (clampedSanity.tooDistorted) {
+        console.warn(
+          `Mesh remained distorted after clamping for ${imgId}: offscreen=${(clampedSanity.offscreenFraction * 100).toFixed(1)}% ` +
+          `extreme=${(clampedSanity.extremeTriangleFraction * 100).toFixed(1)}%`,
+        );
+      }
     }
 
     // Track a simple footprint polygon (AABB in composite-space) for hover highlighting.
@@ -2484,8 +2641,17 @@ async function exportComposite(): Promise<void> {
       ? [safeGainVal(gainObj.gainR), safeGainVal(gainObj.gainG), safeGainVal(gainObj.gainB)]
       : [1.0, 1.0, 1.0];
 
-    // Build warped mesh
+    // Build warped mesh with sanity fallback to avoid severe export distortion.
     let mesh: import('./gl').MeshData;
+    let globalMesh: import('./gl').MeshData | null = null;
+    const ensureGlobalMesh = (): import('./gl').MeshData => {
+      if (!globalMesh) {
+        globalMesh = buildGlobalWarpMesh(
+          alignW, alignH, gridN, T, minX, minY, compositeScale, outW, outH,
+        );
+      }
+      return globalMesh;
+    };
     const apap = meshes.get(imgId);
     if (apap) {
       const warpedPos = new Float32Array(apap.vertices.length);
@@ -2493,23 +2659,35 @@ async function exportComposite(): Promise<void> {
         warpedPos[i] = (apap.vertices[i] - minX) * compositeScale;
         warpedPos[i + 1] = (apap.vertices[i + 1] - minY) * compositeScale;
       }
-      mesh = { positions: warpedPos, uvs: new Float32Array(apap.uvs), indices: new Uint32Array(apap.indices) };
-    } else {
-      const baseMesh = createIdentityMesh(alignW, alignH, gridN, gridN);
-      const warpedPositions = new Float32Array(baseMesh.positions.length);
-      for (let i = 0; i < baseMesh.positions.length; i += 2) {
-        const x = baseMesh.positions[i], y = baseMesh.positions[i + 1];
-        const denom = T[6] * x + T[7] * y + T[8];
-        if (denom < 1e-4) {
-          warpedPositions[i] = 0;
-          warpedPositions[i + 1] = 0;
-        } else {
-          warpedPositions[i] = ((T[0] * x + T[1] * y + T[2]) / denom - minX) * compositeScale;
-          warpedPositions[i + 1] = ((T[3] * x + T[4] * y + T[5]) / denom - minY) * compositeScale;
-        }
+      const apapMesh: import('./gl').MeshData = {
+        positions: warpedPos,
+        uvs: new Float32Array(apap.uvs),
+        indices: new Uint32Array(apap.indices),
+      };
+      const apapSanity = meshSanityReport(apapMesh, outW, outH);
+      if (apapSanity.tooDistorted) {
+        console.warn(
+          `Export APAP mesh sanity fallback for ${imgId}: offscreen=${(apapSanity.offscreenFraction * 100).toFixed(1)}% ` +
+          `extreme=${(apapSanity.extremeTriangleFraction * 100).toFixed(1)}%`,
+        );
+        mesh = ensureGlobalMesh();
+      } else {
+        mesh = apapMesh;
       }
-      baseMesh.positions = warpedPositions;
-      mesh = baseMesh;
+    } else {
+      mesh = ensureGlobalMesh();
+    }
+
+    const meshSanity = meshSanityReport(mesh, outW, outH);
+    if (meshSanity.tooDistorted) {
+      clampMeshPositions(mesh, outW, outH);
+      const clampedSanity = meshSanityReport(mesh, outW, outH);
+      if (clampedSanity.tooDistorted) {
+        console.warn(
+          `Export mesh remained distorted after clamping for ${imgId}: offscreen=${(clampedSanity.offscreenFraction * 100).toFixed(1)}% ` +
+          `extreme=${(clampedSanity.extremeTriangleFraction * 100).toFixed(1)}%`,
+        );
+      }
     }
 
     // Decode image — full original resolution for maxRes, alignment scale otherwise

@@ -60,6 +60,7 @@ export interface MatchEdge {
   inlierCount: number;
   isDuplicate: boolean;
   objectScore: number;
+  exifScore: number;
 }
 let lastEdges: MatchEdge[] = [];
 
@@ -477,6 +478,16 @@ async function prepareImagesForCV(
           rgbSmallBuffer: rgbBuf,
           width,
           height,
+          exif: img.exif
+            ? {
+                orientation: img.exif.orientation,
+                make: img.exif.make,
+                model: img.exif.model,
+                focalLengthMm: img.exif.focalLengthMm,
+                focalLength35mm: img.exif.focalLength35mm,
+                capturedAtMs: img.exif.capturedAtMs,
+              }
+            : undefined,
         },
         [buf, rgbBuf],
       );
@@ -1551,6 +1562,7 @@ export async function runStitchPreview(): Promise<void> {
     inlierCount: e.inlierCount,
     isDuplicate: e.isDuplicate || false,
     objectScore: e.objectScore ?? 0,
+    exifScore: e.exifScore ?? 0,
   }));
 
   // Handle near-duplicates: mark one image in each duplicate pair as excluded

@@ -2,6 +2,15 @@ import type { Capabilities } from './capabilities';
 import type { PipelineSettings, ModeName } from './presets';
 
 /** Represents a single loaded image. */
+export interface ImageExifMeta {
+  orientation: number;
+  make?: string;
+  model?: string;
+  focalLengthMm?: number;
+  focalLength35mm?: number;
+  capturedAtMs?: number;
+}
+
 export interface ImageEntry {
   id: string;
   file: File;
@@ -10,6 +19,7 @@ export interface ImageEntry {
   height: number;
   thumbUrl: string;
   excluded: boolean;
+  exif?: ImageExifMeta;
 }
 
 export interface AppState {

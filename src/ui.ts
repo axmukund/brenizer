@@ -1,6 +1,7 @@
 import { getState, setState, subscribe, type ImageEntry } from './appState';
 import { capsSummary, type Capabilities } from './capabilities';
 import { getPreset } from './presets';
+import { parseExifMetadata, normalizeImageBlobOrientation } from './exif';
 import heic2any from 'heic2any';
 import UTIF from 'utif';
 
@@ -110,10 +111,12 @@ async function importFiles(files: FileList | File[]): Promise<void> {
   const toAdd = arr.slice(0, maxImages - st.images.length);
   const newEntries: ImageEntry[] = [];
   let convertedCount = 0;
+  let exifCount = 0;
 
   for (const file of toAdd) {
     try {
       let sourceBlob: Blob | File = file;
+      const exif = await parseExifMetadata(file);
       
       // Try to convert HEIC/DNG files to JPEG
       const converted = await convertToJpeg(file);
@@ -121,12 +124,19 @@ async function importFiles(files: FileList | File[]): Promise<void> {
         sourceBlob = converted;
         convertedCount++;
       }
+
+      // Normalize to upright pixel orientation using EXIF orientation.
+      const normalizedBlob = await normalizeImageBlobOrientation(sourceBlob, exif.orientation);
+      if ((exif.orientation ?? 1) !== 1) exifCount++;
       
-      const bmp = await createImageBitmap(sourceBlob);
+      const bmp = await createImageBitmap(normalizedBlob);
       const thumbUrl = makeThumb(bmp, 96);
       
-      // Store original file for reference, but use converted blob if available
-      const storedFile = converted ? new File([converted], file.name.replace(/\.(heic|heif|dng)$/i, '.jpg'), { type: 'image/jpeg' }) : file;
+      // Store normalized file so all downstream stages operate in the same
+      // upright coordinate system regardless of EXIF orientation.
+      const normalizedName = file.name.replace(/\.(heic|heif|dng)$/i, '.jpg');
+      const normalizedType = normalizedBlob.type || 'image/jpeg';
+      const storedFile = new File([normalizedBlob], normalizedName, { type: normalizedType });
       
       newEntries.push({
         id: genId(),
@@ -136,6 +146,14 @@ async function importFiles(files: FileList | File[]): Promise<void> {
         height: bmp.height,
         thumbUrl,
         excluded: false,
+        exif: {
+          orientation: exif.orientation,
+          make: exif.make,
+          model: exif.model,
+          focalLengthMm: exif.focalLengthMm,
+          focalLength35mm: exif.focalLength35mm,
+          capturedAtMs: exif.capturedAtMs,
+        },
       });
       bmp.close();
     } catch (err) {
@@ -144,8 +162,11 @@ async function importFiles(files: FileList | File[]): Promise<void> {
   }
 
   setState({ images: [...st.images, ...newEntries] });
-  const msg = convertedCount > 0 
-    ? `${newEntries.length} image(s) added (${convertedCount} converted from HEIC/DNG).`
+  const details: string[] = [];
+  if (convertedCount > 0) details.push(`${convertedCount} converted from HEIC/DNG`);
+  if (exifCount > 0) details.push(`${exifCount} EXIF-oriented`);
+  const msg = details.length > 0
+    ? `${newEntries.length} image(s) added (${details.join(', ')}).`
     : `${newEntries.length} image(s) added.`;
   setStatus(msg);
 }

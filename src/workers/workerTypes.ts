@@ -70,6 +70,14 @@ export interface CVAddImageMsg {
   height: number;
   rgbSmallBuffer?: ArrayBuffer;
   depth?: ArrayBuffer;
+  exif?: {
+    orientation?: number;
+    make?: string;
+    model?: string;
+    focalLengthMm?: number;
+    focalLength35mm?: number;
+    capturedAtMs?: number;
+  };
 }
 
 export interface CVComputeFeaturesMsg {
@@ -189,6 +197,7 @@ export interface CVEdge {
   inlierCount: number;
   isDuplicate?: boolean;
   objectScore?: number;
+  exifScore?: number;
 }
 
 export interface CVEdgesMsg {

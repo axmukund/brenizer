@@ -17,7 +17,7 @@
  *
  * Messages accepted:
  *  - {type:'init', baseUrl, opencvPath}
- *  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?}
+ *  - {type:'addImage', imageId, grayBuffer, width, height, rgbSmallBuffer?, depth?, exif?}
  *  - {type:'computeFeatures', orbParams}
  *  - {type:'computeSaliency'}
  *  - {type:'matchGraph', windowW, ratio, ransacThreshPx, minInliers, matchAllPairs, objectAware?}
@@ -32,7 +32,7 @@
  *  - {type:'progress', stage, percent, info}
  *  - {type:'features', imageId, keypointsBuffer, descriptorsBuffer, descCols}
  *  - {type:'saliency', imageId, saliencyBuffer, width, height}
- *  - {type:'edges', edges: [...]}
+ *  - {type:'edges', edges: [...]}  // each edge may include objectScore/exifScore
  *  - {type:'transforms', refId, transforms: [...]}
  *  - {type:'exposure', gains: [...]}
  *  - {type:'vignetting', imageId, vignetteParams}
@@ -97,7 +97,7 @@ self.addEventListener('message', async (ev) => {
     }
 
     if (msg.type === 'addImage') {
-      const {imageId, grayBuffer, width, height, depth, rgbSmallBuffer} = msg;
+      const {imageId, grayBuffer, width, height, depth, rgbSmallBuffer, exif} = msg;
       const gray = new Uint8ClampedArray(grayBuffer);
       const rgbSmall = rgbSmallBuffer ? new Uint8ClampedArray(rgbSmallBuffer) : null;
       if (images[imageId]) {
@@ -113,6 +113,16 @@ self.addEventListener('message', async (ev) => {
         if (depth) {
           images[imageId].depth = new Uint16Array(depth);
         }
+        if (exif) {
+          images[imageId].exif = {
+            orientation: Number.isFinite(exif.orientation) ? Math.round(exif.orientation) : 1,
+            make: exif.make || '',
+            model: exif.model || '',
+            focalLengthMm: Number.isFinite(exif.focalLengthMm) ? exif.focalLengthMm : undefined,
+            focalLength35mm: Number.isFinite(exif.focalLength35mm) ? exif.focalLength35mm : undefined,
+            capturedAtMs: Number.isFinite(exif.capturedAtMs) ? exif.capturedAtMs : undefined,
+          };
+        }
       } else {
         images[imageId] = {
           width, height, gray,
@@ -120,7 +130,15 @@ self.addEventListener('message', async (ev) => {
           depth: depth ? new Uint16Array(depth) : null,
           keypoints: null,
           descriptors: null,
-          descCols: 0
+          descCols: 0,
+          exif: exif ? {
+            orientation: Number.isFinite(exif.orientation) ? Math.round(exif.orientation) : 1,
+            make: exif.make || '',
+            model: exif.model || '',
+            focalLengthMm: Number.isFinite(exif.focalLengthMm) ? exif.focalLengthMm : undefined,
+            focalLength35mm: Number.isFinite(exif.focalLength35mm) ? exif.focalLength35mm : undefined,
+            capturedAtMs: Number.isFinite(exif.capturedAtMs) ? exif.capturedAtMs : undefined,
+          } : null,
         };
       }
       const rec = images[imageId];
@@ -653,6 +671,8 @@ self.addEventListener('message', async (ev) => {
         if (!objectAware) return 0;
         return objectPairScores.get(makePairKey(idA, idB)) || 0;
       };
+      const exifPairScores = new Map();
+      const getExifPairScore = (idA, idB) => exifPairScores.get(makePairKey(idA, idB)) || 0;
 
       if (objectAware && ids.length >= 2) {
         for (let a = 0; a < ids.length; a++) {
@@ -666,6 +686,17 @@ self.addEventListener('message', async (ev) => {
             if (score > 0) {
               objectPairScores.set(makePairKey(idA, idB), score);
             }
+          }
+        }
+      }
+
+      if (ids.length >= 2) {
+        for (let a = 0; a < ids.length; a++) {
+          for (let b = a + 1; b < ids.length; b++) {
+            const idA = ids[a];
+            const idB = ids[b];
+            const score = computeExifPairSimilarity(images[idA]?.exif, images[idB]?.exif);
+            if (score > 0) exifPairScores.set(makePairKey(idA, idB), score);
           }
         }
       }
@@ -717,6 +748,39 @@ self.addEventListener('message', async (ev) => {
         }
       }
 
+      if (!matchAllPairs && ids.length >= 3) {
+        const maxExtraPairs = Math.min(50, Math.max(6, ids.length * 2));
+        let addedExtra = 0;
+        for (const idA of ids) {
+          if (addedExtra >= maxExtraPairs) break;
+          const ia = idOrder.get(idA) ?? 0;
+          const scored = [];
+          for (const idB of ids) {
+            if (idA === idB) continue;
+            const ib = idOrder.get(idB) ?? 0;
+            if (Math.abs(ia - ib) <= windowW) continue;
+            const key = makePairKey(idA, idB);
+            if (pairKeys.has(key)) continue;
+            const exifScore = getExifPairScore(idA, idB);
+            if (exifScore < 0.75) continue;
+            scored.push([idB, exifScore]);
+          }
+          scored.sort((a, b) => b[1] - a[1]);
+          if (scored.length > 0) {
+            const [idB] = scored[0];
+            if (addUniquePair(initialPairs, idA, idB)) addedExtra++;
+          }
+        }
+        if (addedExtra > 0) {
+          postMessage({
+            type:'progress',
+            stage:'matching',
+            percent:0,
+            info:`EXIF pairing added ${addedExtra} candidate pair(s).`,
+          });
+        }
+      }
+
       const tryMatchPair = (idI, idJ, params) => {
         const imgI = images[idI];
         const imgJ = images[idJ];
@@ -732,9 +796,11 @@ self.addEventListener('message', async (ev) => {
         const numI = imgI.descriptors.length / descColsI;
         const numJ = imgJ.descriptors.length / descColsJ;
         const objectScore = clampScalar(params.objectScore || 0, 0, 1);
+        const exifScore = clampScalar(params.exifScore || 0, 0, 1);
         const effectiveRatio = params.ratio;
         const effectiveRansacThresh = params.ransacThreshPx;
-        const minInliersForPair = Math.max(4, Math.round(params.minInliers));
+        // EXIF support is a weak prior: only a small relaxation on the inlier floor.
+        const minInliersForPair = Math.max(4, Math.round(params.minInliers * (1 - exifScore * 0.04)));
         if (numI < 4 || numJ < 4) return null;
 
         let matI = null, matJ = null;
@@ -917,6 +983,7 @@ self.addEventListener('message', async (ev) => {
               inlierCount: magsacInlierCount,
               isDuplicate,
               objectScore,
+              exifScore,
             };
           } finally {
             if (srcPts) srcPts.delete();
@@ -947,6 +1014,7 @@ self.addEventListener('message', async (ev) => {
             ...params,
             objectAware,
             objectScore: getObjectPairScore(idI, idJ),
+            exifScore: getExifPairScore(idI, idJ),
           });
           if (edge) {
             edges.push(edge);
@@ -1073,6 +1141,7 @@ self.addEventListener('message', async (ev) => {
         inlierCount: e.inlierCount,
         isDuplicate: e.isDuplicate || false,
         objectScore: e.objectScore || 0,
+        exifScore: e.exifScore || 0,
       }));
       postMessage({type:'edges', edges: edgeMessages, duplicatePairs});
       return;
@@ -1105,7 +1174,8 @@ self.addEventListener('message', async (ev) => {
       for (const id of ids) { weightSum[id] = 0; degree[id] = 0; }
       for (const e of edges) {
         const objectBoost = 1 + clampScalar(e.objectScore || 0, 0, 1) * 0.12;
-        const w = (e.inlierCount / (e.rms + 0.1)) * objectBoost;
+        const exifBoost = 1 + clampScalar(e.exifScore || 0, 0, 1) * 0.04;
+        const w = (e.inlierCount / (e.rms + 0.1)) * objectBoost * exifBoost;
         weightSum[e.i] = (weightSum[e.i] || 0) + w;
         weightSum[e.j] = (weightSum[e.j] || 0) + w;
         degree[e.i] = (degree[e.i] || 0) + 1;
@@ -1126,8 +1196,12 @@ self.addEventListener('message', async (ev) => {
 
       // Maximum spanning tree (Kruskal-like, descending edge weight)
       const sortedEdges = [...edges].sort((a, b) => {
-        const wa = (a.inlierCount / (a.rms + 0.1)) * (1 + clampScalar(a.objectScore || 0, 0, 1) * 0.12);
-        const wb = (b.inlierCount / (b.rms + 0.1)) * (1 + clampScalar(b.objectScore || 0, 0, 1) * 0.12);
+        const wa = (a.inlierCount / (a.rms + 0.1))
+          * (1 + clampScalar(a.objectScore || 0, 0, 1) * 0.12)
+          * (1 + clampScalar(a.exifScore || 0, 0, 1) * 0.04);
+        const wb = (b.inlierCount / (b.rms + 0.1))
+          * (1 + clampScalar(b.objectScore || 0, 0, 1) * 0.12)
+          * (1 + clampScalar(b.exifScore || 0, 0, 1) * 0.04);
         return wb - wa;
       });
 
@@ -2879,6 +2953,71 @@ function computeObjectPairSimilarity(objectsA, objectsB) {
   const rev = directional(objectsB, objectsA);
   const countScore = 1 - Math.abs(objectsA.length - objectsB.length) / Math.max(objectsA.length, objectsB.length);
   return clampScalar(0.55 * ((fwd + rev) * 0.5) + 0.45 * countScore, 0, 1);
+}
+
+function orientationAngularDistance(orientationA, orientationB) {
+  const rotMap = { 1: 0, 2: 0, 3: 180, 4: 180, 5: 270, 6: 90, 7: 90, 8: 270 };
+  const a = rotMap[orientationA] ?? 0;
+  const b = rotMap[orientationB] ?? 0;
+  const diff = Math.abs(a - b) % 360;
+  return Math.min(diff, 360 - diff);
+}
+
+function computeExifPairSimilarity(exifA, exifB) {
+  if (!exifA || !exifB) return 0;
+
+  let weighted = 0;
+  let weightSum = 0;
+
+  const makeA = (exifA.make || '').trim().toLowerCase();
+  const makeB = (exifB.make || '').trim().toLowerCase();
+  const modelA = (exifA.model || '').trim().toLowerCase();
+  const modelB = (exifB.model || '').trim().toLowerCase();
+  if (makeA && makeB) {
+    weightSum += 0.20;
+    weighted += (makeA === makeB ? 1 : 0) * 0.20;
+  }
+  if (modelA && modelB) {
+    weightSum += 0.25;
+    weighted += (modelA === modelB ? 1 : 0) * 0.25;
+  }
+
+  const flA = Number.isFinite(exifA.focalLength35mm) ? exifA.focalLength35mm : exifA.focalLengthMm;
+  const flB = Number.isFinite(exifB.focalLength35mm) ? exifB.focalLength35mm : exifB.focalLengthMm;
+  if (Number.isFinite(flA) && Number.isFinite(flB) && flA > 0 && flB > 0) {
+    const ratio = Math.max(flA, flB) / Math.max(1e-6, Math.min(flA, flB));
+    const focalScore = ratio <= 1.08 ? 1
+      : ratio <= 1.20 ? 0.85
+      : ratio <= 1.35 ? 0.60
+      : ratio <= 1.65 ? 0.35
+      : 0.10;
+    weightSum += 0.30;
+    weighted += focalScore * 0.30;
+  }
+
+  const tsA = exifA.capturedAtMs;
+  const tsB = exifB.capturedAtMs;
+  if (Number.isFinite(tsA) && Number.isFinite(tsB)) {
+    const dtSec = Math.abs(tsA - tsB) / 1000;
+    const timeScore = dtSec <= 2 ? 1
+      : dtSec <= 15 ? 0.92
+      : dtSec <= 60 ? 0.78
+      : dtSec <= 180 ? 0.58
+      : dtSec <= 600 ? 0.34
+      : 0.10;
+    weightSum += 0.20;
+    weighted += timeScore * 0.20;
+  }
+
+  const oA = Number.isFinite(exifA.orientation) ? Math.round(exifA.orientation) : 1;
+  const oB = Number.isFinite(exifB.orientation) ? Math.round(exifB.orientation) : 1;
+  const angDist = orientationAngularDistance(oA, oB);
+  const orientScore = angDist === 0 ? 1 : angDist <= 90 ? 0.70 : 0.45;
+  weightSum += 0.05;
+  weighted += orientScore * 0.05;
+
+  if (weightSum <= 1e-6) return 0;
+  return clampScalar(weighted / weightSum, 0, 1);
 }
 
 function analyzeConnectivity(ids, edges) {
