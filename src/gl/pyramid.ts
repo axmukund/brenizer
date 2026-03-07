@@ -111,11 +111,12 @@ void main() {
 }
 `;
 
-// ── Finalise output alpha from the original inputs ──────────────────
-// The pyramid prefill step needs fallback RGB outside the image support,
-// but that RGB must not leak into the final composite footprint. Restore
-// alpha from the original full-resolution inputs so only true covered
-// pixels survive in preview/export outputs.
+// ── Finalise output support from the original inputs ────────────────
+// The pyramid needs fallback RGB outside an image's footprint to avoid
+// black-border contamination in low-frequency bands. But once the blend
+// is reconstructed, pixels outside the *true overlap* must snap back to
+// the original source image instead of keeping a smoothed mix. Otherwise
+// each warped tile keeps a soft vignetted border.
 
 const FINALIZE_FRAG = `#version 300 es
 precision highp float;
@@ -126,10 +127,19 @@ uniform sampler2D u_newImage;
 out vec4 fragColor;
 void main() {
   vec3 rgb = texture(u_rgb, v_uv).rgb;
-  float compA = texture(u_composite, v_uv).a;
-  float newA = texture(u_newImage, v_uv).a;
-  float alpha = max(compA, newA);
-  fragColor = vec4(rgb, alpha);
+  vec4 comp = texture(u_composite, v_uv);
+  vec4 newI = texture(u_newImage, v_uv);
+  const float supportThreshold = 1.0 / 255.0;
+
+  if (newI.a <= supportThreshold && comp.a <= supportThreshold) {
+    fragColor = vec4(0.0);
+  } else if (newI.a <= supportThreshold) {
+    fragColor = vec4(comp.rgb, comp.a);
+  } else if (comp.a <= supportThreshold) {
+    fragColor = vec4(newI.rgb, newI.a);
+  } else {
+    fragColor = vec4(rgb, max(comp.a, newI.a));
+  }
 }
 `;
 
@@ -347,8 +357,8 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  /** Restore alpha from the original composite inputs. */
-  function finalizeAlpha(
+  /** Restore RGB/alpha support from the original composite inputs. */
+  function finalizeOutput(
     rgbTex: WebGLTexture,
     compositeTex: WebGLTexture,
     newImageTex: WebGLTexture,
@@ -529,7 +539,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
         current = result;
       }
 
-      finalizeAlpha(current.tex.texture, compositeTex, newImageTex, outputFBO, width, height);
+      finalizeOutput(current.tex.texture, compositeTex, newImageTex, outputFBO, width, height);
 
       // Cleanup
       if (current !== lapBlended[numLevels - 1]) freeLevel(current);
