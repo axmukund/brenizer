@@ -231,7 +231,7 @@ async function imageToGray(
 
   // Draw onto offscreen canvas
   const offscreen = new OffscreenCanvas(w, h);
-  const ctx = offscreen.getContext('2d')!;
+  const ctx = offscreen.getContext('2d', { willReadFrequently: true })!;
   ctx.drawImage(bmp, 0, 0, w, h);
   bmp.close();
 
@@ -239,17 +239,19 @@ async function imageToGray(
   const rgba = imgData.data;
 
   // Extract RGB (3-channel) for per-channel exposure compensation
-  const rgbSmall = new Uint8ClampedArray(w * h * 3);
+  const pixelCount = w * h;
+  const rgbSmall = new Uint8ClampedArray(pixelCount * 3);
   // Convert to grayscale (luminance)
-  const gray = new Uint8ClampedArray(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const r = rgba[i * 4];
-    const g = rgba[i * 4 + 1];
-    const b = rgba[i * 4 + 2];
-    rgbSmall[i * 3] = r;
-    rgbSmall[i * 3 + 1] = g;
-    rgbSmall[i * 3 + 2] = b;
-    gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+  const gray = new Uint8ClampedArray(pixelCount);
+  for (let px = 0, rgbaOff = 0, rgbOff = 0; px < pixelCount; px++, rgbaOff += 4, rgbOff += 3) {
+    const r = rgba[rgbaOff];
+    const g = rgba[rgbaOff + 1];
+    const b = rgba[rgbaOff + 2];
+    rgbSmall[rgbOff] = r;
+    rgbSmall[rgbOff + 1] = g;
+    rgbSmall[rgbOff + 2] = b;
+    // Integer BT.601 approximation avoids float work in this hot loop.
+    gray[px] = (77 * r + 150 * g + 29 * b + 128) >> 8;
   }
 
   return { gray, rgbSmall, width: w, height: h, scaleFactor };

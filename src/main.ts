@@ -157,6 +157,23 @@ function formatSeamEstimate(percent: number | null, remainingMs: number | null):
   return `${pctText}, ${remainingText}`;
 }
 
+async function createScaledImageTexture(
+  gl: WebGL2RenderingContext,
+  file: File,
+  width: number,
+  height: number,
+): Promise<ManagedTexture> {
+  const bmp = await createImageBitmap(file);
+  try {
+    const offscreen = new OffscreenCanvas(width, height);
+    const ctx2d = offscreen.getContext('2d')!;
+    ctx2d.drawImage(bmp, 0, 0, width, height);
+    return createTextureFromImage(gl, offscreen, width, height);
+  } finally {
+    bmp.close();
+  }
+}
+
 async function waitForSeamSolveAdaptive(
   wm: SeamWorkerClient,
   opts: {
@@ -1576,8 +1593,8 @@ async function renderWarpedPreview(
       }
       const apapMesh: import('./gl').MeshData = {
         positions: warpedPos,
-        uvs: new Float32Array(apap.uvs),
-        indices: new Uint32Array(apap.indices),
+        uvs: apap.uvs,
+        indices: apap.indices,
       };
       const apapSanity = meshSanityReport(apapMesh, compW, compH);
       if (apapSanity.tooDistorted) {
@@ -1626,14 +1643,7 @@ async function renderWarpedPreview(
     }
 
     // Decode image and create texture
-    const bmp = await createImageBitmap(img.file);
-    const offscreen = new OffscreenCanvas(alignW, alignH);
-    const ctx2d = offscreen.getContext('2d')!;
-    ctx2d.drawImage(bmp, 0, 0, alignW, alignH);
-    bmp.close();
-    const resizedBmp = await createImageBitmap(offscreen);
-    const imgTex = createTextureFromImage(gl, resizedBmp, alignW, alignH);
-    resizedBmp.close();
+    const imgTex = await createScaledImageTexture(gl, img.file, alignW, alignH);
 
     // Render new warped image to newImageFBO
     gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
@@ -2585,8 +2595,8 @@ async function exportComposite(): Promise<void> {
       }
       const apapMesh: import('./gl').MeshData = {
         positions: warpedPos,
-        uvs: new Float32Array(apap.uvs),
-        indices: new Uint32Array(apap.indices),
+        uvs: apap.uvs,
+        indices: apap.indices,
       };
       const apapSanity = meshSanityReport(apapMesh, outW, outH);
       if (apapSanity.tooDistorted) {
@@ -2614,24 +2624,16 @@ async function exportComposite(): Promise<void> {
       }
     }
 
-    // Decode image — full original resolution for maxRes, alignment scale otherwise
-    const bmp = await createImageBitmap(img.file);
     let texW: number, texH: number;
     if (settings.maxResExport) {
       // Full resolution: use original image dimensions (no downscale)
-      texW = bmp.width;
-      texH = bmp.height;
+      texW = img.width;
+      texH = img.height;
     } else {
       texW = alignW;
       texH = alignH;
     }
-    const off = new OffscreenCanvas(texW, texH);
-    const ctx2d = off.getContext('2d')!;
-    ctx2d.drawImage(bmp, 0, 0, texW, texH);
-    bmp.close();
-    const resizedBmp = await createImageBitmap(off);
-    const imgTex = createTextureFromImage(gl, resizedBmp, texW, texH);
-    resizedBmp.close();
+    const imgTex = await createScaledImageTexture(gl, img.file, texW, texH);
 
     // Warp to newImageFBO
     gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);

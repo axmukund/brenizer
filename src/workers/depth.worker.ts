@@ -82,13 +82,13 @@ self.addEventListener('message', async (ev) => {
 
       // Resize to model input size
       const off = new OffscreenCanvas(modelInputSize, modelInputSize);
-      const ctx = off.getContext('2d')!;
+      const ctx = off.getContext('2d', { willReadFrequently: true })!;
       if (width === modelInputSize && height === modelInputSize) {
         const im = new ImageData(rgba, width, height);
         ctx.putImageData(im, 0, 0);
       } else {
         const bmp = await createImageBitmap(
-          new ImageData(new Uint8ClampedArray(rgba), width, height),
+          new ImageData(rgba, width, height),
         );
         ctx.drawImage(bmp, 0, 0, modelInputSize, modelInputSize);
         bmp.close();

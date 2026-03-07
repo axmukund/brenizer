@@ -167,6 +167,17 @@ export function computeBlockCosts(
   const gridW = Math.max(1, Math.ceil(compW / blockSize));
   const gridH = Math.max(1, Math.ceil(compH / blockSize));
   const nNodes = gridW * gridH;
+  const hasSaliency = !!saliencyMap && saliencyMap.length >= compW * compH;
+  const expandedFaces = faceRects.map((face) => {
+    const margin = Math.max(face.width, face.height) * 0.5;
+    return {
+      imageLabel: face.imageLabel,
+      left: face.x - margin,
+      top: face.y - margin,
+      right: face.x + face.width + margin,
+      bottom: face.y + face.height + margin,
+    };
+  });
 
   const dataCosts = new Float32Array(nNodes * 2);
   const hardConstraints = new Uint8Array(nNodes);
@@ -266,7 +277,7 @@ export function computeBlockCosts(
         // colour distinctness (Achanta frequency-tuned), and focus measure
         // (Laplacian variance). The seam is pushed towards low-saliency
         // (blurred/uniform) regions — ideal for Brenizer composites.
-        if (saliencyMap && saliencyMap.length >= compW * compH) {
+        if (hasSaliency) {
           // Average saliency within this block
           let salSum = 0;
           let salN = 0;
@@ -277,7 +288,7 @@ export function computeBlockCosts(
           const step = Math.max(1, Math.floor(blockSize / 4));
           for (let sy = by0; sy < by1; sy += step) {
             for (let sx = bx0; sx < bx1; sx += step) {
-              salSum += saliencyMap[sy * compW + sx];
+              salSum += saliencyMap![sy * compW + sx];
               salN++;
             }
           }
@@ -297,19 +308,10 @@ export function computeBlockCosts(
         const blockTop = gy * blockSize;
         const blockRight = blockLeft + blockSize;
         const blockBottom = blockTop + blockSize;
-        for (const face of faceRects) {
-          const faceRight = face.x + face.width;
-          const faceBottom = face.y + face.height;
-          // Expand face rect by 50% in all directions — gives a safety margin
-          // so the seam doesn't graze the face boundary due to block quantisation.
-          const margin = Math.max(face.width, face.height) * 0.5;
-          const fLeft = face.x - margin;
-          const fTop = face.y - margin;
-          const fRight = faceRight + margin;
-          const fBottom = faceBottom + margin;
+        for (const face of expandedFaces) {
           // Check overlap
-          if (blockLeft < fRight && blockRight > fLeft &&
-              blockTop < fBottom && blockBottom > fTop) {
+          if (blockLeft < face.right && blockRight > face.left &&
+              blockTop < face.bottom && blockBottom > face.top) {
             // This block overlaps a face — penalise the OTHER label heavily.
             // A penalty of 10 is ~10× larger than typical edge weights, making
             // it extremely unlikely the graph cut splits a face between images.
@@ -352,7 +354,7 @@ export function computeBlockCosts(
 
   /** Sample average saliency at the boundary between two adjacent blocks. */
   function sampleBoundarySaliency(bx: number, by: number, isHorizontal: boolean): number {
-    if (!saliencyMap || saliencyMap.length < compW * compH) return 1.0;
+    if (!hasSaliency) return 1.0;
     let sum = 0, count = 0;
     const samples = 3;
     for (let s = 0; s < samples; s++) {
@@ -365,7 +367,7 @@ export function computeBlockCosts(
         py = by;
       }
       if (px >= 0 && px < compW && py >= 0 && py < compH) {
-        sum += saliencyMap[py * compW + px];
+        sum += saliencyMap![py * compW + px];
         count++;
       }
     }
@@ -612,11 +614,20 @@ export function labelsToMask(
   outH: number,
 ): Uint8Array {
   const mask = new Uint8Array(outW * outH);
-  for (let y = 0; y < outH; y++) {
-    const gy = Math.min(Math.floor(y / blockSize), gridH - 1);
-    for (let x = 0; x < outW; x++) {
-      const gx = Math.min(Math.floor(x / blockSize), gridW - 1);
-      mask[y * outW + x] = labels[gy * gridW + gx] ? 255 : 0;
+  for (let gy = 0; gy < gridH; gy++) {
+    const y0 = gy * blockSize;
+    if (y0 >= outH) break;
+    const y1 = Math.min(y0 + blockSize, outH);
+    const rowLabelOffset = gy * gridW;
+    for (let gx = 0; gx < gridW; gx++) {
+      const x0 = gx * blockSize;
+      if (x0 >= outW) break;
+      const x1 = Math.min(x0 + blockSize, outW);
+      const value = labels[rowLabelOffset + gx] ? 255 : 0;
+      for (let y = y0; y < y1; y++) {
+        const rowOffset = y * outW;
+        mask.fill(value, rowOffset + x0, rowOffset + x1);
+      }
     }
   }
   return mask;
