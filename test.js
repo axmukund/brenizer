@@ -135,6 +135,20 @@ const TIMEOUTS = {
   protocolMs: 1_800_000,
 };
 
+const SEAM_TIER_OVERRIDE = (process.env.SEAM_TIER || '').trim() || null;
+const RUN_SEAM_BENCHMARKS = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK || '');
+const BENCHMARK_ASSERT = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK_ASSERT || '');
+const BENCHMARK_TIER_MATRIX = (process.env.SEAM_BENCHMARK_TIERS || 'legacyCpu,webglGrid')
+  .split(',')
+  .map(v => v.trim())
+  .filter(Boolean);
+const BENCHMARK_SCENARIO_IDS = new Set(
+  (process.env.SEAM_BENCHMARK_SCENARIOS || 'synth-orchard-row-major,landscape-row-major,axm-center-out')
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean),
+);
+
 function formatMetrics(m) {
   return [
     `blended=${m.blendedCount}`,
@@ -146,13 +160,78 @@ function formatMetrics(m) {
   ].join(', ');
 }
 
-async function runScenario(browser, scenario) {
+function withSeamTier(baseUrl, seamTier) {
+  if (!seamTier) return baseUrl;
+  const url = new URL(baseUrl);
+  url.searchParams.set('seamTier', seamTier);
+  return url.toString();
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = Array.from(values).sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function formatCountMap(entries) {
+  return Array.from(entries.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, count]) => `${key}:${count}`)
+    .join(', ');
+}
+
+function summarizeSeamJobs(seamJobs) {
+  if (!Array.isArray(seamJobs) || seamJobs.length === 0) return 'seams=0';
+  const tierCounts = new Map();
+  const builderCounts = new Map();
+  const solverCounts = new Map();
+  const readbackBytes = [];
+  const totalMs = [];
+  const solverMs = [];
+  for (const job of seamJobs) {
+    tierCounts.set(job.tier, (tierCounts.get(job.tier) || 0) + 1);
+    builderCounts.set(job.builderBackend, (builderCounts.get(job.builderBackend) || 0) + 1);
+    solverCounts.set(job.solverBackend, (solverCounts.get(job.solverBackend) || 0) + 1);
+    readbackBytes.push(Number(job.readbackBytes) || 0);
+    totalMs.push(Number(job.totalMs) || 0);
+    solverMs.push(Number(job.solverMs) || 0);
+  }
+  return [
+    `seams=${seamJobs.length}`,
+    `tiers=${formatCountMap(tierCounts)}`,
+    `builders=${formatCountMap(builderCounts)}`,
+    `solvers=${formatCountMap(solverCounts)}`,
+    `medianReadback=${Math.round(median(readbackBytes)).toLocaleString()}B`,
+    `medianSolver=${median(solverMs).toFixed(1)}ms`,
+    `medianTotal=${median(totalMs).toFixed(1)}ms`,
+  ].join(', ');
+}
+
+function extractBenchmarkStats(seamJobs) {
+  const readbackBytes = seamJobs.map(job => Number(job.readbackBytes) || 0);
+  const totalMs = seamJobs.map(job => Number(job.totalMs) || 0);
+  const solverMs = seamJobs.map(job => Number(job.solverMs) || 0);
+  return {
+    count: seamJobs.length,
+    medianReadbackBytes: median(readbackBytes),
+    medianTotalMs: median(totalMs),
+    medianSolverMs: median(solverMs),
+  };
+}
+
+async function runScenario(browser, scenario, options = {}) {
+  const seamTier = options.seamTier ?? SEAM_TIER_OVERRIDE;
+  const scenarioUrl = withSeamTier(APP_URL, seamTier);
+  const scenarioLabel = seamTier ? `${scenario.id}@${seamTier}` : scenario.id;
   const page = await browser.newPage();
-  page.on('console', msg => console.log(`[${scenario.id}] PAGE:`, msg.text()));
-  page.on('pageerror', err => console.error(`[${scenario.id}] PAGE ERROR:`, err));
+  page.on('console', msg => console.log(`[${scenarioLabel}] PAGE:`, msg.text()));
+  page.on('pageerror', err => console.error(`[${scenarioLabel}] PAGE ERROR:`, err));
 
   try {
-    await page.goto(APP_URL, {
+    await page.goto(scenarioUrl, {
       waitUntil: 'networkidle0',
       timeout: TIMEOUTS.pageLoadMs,
     });
@@ -493,6 +572,9 @@ async function runScenario(browser, scenario) {
         phase: failures.length === 0 ? 'done' : 'quality',
         reason: failures.join('; '),
         status: finalStatus,
+        seamJobs: Array.isArray(window.__brenizerPerf?.seamJobs)
+          ? window.__brenizerPerf.seamJobs
+          : [],
         metrics: {
           blendedCount: blendedCount ?? -1,
           coverage: quality.coverage,
@@ -513,6 +595,7 @@ async function runScenario(browser, scenario) {
 async function main() {
   console.log('--- Brenizer E2E suite: multi-scenario composite quality checks ---');
   console.log(`Server: ${APP_URL}`);
+  if (SEAM_TIER_OVERRIDE) console.log(`Forced seam tier: ${SEAM_TIER_OVERRIDE}`);
   console.log(`Scenarios: ${SCENARIOS.map(s => s.id).join(', ')}`);
   console.log();
 
@@ -537,11 +620,77 @@ async function main() {
         failures.push({ scenario: scenario.id, result });
         console.log(`  FAIL [${result.phase}] ${result.reason || 'unknown reason'}`);
         if (result.status) console.log(`  status: ${result.status}`);
+        console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
       } else {
         console.log(`  PASS ${formatMetrics(result.metrics)}`);
         console.log(`  status: ${result.status}`);
+        console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
       }
       console.log();
+    }
+
+    if (RUN_SEAM_BENCHMARKS) {
+      console.log('--- Seam benchmark matrix ---');
+      const benchmarkScenarios = SCENARIOS.filter(s => BENCHMARK_SCENARIO_IDS.has(s.id));
+      const benchmarkResults = [];
+
+      for (const scenario of benchmarkScenarios) {
+        for (const seamTier of BENCHMARK_TIER_MATRIX) {
+          console.log(`Benchmark scenario: ${scenario.id} @ ${seamTier}`);
+          const result = await runScenario(browser, scenario, { seamTier });
+          if (!result.ok) {
+            failures.push({ scenario: `${scenario.id}@${seamTier}`, result });
+            console.log(`  FAIL [${result.phase}] ${result.reason || 'unknown reason'}`);
+            if (result.status) console.log(`  status: ${result.status}`);
+            console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
+            console.log();
+            continue;
+          }
+
+          const stats = extractBenchmarkStats(result.seamJobs || []);
+          benchmarkResults.push({ scenario: scenario.id, seamTier, stats });
+          console.log(`  PASS ${formatMetrics(result.metrics)}`);
+          console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
+          console.log();
+        }
+      }
+
+      for (const scenario of benchmarkScenarios) {
+        const runs = benchmarkResults.filter(r => r.scenario === scenario.id);
+        if (runs.length === 0) continue;
+        console.log(`Benchmark summary: ${scenario.id}`);
+        for (const run of runs) {
+          console.log(
+            `  ${run.seamTier}: seams=${run.stats.count}, medianReadback=${Math.round(run.stats.medianReadbackBytes).toLocaleString()}B, ` +
+            `medianSolver=${run.stats.medianSolverMs.toFixed(1)}ms, medianTotal=${run.stats.medianTotalMs.toFixed(1)}ms`,
+          );
+        }
+
+        if (BENCHMARK_ASSERT) {
+          const legacy = runs.find(r => r.seamTier === 'legacyCpu');
+          for (const run of runs) {
+            if (!legacy || run.seamTier === 'legacyCpu' || run.stats.count === 0 || legacy.stats.count === 0) continue;
+            const readbackRatio = legacy.stats.medianReadbackBytes > 0
+              ? run.stats.medianReadbackBytes / legacy.stats.medianReadbackBytes
+              : 0;
+            if (readbackRatio > 0.05) {
+              failures.push({
+                scenario: `${scenario.id}@${run.seamTier}`,
+                result: {
+                  phase: 'benchmark',
+                  reason: `median readback ratio ${readbackRatio.toFixed(3)} exceeds 0.05`,
+                  status: '',
+                },
+              });
+              console.log(
+                `  FAIL benchmark readback: ${run.seamTier} medianReadback ${Math.round(run.stats.medianReadbackBytes).toLocaleString()}B ` +
+                `vs legacy ${Math.round(legacy.stats.medianReadbackBytes).toLocaleString()}B`,
+              );
+            }
+          }
+        }
+        console.log();
+      }
     }
   } finally {
     await browser.close();

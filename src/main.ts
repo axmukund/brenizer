@@ -29,9 +29,10 @@ import {
   createPyramidBlender,
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
   makeViewMatrix, computeBlockCosts, labelsToMask, buildAdaptiveBlendMask,
-  createMaskTexture,
+  createMaskTexture, createSeamAccelerator,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
   type PyramidBlender, type ManagedTexture, type FaceRectComposite,
+  type SeamAccelerator, type SeamAccelerationTier, type CompactSeamGraphBuildResult,
 } from './gl';
 import {
   runStitchPreview, getLastFeatures, getLastEdges, getLastTransforms, getLastRefId,
@@ -46,6 +47,7 @@ let warpRenderer: WarpRenderer | null = null;
 let kpRenderer: KeypointRenderer | null = null;
 let compositor: Compositor | null = null;
 let pyramidBlender: PyramidBlender | null = null;
+let seamAccelerator: SeamAccelerator | null = null;
 let editorZoom = 1.0;
 let editorRotationDeg = 0.0;
 let editorPanX = 0.0;
@@ -65,9 +67,34 @@ interface PreviewDisplayRegion {
   dispH: number;
 }
 
+interface SeamJobMetrics {
+  stage: 'preview' | 'export';
+  imageId: string;
+  tier: SeamAccelerationTier;
+  builderBackend: string;
+  solverBackend: string;
+  gridW: number;
+  gridH: number;
+  blockSize: number;
+  readbackBytes: number;
+  summaryMs: number;
+  graphBuildMs: number;
+  solverMs: number;
+  maskMs: number;
+  totalMs: number;
+}
+
 let previewImageOutlines = new Map<string, PreviewOutlinePolygon>();
 let previewDisplayRegion: PreviewDisplayRegion | null = null;
 let hoveredPreviewImageId: string | null = null;
+
+declare global {
+  interface Window {
+    __brenizerPerf?: {
+      seamJobs: SeamJobMetrics[];
+    };
+  }
+}
 
 const EXPORT_SEAM_TARGET_GRID_NODES = 50000;
 const EXPORT_SEAM_HARD_GRID_NODES = 90000;
@@ -181,8 +208,10 @@ async function waitForSeamSolveAdaptive(
     gridW: number;
     gridH: number;
     dataCostsBuf: ArrayBuffer;
-    edgeWeightsBuf: ArrayBuffer;
+    edgeWeightsHBuf: ArrayBuffer;
+    edgeWeightsVBuf: ArrayBuffer;
     hardBuf: ArrayBuffer;
+    forceLegacy?: boolean;
     progressEveryMs: number;
     onStatus: (snapshot: SeamSolveStatusSnapshot) => void;
   },
@@ -192,8 +221,10 @@ async function waitForSeamSolveAdaptive(
     gridW,
     gridH,
     dataCostsBuf,
-    edgeWeightsBuf,
+    edgeWeightsHBuf,
+    edgeWeightsVBuf,
     hardBuf,
+    forceLegacy,
     progressEveryMs,
     onStatus,
   } = opts;
@@ -299,10 +330,11 @@ async function waitForSeamSolveAdaptive(
         gridW,
         gridH,
         dataCostsBuffer: dataCostsBuf,
-        edgeWeightsBuffer: edgeWeightsBuf,
+        edgeWeightsHBuffer: edgeWeightsHBuf,
+        edgeWeightsVBuffer: edgeWeightsVBuf,
         hardConstraintsBuffer: hardBuf,
-        params: { progressEveryMs },
-      }, [dataCostsBuf, edgeWeightsBuf, hardBuf]);
+        params: { progressEveryMs, forceLegacy: forceLegacy ? 1 : 0 },
+      }, [dataCostsBuf, edgeWeightsHBuf, edgeWeightsVBuf, hardBuf]);
     } catch (err) {
       done = true;
       cleanup(unsub);
@@ -314,6 +346,27 @@ async function waitForSeamSolveAdaptive(
 /** Sanitize a gain value: replace NaN/Infinity/non-positive with 1.0. */
 function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
+}
+
+function getResolvedSeamTier(): SeamAccelerationTier {
+  return getState().capabilities?.seamAccelerationTier ?? 'legacyCpu';
+}
+
+function ensurePerfStore(): NonNullable<Window['__brenizerPerf']> {
+  if (!window.__brenizerPerf) {
+    window.__brenizerPerf = { seamJobs: [] };
+  }
+  return window.__brenizerPerf;
+}
+
+function recordSeamMetrics(metrics: SeamJobMetrics): void {
+  ensurePerfStore().seamJobs.push(metrics);
+  console.log(
+    `[seam] ${metrics.stage}:${metrics.imageId} tier=${metrics.tier} builder=${metrics.builderBackend} ` +
+    `solver=${metrics.solverBackend} grid=${metrics.gridW}x${metrics.gridH} block=${metrics.blockSize} ` +
+    `readback=${metrics.readbackBytes}B summary=${metrics.summaryMs.toFixed(1)}ms graph=${metrics.graphBuildMs.toFixed(1)}ms ` +
+    `solverMs=${metrics.solverMs.toFixed(1)}ms mask=${metrics.maskMs.toFixed(1)}ms total=${metrics.totalMs.toFixed(1)}ms`,
+  );
 }
 
 function computeTriangleDoubleArea(
@@ -667,6 +720,258 @@ function projectSaliencyToComposite(
   return out;
 }
 
+function projectSaliencyToGrid(
+  imgId: string,
+  T: Float64Array,
+  minX: number,
+  minY: number,
+  compositeScale: number,
+  gridW: number,
+  gridH: number,
+  blockSize: number,
+  saliencyMaps: Map<string, import('./pipelineController').SaliencyData>,
+): Float32Array | null {
+  const sal = saliencyMaps.get(imgId);
+  if (!sal) return null;
+  const sw = sal.width;
+  const sh = sal.height;
+  const sMap = sal.saliency;
+  if (sMap.length < sw * sh) return null;
+
+  const a = T[0], b = T[1], c = T[2];
+  const d = T[3], e = T[4], f = T[5];
+  const g = T[6], h = T[7], k = T[8];
+  const det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+  if (Math.abs(det) < 1e-15) return null;
+  const invDet = 1 / det;
+  const Ti = new Float64Array([
+    (e * k - f * h) * invDet, (c * h - b * k) * invDet, (b * f - c * e) * invDet,
+    (f * g - d * k) * invDet, (a * k - c * g) * invDet, (c * d - a * f) * invDet,
+    (d * h - e * g) * invDet, (b * g - a * h) * invDet, (a * e - b * d) * invDet,
+  ]);
+
+  const out = new Float32Array(gridW * gridH);
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      let sum = 0;
+      let count = 0;
+      for (let sy = 0; sy < 2; sy++) {
+        for (let sx = 0; sx < 2; sx++) {
+          const cx = gx * blockSize + ((sx + 0.5) * blockSize * 0.5);
+          const cy = gy * blockSize + ((sy + 0.5) * blockSize * 0.5);
+          const gxWorld = cx / compositeScale + minX;
+          const gyWorld = cy / compositeScale + minY;
+          const denom = Ti[6] * gxWorld + Ti[7] * gyWorld + Ti[8];
+          if (Math.abs(denom) < 1e-8) continue;
+          const ix = (Ti[0] * gxWorld + Ti[1] * gyWorld + Ti[2]) / denom;
+          const iy = (Ti[3] * gxWorld + Ti[4] * gyWorld + Ti[5]) / denom;
+          if (ix < 0 || ix >= sw - 1 || iy < 0 || iy >= sh - 1) continue;
+          sum += sMap[Math.round(iy) * sw + Math.round(ix)] ?? 0;
+          count++;
+        }
+      }
+      out[gy * gridW + gx] = count > 0 ? sum / count : 0;
+    }
+  }
+  return out;
+}
+
+function resolvePreviewSeamBlockSize(
+  baseBlockSize: number,
+  tier: SeamAccelerationTier,
+  compW: number,
+  compH: number,
+): number {
+  if (tier === 'desktopTurbo' || tier === 'legacyCpu') return baseBlockSize;
+  const nodes = Math.ceil(compW / baseBlockSize) * Math.ceil(compH / baseBlockSize);
+  if (nodes <= 22000) return baseBlockSize;
+  return Math.max(4, Math.round((baseBlockSize + 4) / 4) * 4);
+}
+
+interface BuildAndSolveSeamOptions {
+  stage: 'preview' | 'export';
+  imageId: string;
+  currentCompTex: WebGLTexture;
+  newImageTex: WebGLTexture;
+  width: number;
+  height: number;
+  blockSize: number;
+  featherRadius: number;
+  sameCameraSettings: boolean;
+  faceRects: FaceRectComposite[];
+  saliencyGrid: Float32Array | null;
+  keyCoverageTex?: WebGLTexture | null;
+  wm: SeamWorkerClient;
+  progressEveryMs: number;
+  forceLegacy?: boolean;
+  onStatus: (snapshot: SeamSolveStatusSnapshot) => void;
+}
+
+interface ResolvedSeamMaskResult {
+  maskTex: ManagedTexture;
+  blendTex: WebGLTexture;
+  correctedTex: ManagedTexture | null;
+  graph: CompactSeamGraphBuildResult;
+  solver: SeamResultMsg;
+}
+
+function splitLegacySeamEdgeWeights(
+  edgeWeights: Float32Array,
+  gridW: number,
+  gridH: number,
+): { edgeWeightsHBuf: ArrayBuffer; edgeWeightsVBuf: ArrayBuffer } {
+  const nHorizontal = Math.max(0, (gridW - 1) * gridH);
+  const edgeWeightsH = edgeWeights.slice(0, nHorizontal);
+  const edgeWeightsV = edgeWeights.slice(nHorizontal);
+  return {
+    edgeWeightsHBuf: edgeWeightsH.buffer as ArrayBuffer,
+    edgeWeightsVBuf: edgeWeightsV.buffer as ArrayBuffer,
+  };
+}
+
+function buildGpuFeatherMask(
+  imageId: string,
+  width: number,
+  height: number,
+  featherRadius: number,
+  currentCompTex: WebGLTexture,
+  newImageTex: WebGLTexture,
+  keyCoverageTex?: WebGLTexture | null,
+): ManagedTexture {
+  if (!seamAccelerator) throw new Error('Seam accelerator unavailable');
+  const labels = new Uint8Array([255]);
+  return seamAccelerator.buildMaskTexture({
+    labels,
+    gridW: 1,
+    gridH: 1,
+    width,
+    height,
+    blockSize: Math.max(width, height),
+    featherRadius,
+    ghostPenalty: new Float32Array([0]),
+    ghostThreshold: 1,
+    lightingSoftStart: 1,
+    lightingSoftEnd: 1,
+    compositeTex: currentCompTex,
+    newTex: newImageTex,
+    keyCoverageTex,
+  });
+}
+
+async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<ResolvedSeamMaskResult> {
+  if (!seamAccelerator) throw new Error('Seam accelerator unavailable');
+  const tier = getResolvedSeamTier();
+  const startedAt = performance.now();
+  let graph = seamAccelerator.buildCompactGraph({
+    compositeTex: opts.currentCompTex,
+    newTex: opts.newImageTex,
+    width: opts.width,
+    height: opts.height,
+    blockSize: opts.blockSize,
+    faceRects: opts.faceRects,
+    saliencyGrid: opts.saliencyGrid,
+    tier,
+  });
+  if (!graph) {
+    throw new Error('Compact seam graph unavailable');
+  }
+
+  let correctedTex: ManagedTexture | null = null;
+  let blendTex = opts.newImageTex;
+  let totalSummaryMs = graph.summaryMs;
+  let totalGraphMs = graph.buildMs;
+  let totalReadbackBytes = graph.readbackBytes;
+
+  if (!opts.sameCameraSettings && graph.colorTransferStats.apply) {
+    correctedTex = seamAccelerator.applyColorTransfer(opts.newImageTex, opts.width, opts.height, graph.colorTransferStats);
+    blendTex = correctedTex.texture;
+    const correctedGraph = seamAccelerator.buildCompactGraph({
+      compositeTex: opts.currentCompTex,
+      newTex: blendTex,
+      width: opts.width,
+      height: opts.height,
+      blockSize: opts.blockSize,
+      faceRects: opts.faceRects,
+      saliencyGrid: opts.saliencyGrid,
+      tier,
+    });
+    if (correctedGraph) {
+      totalSummaryMs += correctedGraph.summaryMs;
+      totalGraphMs += correctedGraph.buildMs;
+      totalReadbackBytes += correctedGraph.readbackBytes;
+      graph = correctedGraph;
+    }
+  }
+
+  const dataCostsBuf = graph.dataCosts.buffer.slice(0) as ArrayBuffer;
+  const edgeWeightsHBuf = graph.edgeWeightsH.buffer.slice(0) as ArrayBuffer;
+  const edgeWeightsVBuf = graph.edgeWeightsV.buffer.slice(0) as ArrayBuffer;
+  const hardBuf = graph.hardConstraints.buffer.slice(0) as ArrayBuffer;
+
+  const solver = await waitForSeamSolveAdaptive(opts.wm, {
+    jobId: `${opts.stage}-${opts.imageId}`,
+    gridW: graph.gridW,
+    gridH: graph.gridH,
+    dataCostsBuf,
+    edgeWeightsHBuf,
+    edgeWeightsVBuf,
+    hardBuf,
+    forceLegacy: opts.forceLegacy,
+    progressEveryMs: opts.progressEveryMs,
+    onStatus: opts.onStatus,
+  });
+
+  const maskStartedAt = performance.now();
+  const labels = new Uint8Array(solver.labelsBuffer);
+  const maskTex = seamAccelerator.buildMaskTexture({
+    labels,
+    gridW: graph.gridW,
+    gridH: graph.gridH,
+    width: opts.width,
+    height: opts.height,
+    blockSize: graph.resolvedBlockSize,
+    featherRadius: opts.featherRadius,
+    ghostPenalty: graph.ghostPenaltyBuffer,
+    ghostThreshold: graph.ghostThreshold,
+    lightingSoftStart: graph.lightingSoftStart,
+    lightingSoftEnd: graph.lightingSoftEnd,
+    compositeTex: opts.currentCompTex,
+    newTex: blendTex,
+    keyCoverageTex: opts.keyCoverageTex,
+  });
+  const maskMs = performance.now() - maskStartedAt;
+
+  recordSeamMetrics({
+    stage: opts.stage,
+    imageId: opts.imageId,
+    tier,
+    builderBackend: graph.backendId,
+    solverBackend: solver.backendId,
+    gridW: graph.gridW,
+    gridH: graph.gridH,
+    blockSize: graph.resolvedBlockSize,
+    readbackBytes: totalReadbackBytes,
+    summaryMs: totalSummaryMs,
+    graphBuildMs: totalGraphMs,
+    solverMs: solver.solverMs,
+    maskMs,
+    totalMs: performance.now() - startedAt,
+  });
+
+  return {
+    maskTex,
+    blendTex,
+    correctedTex,
+    graph: {
+      ...graph,
+      summaryMs: totalSummaryMs,
+      buildMs: totalGraphMs,
+      readbackBytes: totalReadbackBytes,
+    },
+    solver,
+  };
+}
+
 /** Expose for UI to trigger image preview via WebGL */
 export function getGLContext(): GLContext | null { return glCtx; }
 export function getWarpRenderer(): WarpRenderer | null { return warpRenderer; }
@@ -768,6 +1073,7 @@ async function boot(): Promise<void> {
   const caps = await detectCapabilities();
   setState({ capabilities: caps });
   renderCapabilities(caps);
+  ensurePerfStore().seamJobs.length = 0;
 
   // Resolve mode and apply preset
   const { userMode, mobileSafeFlag } = getState();
@@ -785,7 +1091,9 @@ async function boot(): Promise<void> {
     kpRenderer = createKeypointRenderer(glCtx.gl);
     compositor = createCompositor(glCtx.gl);
     pyramidBlender = createPyramidBlender(glCtx.gl, glCtx.floatFBO);
+    seamAccelerator = createSeamAccelerator(glCtx.gl, glCtx.floatFBO);
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
+    console.log('Seam acceleration tier:', caps.seamAccelerationTier);
   } catch (e) {
     console.warn('WebGL2 init failed:', e);
     setStatus('Warning: WebGL2 not available — rendering disabled');
@@ -1550,10 +1858,13 @@ async function renderWarpedPreview(
     if (projected.length > 0) facesInCompositeCoords.set(imgId, projected);
   }
 
-  // Pre-allocate readback buffers for compositing (reused each iteration)
-  const _compPixels = new Uint8Array(compW * compH * 4);
-  const _newPixels = new Uint8Array(compW * compH * 4);
+  const seamTier = getResolvedSeamTier();
+  const useAcceleratedSeam = seamTier !== 'legacyCpu' && !!seamAccelerator && glCtx.floatFBO;
+  const previewSeamBlockSize = resolvePreviewSeamBlockSize(blockSize, seamTier, compW, compH);
+  const _compPixels = useAcceleratedSeam ? null : new Uint8Array(compW * compH * 4);
+  const _newPixels = useAcceleratedSeam ? null : new Uint8Array(compW * compH * 4);
   let keyCoverageMask: Uint8Array | null = null;
+  let keyCoverageTex: ManagedTexture | null = null;
   const saliencyMaps = getLastSaliency();
   const imageById = new Map(images.map((img) => [img.id, img]));
 
@@ -1662,14 +1973,18 @@ async function renderWarpedPreview(
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 
-    if (imgId === keyImageId && !keyCoverageMask) {
-      const keyPixels = _newPixels;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
-      gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, keyPixels);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      keyCoverageMask = new Uint8Array(compW * compH);
-      for (let px = 0; px < compW * compH; px++) {
-        keyCoverageMask[px] = keyPixels[px * 4 + 3];
+    if (imgId === keyImageId && !keyCoverageMask && !keyCoverageTex) {
+      if (useAcceleratedSeam && seamAccelerator) {
+        keyCoverageTex = seamAccelerator.copyTexture(newImageTex.texture, compW, compH);
+      } else if (_newPixels) {
+        const keyPixels = _newPixels;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+        gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, keyPixels);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        keyCoverageMask = new Uint8Array(compW * compH);
+        for (let px = 0; px < compW * compH; px++) {
+          keyCoverageMask[px] = keyPixels[px * 4 + 3];
+        }
       }
     }
 
@@ -1681,11 +1996,72 @@ async function renderWarpedPreview(
       gl.blitFramebuffer(0, 0, compW, compH, 0, 0, compW, compH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    } else if (useGraphCut && useAcceleratedSeam) {
+      const seamFaces: FaceRectComposite[] = [];
+      for (const prevId of mstOrder.slice(0, imgIdx)) {
+        const pf = facesInCompositeCoords.get(prevId);
+        if (pf) {
+          for (const f of pf) seamFaces.push({ ...f, imageLabel: 0 });
+        }
+      }
+      const curFaces = facesInCompositeCoords.get(imgId);
+      if (curFaces) {
+        for (const f of curFaces) seamFaces.push({ ...f, imageLabel: 1 });
+      }
+
+      const saliencyGrid = settings?.blurAwareStitching
+        ? projectSaliencyToGrid(imgId, T, minX, minY, compositeScale, Math.ceil(compW / previewSeamBlockSize), Math.ceil(compH / previewSeamBlockSize), previewSeamBlockSize, saliencyMaps)
+        : null;
+      const seamResult = await buildAndSolveSeam({
+        stage: 'preview',
+        imageId: imgId,
+        currentCompTex: currentCompTex.texture,
+        newImageTex: newImageTex.texture,
+        width: compW,
+        height: compH,
+        blockSize: previewSeamBlockSize,
+        featherRadius: Math.max(1, Math.round(featherWidth * compositeScale)),
+        sameCameraSettings: !!settings?.sameCameraSettings,
+        faceRects: seamFaces,
+        saliencyGrid,
+        keyCoverageTex: keyCoverageTex?.texture ?? null,
+        wm: wm!,
+        progressEveryMs: PREVIEW_SEAM_PROGRESS_INTERVAL_MS,
+        onStatus: ({ percent, remainingMs, info }) => {
+          setStatus(`Compositing ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
+        },
+      });
+
+      if (useMultiband) {
+        pyramidBlender!.blend(
+          currentCompTex.texture,
+          seamResult.blendTex,
+          seamResult.maskTex.texture,
+          altCompFBO.fbo,
+          compW,
+          compH,
+          mbLevels,
+        );
+      } else {
+        compositor.blendWithMask(
+          currentCompTex.texture,
+          seamResult.blendTex,
+          seamResult.maskTex.texture,
+          altCompFBO.fbo,
+          compW,
+          compH,
+        );
+      }
+      seamResult.maskTex.dispose();
+      seamResult.correctedTex?.dispose();
+
+      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
     } else if (useGraphCut) {
       // Seam finding via graph cut
       // Read back composite and new image at full resolution
-      const compPixels = _compPixels;
-      const newPixels = _newPixels;
+      const compPixels = _compPixels!;
+      const newPixels = _newPixels!;
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
@@ -1791,7 +2167,7 @@ async function renderWarpedPreview(
 
       // Send to seam worker
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
-      const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
+      const { edgeWeightsHBuf, edgeWeightsVBuf } = splitLegacySeamEdgeWeights(costs.edgeWeights, costs.gridW, costs.gridH);
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
 
       const jobId = `seam-${imgId}`;
@@ -1800,8 +2176,10 @@ async function renderWarpedPreview(
         gridW: costs.gridW,
         gridH: costs.gridH,
         dataCostsBuf,
-        edgeWeightsBuf,
+        edgeWeightsHBuf,
+        edgeWeightsVBuf,
         hardBuf,
+        forceLegacy: true,
         progressEveryMs: PREVIEW_SEAM_PROGRESS_INTERVAL_MS,
         onStatus: ({ percent, remainingMs, info }) => {
           setStatus(`Compositing ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
@@ -1857,15 +2235,49 @@ async function renderWarpedPreview(
       // Swap composite buffers
       [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
       [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+    } else if (useAcceleratedSeam) {
+      const maskTex = buildGpuFeatherMask(
+        imgId,
+        compW,
+        compH,
+        Math.max(1, Math.round(featherWidth * compositeScale)),
+        currentCompTex.texture,
+        newImageTex.texture,
+        keyCoverageTex?.texture ?? null,
+      );
+
+      if (useMultiband) {
+        pyramidBlender!.blend(
+          currentCompTex.texture,
+          newImageTex.texture,
+          maskTex.texture,
+          altCompFBO.fbo,
+          compW,
+          compH,
+          mbLevels,
+        );
+      } else {
+        compositor.blendWithMask(
+          currentCompTex.texture,
+          newImageTex.texture,
+          maskTex.texture,
+          altCompFBO.fbo,
+          compW,
+          compH,
+        );
+      }
+      maskTex.dispose();
+      [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
+      [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
     } else {
       // Feather-only fallback: simple alpha blend
       // Create a mask where new image has alpha
-      const newPixels = _newPixels;
+      const newPixels = _newPixels!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
 
       // Also read composite for adaptive feather + alpha clamping
-      const compPixels = _compPixels;
+      const compPixels = _compPixels!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
       gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -2198,6 +2610,8 @@ async function renderWarpedPreview(
   drawPreviewHoverOverlay();
   applyPreviewEditorTransform();
 
+  keyCoverageTex?.dispose();
+
   // Cleanup FBOs
   } catch (err) {
     console.error('renderWarpedPreview error:', err);
@@ -2420,8 +2834,11 @@ async function exportComposite(): Promise<void> {
   })();
   const wm = getWorkerManager();
   const useGraphCut = settings.seamMethod === 'graphcut' && wm !== null;
+  const seamTier = getResolvedSeamTier();
+  const useAcceleratedSeam = seamTier !== 'legacyCpu' && !!seamAccelerator && glCtx.floatFBO;
   const exportSeamPlan = useGraphCut ? chooseExportSeamPlan(outW, outH, blockSize) : null;
   const useGraphCutForExport = useGraphCut && exportSeamPlan !== null && !exportSeamPlan.forceFeather;
+  const useAcceleratedGraphCutForExport = useGraphCutForExport && useAcceleratedSeam;
 
   if (useGraphCut && exportSeamPlan) {
     if (exportSeamPlan.forceFeather) {
@@ -2482,22 +2899,56 @@ async function exportComposite(): Promise<void> {
 
   // Saliency maps + pre-allocate readback buffers for export compositing
   const exportSaliencyMaps = getLastSaliency();
-  const _expCompPixels = useGraphCutForExport ? new Uint8Array(outW * outH * 4) : null;
-  const _expNewPixels = new Uint8Array(outW * outH * 4);
+  const _expCompPixels = useGraphCutForExport && !useAcceleratedGraphCutForExport
+    ? new Uint8Array(outW * outH * 4)
+    : null;
+  const _expNewPixels = useAcceleratedSeam ? null : new Uint8Array(outW * outH * 4);
   let keyCoverageMask: Uint8Array | null = null;
+  let keyCoverageTex: ManagedTexture | null = null;
   const exportFeatherWidth = Math.max(1, Math.round(featherWidth * compositeScale));
   const exportGhostBlockSize = (exportSeamPlan?.blockSize ?? blockSize) * 2;
 
-  const blendWithMask = (maskPixels: Uint8Array): void => {
-    const maskTex = createMaskTexture(gl, maskPixels, outW, outH);
+  const blendWithMaskTexture = (
+    maskTex: WebGLTexture,
+    blendTex: WebGLTexture = newImageTex!.texture,
+  ): void => {
     if (useMultiband) {
-      pyramidBlender!.blend(currentCompTex.texture, newImageTex!.texture, maskTex.texture, altCompFBO.fbo, outW, outH, mbLevels);
+      pyramidBlender!.blend(currentCompTex.texture, blendTex, maskTex, altCompFBO.fbo, outW, outH, mbLevels);
     } else {
-      compositor!.blendWithMask(currentCompTex.texture, newImageTex!.texture, maskTex.texture, altCompFBO.fbo, outW, outH);
+      compositor!.blendWithMask(currentCompTex.texture, blendTex, maskTex, altCompFBO.fbo, outW, outH);
     }
-    maskTex.dispose();
     [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
     [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
+  };
+
+  const blendWithMask = (
+    maskPixels: Uint8Array,
+    blendTex: WebGLTexture = newImageTex!.texture,
+  ): void => {
+    const maskTex = createMaskTexture(gl, maskPixels, outW, outH);
+    try {
+      blendWithMaskTexture(maskTex.texture, blendTex);
+    } finally {
+      maskTex.dispose();
+    }
+  };
+
+  const blendGpuFeather = (blendTex: WebGLTexture = newImageTex!.texture): void => {
+    if (!seamAccelerator) throw new Error('Seam accelerator unavailable');
+    const maskTex = buildGpuFeatherMask(
+      'export-feather',
+      outW,
+      outH,
+      exportFeatherWidth,
+      currentCompTex.texture,
+      blendTex,
+      keyCoverageTex?.texture ?? null,
+    );
+    try {
+      blendWithMaskTexture(maskTex.texture, blendTex);
+    } finally {
+      maskTex.dispose();
+    }
   };
 
   const blendFeatherFromNewPixels = (
@@ -2533,8 +2984,10 @@ async function exportComposite(): Promise<void> {
     gridW: number,
     gridH: number,
     dataCostsBuf: ArrayBuffer,
-    edgeWeightsBuf: ArrayBuffer,
+    edgeWeightsHBuf: ArrayBuffer,
+    edgeWeightsVBuf: ArrayBuffer,
     hardBuf: ArrayBuffer,
+    forceLegacy = false,
   ): Promise<SeamResultMsg> => {
     if (!wm) throw new Error('Seam worker unavailable');
     const jobId = `export-${imgId}`;
@@ -2544,8 +2997,10 @@ async function exportComposite(): Promise<void> {
         gridW,
         gridH,
         dataCostsBuf,
-        edgeWeightsBuf,
+        edgeWeightsHBuf,
+        edgeWeightsVBuf,
         hardBuf,
+        forceLegacy,
         progressEveryMs: EXPORT_SEAM_PROGRESS_INTERVAL_MS,
         onStatus: ({ percent, remainingMs, info }) => {
           setStatus(`Export: ${imgNumber}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
@@ -2651,14 +3106,18 @@ async function exportComposite(): Promise<void> {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 
-    if (imgId === keyImageId && !keyCoverageMask) {
-      const keyPixels = _expNewPixels;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
-      gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, keyPixels);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      keyCoverageMask = new Uint8Array(outW * outH);
-      for (let px = 0; px < outW * outH; px++) {
-        keyCoverageMask[px] = keyPixels[px * 4 + 3];
+    if (imgId === keyImageId && !keyCoverageMask && !keyCoverageTex) {
+      if (useAcceleratedSeam && seamAccelerator) {
+        keyCoverageTex = seamAccelerator.copyTexture(newImageTex.texture, outW, outH);
+      } else {
+        const keyPixels = _expNewPixels!;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
+        gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, keyPixels);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        keyCoverageMask = new Uint8Array(outW * outH);
+        for (let px = 0; px < outW * outH; px++) {
+          keyCoverageMask[px] = keyPixels[px * 4 + 3];
+        }
       }
     }
 
@@ -2669,10 +3128,75 @@ async function exportComposite(): Promise<void> {
       gl.blitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    } else if (useGraphCutForExport && useAcceleratedGraphCutForExport) {
+      const seamFacesExport: FaceRectComposite[] = [];
+      for (const prevId of mstOrder.slice(0, imgIdx)) {
+        const pf = facesInExportCoords.get(prevId);
+        if (pf) {
+          for (const f of pf) seamFacesExport.push({ ...f, imageLabel: 0 });
+        }
+      }
+      const curFacesExport = facesInExportCoords.get(imgId);
+      if (curFacesExport) {
+        for (const f of curFacesExport) seamFacesExport.push({ ...f, imageLabel: 1 });
+      }
+
+      const seamBlockSize = exportSeamPlan?.blockSize ?? blockSize;
+      const saliencyGrid = settings?.blurAwareStitching
+        ? projectSaliencyToGrid(
+          imgId,
+          T,
+          minX,
+          minY,
+          compositeScale,
+          Math.ceil(outW / seamBlockSize),
+          Math.ceil(outH / seamBlockSize),
+          seamBlockSize,
+          exportSaliencyMaps,
+        )
+        : null;
+
+      try {
+        const seamResult = await buildAndSolveSeam({
+          stage: 'export',
+          imageId: imgId,
+          currentCompTex: currentCompTex.texture,
+          newImageTex: newImageTex.texture,
+          width: outW,
+          height: outH,
+          blockSize: seamBlockSize,
+          featherRadius: exportFeatherWidth,
+          sameCameraSettings: !!settings.sameCameraSettings,
+          faceRects: seamFacesExport,
+          saliencyGrid,
+          keyCoverageTex: keyCoverageTex?.texture ?? null,
+          wm,
+          progressEveryMs: EXPORT_SEAM_PROGRESS_INTERVAL_MS,
+          onStatus: ({ percent, remainingMs, info }) => {
+            setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
+          },
+        });
+        try {
+          blendWithMaskTexture(seamResult.maskTex.texture, seamResult.blendTex);
+        } finally {
+          seamResult.maskTex.dispose();
+          seamResult.correctedTex?.dispose();
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes('stalled')) {
+          console.warn(`Export seam stalled for ${imgId}; falling back to GPU feather blend.`, err);
+          setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam stalled, using feather fallback`);
+        } else {
+          console.warn(`Export seam solve failed for ${imgId}; falling back to GPU feather blend.`, err);
+          setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam failed, using feather fallback`);
+        }
+        blendGpuFeather();
+      }
     } else if (useGraphCutForExport) {
       // Graph cut seam finding with adaptive block sizing and stall monitoring.
       const compPixels = _expCompPixels!;
-      const newPixels = _expNewPixels;
+      const newPixels = _expNewPixels!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, compPixels);
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
@@ -2697,7 +3221,7 @@ async function exportComposite(): Promise<void> {
           ? projectSaliencyToComposite(imgId, T, minX, minY, compositeScale, outW, outH, exportSaliencyMaps)
           : null);
       const dataCostsBuf = costs.dataCosts.buffer.slice(0) as ArrayBuffer;
-      const edgeWeightsBuf = costs.edgeWeights.buffer.slice(0) as ArrayBuffer;
+      const { edgeWeightsHBuf, edgeWeightsVBuf } = splitLegacySeamEdgeWeights(costs.edgeWeights, costs.gridW, costs.gridH);
       const hardBuf = costs.hardConstraints.buffer.slice(0) as ArrayBuffer;
 
       try {
@@ -2707,8 +3231,10 @@ async function exportComposite(): Promise<void> {
           costs.gridW,
           costs.gridH,
           dataCostsBuf,
-          edgeWeightsBuf,
+          edgeWeightsHBuf,
+          edgeWeightsVBuf,
           hardBuf,
+          true,
         );
         const blockLabels = new Uint8Array(seamResult.labelsBuffer);
         const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, seamBlockSize, outW, outH);
@@ -2733,9 +3259,11 @@ async function exportComposite(): Promise<void> {
         }
         blendFeatherFromNewPixels(imgId, newPixels, compPixels);
       }
+    } else if (useAcceleratedSeam) {
+      blendGpuFeather();
     } else {
       // Feather-only fallback — reuse pre-allocated buffer
-      const newPixels = _expNewPixels;
+      const newPixels = _expNewPixels!;
       newPixels.fill(0);
       gl.bindFramebuffer(gl.FRAMEBUFFER, newImageFBO.fbo);
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
@@ -2746,6 +3274,8 @@ async function exportComposite(): Promise<void> {
     imgIdx++;
     setStatus(`Export: ${imgIdx}/${mstOrder.length}`);
   }
+
+  keyCoverageTex?.dispose();
 
   // Read back final composite
   setStatus('Finalizing export pixels…');

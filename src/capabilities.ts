@@ -13,6 +13,70 @@ export interface Capabilities {
   crossOriginIsolated: boolean;
   glRenderer: string;
   glVendor: string;
+  wasmSimd: boolean;
+  wasmThreads: boolean;
+  browserFamily: 'chromium' | 'firefox' | 'safari' | 'other';
+  seamAccelerationTier: 'desktopTurbo' | 'webgpu' | 'webglGrid' | 'legacyCpu';
+}
+
+const VALID_SEAM_TIERS = new Set(['desktopTurbo', 'webgpu', 'webglGrid', 'legacyCpu']);
+
+function detectBrowserFamily(): Capabilities['browserFamily'] {
+  const ua = navigator.userAgent || '';
+  if (/Chrome|Chromium|Edg\//i.test(ua) && !/OPR|Opera/i.test(ua)) return 'chromium';
+  if (/Firefox\//i.test(ua)) return 'firefox';
+  if (/Safari\//i.test(ua) && !/Chrome|Chromium|Edg\//i.test(ua)) return 'safari';
+  return 'other';
+}
+
+function detectWasmSimd(): boolean {
+  try {
+    return WebAssembly.validate(new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d,
+      0x01, 0x00, 0x00, 0x00,
+      0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
+      0x03, 0x02, 0x01, 0x00,
+      0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x0b,
+    ]));
+  } catch {
+    return false;
+  }
+}
+
+function detectWasmThreads(crossOriginIsolated: boolean): boolean {
+  return crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
+}
+
+function detectSeamTierOverride(): Capabilities['seamAccelerationTier'] | null {
+  try {
+    const qs = new URLSearchParams(window.location.search);
+    const queryOverride = qs.get('seamTier');
+    const storedOverride = window.localStorage.getItem('brenizer.seamTier');
+    const raw = queryOverride || storedOverride;
+    if (raw && VALID_SEAM_TIERS.has(raw)) {
+      return raw as Capabilities['seamAccelerationTier'];
+    }
+  } catch {
+    // Ignore storage/query failures and use auto detection.
+  }
+  return null;
+}
+
+function resolveSeamAccelerationTier(caps: Omit<Capabilities, 'seamAccelerationTier'>): Capabilities['seamAccelerationTier'] {
+  const override = detectSeamTierOverride();
+  if (override) return override;
+  if (!caps.webgl2) return 'legacyCpu';
+  if (
+    caps.browserFamily === 'chromium'
+    && caps.webgpuAvailable
+    && caps.crossOriginIsolated
+    && caps.hardwareConcurrency >= 8
+    && (caps.deviceMemory ?? 0) >= 8
+  ) {
+    return 'desktopTurbo';
+  }
+  if (caps.webgpuAvailable) return 'webgpu';
+  return 'webglGrid';
 }
 
 /** Quick mobile heuristic using UA + screen size. */
@@ -58,14 +122,23 @@ function probeGL(): Pick<Capabilities, 'webgl2' | 'floatFBO' | 'maxTextureSize' 
 /** Detect all capabilities. Call once after DOM is ready. */
 export async function detectCapabilities(): Promise<Capabilities> {
   const glCaps = probeGL();
+  const crossOriginIsolated = self.crossOriginIsolated ?? false;
 
-  const caps: Capabilities = {
+  const partialCaps: Omit<Capabilities, 'seamAccelerationTier'> = {
     isMobile: detectMobile(),
     deviceMemory: (navigator as any).deviceMemory ?? null,
     hardwareConcurrency: navigator.hardwareConcurrency || 2,
     webgpuAvailable: 'gpu' in navigator,
-    crossOriginIsolated: self.crossOriginIsolated ?? false,
+    crossOriginIsolated,
     ...glCaps,
+    wasmSimd: detectWasmSimd(),
+    wasmThreads: detectWasmThreads(crossOriginIsolated),
+    browserFamily: detectBrowserFamily(),
+  };
+
+  const caps: Capabilities = {
+    ...partialCaps,
+    seamAccelerationTier: resolveSeamAccelerationTier(partialCaps),
   };
 
   return caps;
@@ -84,9 +157,15 @@ export function capsSummary(c: Capabilities): { label: string; status: 'ok' | 'w
   });
   items.push({ label: `WebGPU`, status: c.webgpuAvailable ? 'ok' : 'warn' });
   items.push({
+    label: `Seam ${c.seamAccelerationTier}`,
+    status: c.seamAccelerationTier === 'legacyCpu' ? 'warn' : 'ok',
+  });
+  items.push({
     label: `Cores ${c.hardwareConcurrency}`,
     status: c.hardwareConcurrency >= 4 ? 'ok' : 'warn',
   });
+  items.push({ label: `WASM SIMD`, status: c.wasmSimd ? 'ok' : 'warn' });
+  items.push({ label: `WASM Threads`, status: c.wasmThreads ? 'ok' : 'warn' });
   if (c.deviceMemory !== null) {
     items.push({
       label: `${c.deviceMemory} GB RAM`,

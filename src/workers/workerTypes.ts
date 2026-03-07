@@ -273,8 +273,11 @@ export interface SeamSolveMsg {
   gridW: number;
   gridH: number;
   dataCostsBuffer: ArrayBuffer;
-  edgeWeightsBuffer?: ArrayBuffer;
+  edgeWeightsHBuffer?: ArrayBuffer;
+  edgeWeightsVBuffer?: ArrayBuffer;
   hardConstraintsBuffer: ArrayBuffer;
+  colorTransferStatsBuffer?: ArrayBuffer;
+  ghostPenaltyBuffer?: ArrayBuffer;
   params: Record<string, number>;
 }
 
@@ -284,6 +287,11 @@ export interface SeamResultMsg {
   type: 'result';
   jobId: string;
   labelsBuffer: ArrayBuffer;
+  backendId: string;
+  solverMs: number;
+  pushes?: number;
+  relabels?: number;
+  globalRelabels?: number;
 }
 
 export interface SeamProgressMsg {
@@ -296,6 +304,8 @@ export interface SeamProgressMsg {
   augments?: number;
   remainingMs?: number;
   expectedAugments?: number;
+  backendId?: string;
+  solverMs?: number;
 }
 
 export interface SeamErrorMsg {

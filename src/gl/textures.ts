@@ -60,3 +60,43 @@ export function createEmptyTexture(
     dispose() { gl.deleteTexture(tex); },
   };
 }
+
+export function createTextureFromData(
+  gl: WebGL2RenderingContext,
+  width: number,
+  height: number,
+  internalFormat: number,
+  format: number,
+  type: number,
+  data: ArrayBufferView | null,
+  options: {
+    minFilter?: number;
+    magFilter?: number;
+    wrapS?: number;
+    wrapT?: number;
+    unpackAlignment?: number;
+  } = {},
+): ManagedTexture {
+  const tex = gl.createTexture();
+  if (!tex) throw new Error('Failed to create texture');
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, options.wrapS ?? gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, options.wrapT ?? gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, options.minFilter ?? gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, options.magFilter ?? gl.NEAREST);
+  const prevAlignment = gl.getParameter(gl.UNPACK_ALIGNMENT) as number;
+  if (options.unpackAlignment && options.unpackAlignment !== prevAlignment) {
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, options.unpackAlignment);
+  }
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, data);
+  if (options.unpackAlignment && options.unpackAlignment !== prevAlignment) {
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlignment);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  return {
+    texture: tex,
+    width,
+    height,
+    dispose() { gl.deleteTexture(tex); },
+  };
+}
