@@ -160,7 +160,13 @@ export interface BuildWebGPUSeamGraphArgs {
   colorTransfer?: Pick<SeamColorTransferStats, 'gain' | 'offset'> | null;
 }
 
-export interface SeedWebGPUCompositeArgs {
+export interface WebGPUSeamBuilder {
+  available(): boolean;
+  buildCompactGraph(args: BuildWebGPUSeamGraphArgs): Promise<CompactSeamGraphBuildResult | null>;
+  dispose(): void;
+}
+
+interface RenderSummariesArgs {
   imageId: string;
   imageFile: File;
   sourceWidth: number;
@@ -174,22 +180,6 @@ export interface SeedWebGPUCompositeArgs {
   vignette?: { a: number; b: number; c: number };
   toneMap: boolean;
   tier: SeamAccelerationTier;
-  colorTransfer?: Pick<SeamColorTransferStats, 'gain' | 'offset'> | null;
-}
-
-export interface WebGPUSeamBuilder {
-  available(): boolean;
-  seedCompositeState(args: SeedWebGPUCompositeArgs): Promise<WebGPUSeamCompositeState | null>;
-  buildCompactGraph(args: BuildWebGPUSeamGraphArgs): Promise<CompactSeamGraphBuildResult | null>;
-  commitCompositeState(
-    previous: WebGPUSeamCompositeState,
-    graph: CompactSeamGraphBuildResult,
-    labels: Uint8Array,
-  ): WebGPUSeamCompositeState;
-  dispose(): void;
-}
-
-interface RenderSummariesArgs extends SeedWebGPUCompositeArgs {
   colorTransfer?: Pick<SeamColorTransferStats, 'gain' | 'offset'> | null;
 }
 
@@ -282,17 +272,6 @@ async function createScaledSourceCanvas(file: File, width: number, height: numbe
   } finally {
     bmp.close();
   }
-}
-
-function cloneCompositeState(state: WebGPUSeamCompositeState): WebGPUSeamCompositeState {
-  return {
-    gridW: state.gridW,
-    gridH: state.gridH,
-    blockSize: state.blockSize,
-    sampleGrid: state.sampleGrid,
-    compMean: new Float32Array(state.compMean),
-    compSq: new Float32Array(state.compSq),
-  };
 }
 
 async function mapFloat32Buffer(device: GPUDeviceLike, source: any, byteLength: number): Promise<Float32Array> {
@@ -529,19 +508,6 @@ export function createWebGPUSeamBuilder(): WebGPUSeamBuilder {
       return isWebGPUUsable();
     },
 
-    async seedCompositeState(args) {
-      const summaries = await renderCandidateSummaries(args);
-      if (!summaries) return null;
-      return {
-        gridW: summaries.gridW,
-        gridH: summaries.gridH,
-        blockSize: args.blockSize,
-        sampleGrid: summaries.sampleGrid,
-        compMean: summaries.mean,
-        compSq: summaries.sq,
-      };
-    },
-
     async buildCompactGraph(args) {
       const expectedGridW = Math.max(1, Math.ceil(args.width / args.blockSize));
       const expectedGridH = Math.max(1, Math.ceil(args.height / args.blockSize));
@@ -569,40 +535,6 @@ export function createWebGPUSeamBuilder(): WebGPUSeamBuilder {
         readbackBytes: summaries.readbackBytes,
         backendId: 'compact-webgpu-grid',
       });
-    },
-
-    commitCompositeState(previous, graph, labels) {
-      const nodeCount = graph.gridW * graph.gridH;
-      const next = cloneCompositeState(previous);
-      const nextMean = new Float32Array(nodeCount * 4);
-      const nextSq = new Float32Array(nodeCount * 4);
-      const srcCompMean = graph.summaryBuffers.compMean;
-      const srcCompSq = graph.summaryBuffers.compSq;
-      const srcNewMean = graph.summaryBuffers.newMean;
-      const srcNewSq = graph.summaryBuffers.newSq;
-
-      for (let i = 0; i < nodeCount; i++) {
-        const chooseNew = graph.hardConstraints[i] === 2 || (graph.hardConstraints[i] !== 1 && !!labels[i]);
-        const srcMean = chooseNew ? srcNewMean : srcCompMean;
-        const srcSq = chooseNew ? srcNewSq : srcCompSq;
-        const off = i * 4;
-        nextMean[off] = srcMean[off];
-        nextMean[off + 1] = srcMean[off + 1];
-        nextMean[off + 2] = srcMean[off + 2];
-        nextMean[off + 3] = srcMean[off + 3];
-        nextSq[off] = srcSq[off];
-        nextSq[off + 1] = srcSq[off + 1];
-        nextSq[off + 2] = srcSq[off + 2];
-        nextSq[off + 3] = srcSq[off + 3];
-      }
-
-      next.compMean = nextMean;
-      next.compSq = nextSq;
-      next.gridW = graph.gridW;
-      next.gridH = graph.gridH;
-      next.blockSize = graph.resolvedBlockSize;
-      next.sampleGrid = graph.sampleGrid;
-      return next;
     },
 
     dispose() {

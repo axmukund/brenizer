@@ -78,6 +78,26 @@ export interface BuildCompactGraphFromSummariesArgs {
   backendId: string;
 }
 
+export interface SummarizeTextureArgs {
+  sourceTex: WebGLTexture;
+  width: number;
+  height: number;
+  blockSize: number;
+  tier: SeamAccelerationTier;
+}
+
+export interface CompactTextureSummaryResult {
+  gridW: number;
+  gridH: number;
+  blockSize: number;
+  sampleGrid: number;
+  mean: Float32Array;
+  sq: Float32Array;
+  readbackBytes: number;
+  summaryMs: number;
+  backendId: string;
+}
+
 export interface BuildMaskTextureArgs {
   labels: Uint8Array;
   gridW: number;
@@ -97,6 +117,7 @@ export interface BuildMaskTextureArgs {
 
 export interface SeamAccelerator {
   buildCompactGraph(args: BuildCompactSeamGraphArgs): CompactSeamGraphBuildResult | null;
+  summarizeTexture(args: SummarizeTextureArgs): CompactTextureSummaryResult | null;
   applyColorTransfer(
     sourceTex: WebGLTexture,
     width: number,
@@ -747,6 +768,26 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
     });
   }
 
+  function summarizeTexture(args: SummarizeTextureArgs): CompactTextureSummaryResult | null {
+    if (!floatFBO) return null;
+    const summaryStart = performance.now();
+    const { gridW, gridH } = resolveCompactSeamGrid(args.width, args.height, args.blockSize);
+    const sampleGrid = resolveCompactSummarySampleGrid(args.tier);
+    const mean = renderBlockSummary(args.sourceTex, args.width, args.height, gridW, gridH, args.blockSize, sampleGrid, 0);
+    const sq = renderBlockSummary(args.sourceTex, args.width, args.height, gridW, gridH, args.blockSize, sampleGrid, 1);
+    return {
+      gridW,
+      gridH,
+      blockSize: args.blockSize,
+      sampleGrid,
+      mean,
+      sq,
+      readbackBytes: mean.byteLength + sq.byteLength,
+      summaryMs: performance.now() - summaryStart,
+      backendId: 'compact-webgl-grid',
+    };
+  }
+
   function renderColorAdjustedTexture(
     sourceTex: WebGLTexture,
     width: number,
@@ -895,6 +936,7 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
 
   return {
     buildCompactGraph,
+    summarizeTexture,
     applyColorTransfer,
     copyTexture,
     buildMaskTexture,
