@@ -970,7 +970,7 @@ async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<Resolv
   let totalGraphMs = graph.buildMs;
   let totalReadbackBytes = graph.readbackBytes;
 
-  if (!opts.sameCameraSettings && graph.colorTransferStats.apply) {
+  if (graph.colorTransferStats.apply) {
     correctedTex = seamAccelerator.applyColorTransfer(opts.newImageTex, opts.width, opts.height, graph.colorTransferStats);
     blendTex = correctedTex.texture;
     const correctedGraph = await tryBuildWebGPUCompactGraph(opts, tier, graph.colorTransferStats)
@@ -2222,74 +2222,73 @@ async function renderWarpedPreview(
       // zone and apply an affine correction so the new image matches the
       // composite's color distribution.  This handles non-linear differences
       // (white balance shifts, vignetting residuals, etc.).
-      // Skip when sameCameraSettings: same sensor + same exposure + same WB
-      // means color distributions are already matched; applying the transfer
-      // could introduce unnecessary rounding artefacts.
-      if (!settings.sameCameraSettings) {
-        // Collect overlap pixel statistics
-        let nOverlap = 0;
-        const sumC = [0, 0, 0]; // composite R, G, B sums
-        const sumN = [0, 0, 0]; // new image R, G, B sums
-        const sumC2 = [0, 0, 0];
-        const sumN2 = [0, 0, 0];
+      // Even when the user indicates the images share camera settings, residual
+      // overlap mismatch is still useful signal for white-balance drift and
+      // imperfect vignette correction. Trust the measured overlap statistics
+      // instead of suppressing this pass from metadata alone.
+      // Collect overlap pixel statistics
+      let nOverlap = 0;
+      const sumC = [0, 0, 0]; // composite R, G, B sums
+      const sumN = [0, 0, 0]; // new image R, G, B sums
+      const sumC2 = [0, 0, 0];
+      const sumN2 = [0, 0, 0];
 
-        // Sample every 4th pixel for speed (the stats converge quickly)
-        for (let px = 0; px < compW * compH; px += 4) {
-          const off = px * 4;
-          if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
-            nOverlap++;
-            for (let ch = 0; ch < 3; ch++) {
-              const cv = compPixels[off + ch];
-              const nv = newPixels[off + ch];
-              sumC[ch] += cv;
-              sumN[ch] += nv;
-              sumC2[ch] += cv * cv;
-              sumN2[ch] += nv * nv;
+      // Sample every 4th pixel for speed (the stats converge quickly)
+      for (let px = 0; px < compW * compH; px += 4) {
+        const off = px * 4;
+        if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
+          nOverlap++;
+          for (let ch = 0; ch < 3; ch++) {
+            const cv = compPixels[off + ch];
+            const nv = newPixels[off + ch];
+            sumC[ch] += cv;
+            sumN[ch] += nv;
+            sumC2[ch] += cv * cv;
+            sumN2[ch] += nv * nv;
+          }
+        }
+      }
+
+      // Only apply if we have meaningful overlap (>100 sampled pixels)
+      if (nOverlap > 100) {
+        const gains = [0, 0, 0];
+        const offsets = [0, 0, 0];
+        let needsTransfer = false;
+
+        for (let ch = 0; ch < 3; ch++) {
+          const meanC = sumC[ch] / nOverlap;
+          const meanN = sumN[ch] / nOverlap;
+          const stdC = Math.sqrt(Math.max(0, sumC2[ch] / nOverlap - meanC * meanC));
+          const stdN = Math.sqrt(Math.max(0, sumN2[ch] / nOverlap - meanN * meanN));
+
+          if (stdN > 2) { // avoid div-by-zero for flat regions
+            const g = stdC / stdN;
+            // Clamp gain to reasonable range to avoid extreme corrections
+            gains[ch] = Math.max(0.5, Math.min(2.0, g));
+            offsets[ch] = meanC - gains[ch] * meanN;
+            // Only flag if correction is non-trivial
+            if (Math.abs(gains[ch] - 1.0) > 0.03 || Math.abs(offsets[ch]) > 3) {
+              needsTransfer = true;
             }
+          } else {
+            gains[ch] = 1;
+            offsets[ch] = 0;
           }
         }
 
-        // Only apply if we have meaningful overlap (>100 sampled pixels)
-        if (nOverlap > 100) {
-          const gains = [0, 0, 0];
-          const offsets = [0, 0, 0];
-          let needsTransfer = false;
-
-          for (let ch = 0; ch < 3; ch++) {
-            const meanC = sumC[ch] / nOverlap;
-            const meanN = sumN[ch] / nOverlap;
-            const stdC = Math.sqrt(Math.max(0, sumC2[ch] / nOverlap - meanC * meanC));
-            const stdN = Math.sqrt(Math.max(0, sumN2[ch] / nOverlap - meanN * meanN));
-
-            if (stdN > 2) { // avoid div-by-zero for flat regions
-              const g = stdC / stdN;
-              // Clamp gain to reasonable range to avoid extreme corrections
-              gains[ch] = Math.max(0.5, Math.min(2.0, g));
-              offsets[ch] = meanC - gains[ch] * meanN;
-              // Only flag if correction is non-trivial
-              if (Math.abs(gains[ch] - 1.0) > 0.03 || Math.abs(offsets[ch]) > 3) {
-                needsTransfer = true;
-              }
-            } else {
-              gains[ch] = 1;
-              offsets[ch] = 0;
+        if (needsTransfer) {
+          // Apply affine per-channel correction to new image pixels
+          for (let px = 0; px < compW * compH; px++) {
+            if (newPixels[px * 4 + 3] < 10) continue;
+            for (let ch = 0; ch < 3; ch++) {
+              const corrected = gains[ch] * newPixels[px * 4 + ch] + offsets[ch];
+              newPixels[px * 4 + ch] = Math.max(0, Math.min(255, Math.round(corrected)));
             }
           }
-
-          if (needsTransfer) {
-            // Apply affine per-channel correction to new image pixels
-            for (let px = 0; px < compW * compH; px++) {
-              if (newPixels[px * 4 + 3] < 10) continue;
-              for (let ch = 0; ch < 3; ch++) {
-                const corrected = gains[ch] * newPixels[px * 4 + ch] + offsets[ch];
-                newPixels[px * 4 + ch] = Math.max(0, Math.min(255, Math.round(corrected)));
-              }
-            }
-            // Re-upload corrected pixels to the new image texture
-            gl.bindTexture(gl.TEXTURE_2D, newImageTex!.texture);
-            gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
-            gl.bindTexture(gl.TEXTURE_2D, null);
-          }
+          // Re-upload corrected pixels to the new image texture
+          gl.bindTexture(gl.TEXTURE_2D, newImageTex!.texture);
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, newPixels);
+          gl.bindTexture(gl.TEXTURE_2D, null);
         }
       }
 
