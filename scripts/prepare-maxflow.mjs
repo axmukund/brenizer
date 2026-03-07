@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { chmod, copyFile, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, copyFile, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -9,7 +10,7 @@ const sourceDir = resolve(root, 'native/maxflow');
 const outDir = resolve(root, 'public/wasm/maxflow');
 const emccCommand = process.env.EMXX || 'em++';
 const emCache = process.env.EM_CACHE || resolve('/tmp', 'brenizer-emcache');
-const emConfig = process.env.EM_CONFIG || resolve('/tmp', 'brenizer-emscripten-config.py');
+const synthesizedEmConfigPath = resolve('/tmp', 'brenizer-emscripten-config.py');
 const compilerWrapperPath = process.env.EM_COMPILER_WRAPPER || resolve('/tmp', 'brenizer-emcc-wrapper.py');
 
 const sourceFiles = [
@@ -33,6 +34,77 @@ const outputs = [
 ];
 
 let resolvedToolchain = null;
+
+async function fileExists(path) {
+  try {
+    await access(path, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function executableExists(path) {
+  try {
+    await access(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatPathDetails(meta) {
+  const parts = [];
+  if (meta.activeConfigPath) parts.push(`EM_CONFIG=${meta.activeConfigPath}`);
+  if (meta.emRoot) parts.push(`EMSCRIPTEN_ROOT=${meta.emRoot}`);
+  if (meta.llvmRoot) parts.push(`LLVM_ROOT=${meta.llvmRoot}`);
+  if (meta.binaryenRoot) parts.push(`BINARYEN_ROOT=${meta.binaryenRoot}`);
+  if (meta.nodePath) parts.push(`NODE_JS=${meta.nodePath}`);
+  return parts.join(', ');
+}
+
+async function resolvePathlikeEnvFile(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  if (raw.includes('\n') || raw.includes('\r')) return null;
+  const candidate = resolve(raw);
+  return (await fileExists(candidate)) ? candidate : null;
+}
+
+async function findBinaryenTool(binaryenRoot) {
+  if (!binaryenRoot) return null;
+  const candidates = [
+    join(binaryenRoot, 'bin', 'wasm-opt'),
+    join(binaryenRoot, 'wasm-opt'),
+    join(binaryenRoot, 'bin', 'wasm-opt.exe'),
+    join(binaryenRoot, 'wasm-opt.exe'),
+  ];
+  for (const candidate of candidates) {
+    if (await executableExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function validateSynthesizedToolchain(meta) {
+  const clangCandidates = [
+    join(meta.llvmRoot, 'clang'),
+    join(meta.llvmRoot, 'clang.exe'),
+  ];
+  let clangPath = null;
+  for (const candidate of clangCandidates) {
+    if (await executableExists(candidate)) {
+      clangPath = candidate;
+      break;
+    }
+  }
+  const binaryenTool = await findBinaryenTool(meta.binaryenRoot);
+  if (!clangPath || !binaryenTool) {
+    const missing = [];
+    if (!clangPath) missing.push(`clang executable not found under LLVM_ROOT (${meta.llvmRoot})`);
+    if (!binaryenTool) missing.push(`wasm-opt executable not found under BINARYEN_ROOT (${meta.binaryenRoot})`);
+    throw new Error(`${missing.join('; ')}. Resolved paths: ${formatPathDetails(meta)}`);
+  }
+  return { clangPath, binaryenTool };
+}
 
 function compilerInvocation(args) {
   if (emccCommand.endsWith('.py')) {
@@ -80,9 +152,7 @@ function run(cmd, args) {
       env: {
         ...process.env,
         PYTHONPATH: process.env.PYTHONPATH || '',
-        EM_CACHE: emCache,
-        EM_CONFIG: emConfig,
-        ...(resolvedToolchain ?? {}),
+        ...(resolvedToolchain?.env ?? { EM_CACHE: emCache }),
       },
     });
     let stdout = '';
@@ -108,11 +178,33 @@ function run(cmd, args) {
 async function resolveToolchain() {
   if (resolvedToolchain) return resolvedToolchain;
 
+  const activeEmConfigPath = await resolvePathlikeEnvFile(process.env.EM_CONFIG);
+  if (activeEmConfigPath) {
+    resolvedToolchain = {
+      mode: 'active-config',
+      env: {
+        EM_CACHE: emCache,
+      },
+      meta: {
+        activeConfigPath: activeEmConfigPath,
+      },
+    };
+    return resolvedToolchain;
+  }
+
   const compilerLookup = emccCommand.includes('/')
     ? emccCommand
     : (await run('which', [emccCommand])).stdout.trim();
   const compilerPath = await realpath(compilerLookup);
   const compilerDir = dirname(compilerPath);
+  const explicitRootsRequested = [
+    process.env.EMSCRIPTEN_ROOT,
+    process.env.EM_LLVM_ROOT,
+    process.env.EM_BINARYEN_ROOT,
+    process.env.EM_NODE_JS,
+  ].some(Boolean);
+  const emsdkLayout = basename(compilerDir) === 'emscripten' && basename(dirname(compilerDir)) === 'upstream';
+
   const emRoot = process.env.EMSCRIPTEN_ROOT
     ? resolve(process.env.EMSCRIPTEN_ROOT)
     : basename(compilerDir) === 'bin'
@@ -120,10 +212,14 @@ async function resolveToolchain() {
       : compilerDir;
   const llvmRoot = process.env.EM_LLVM_ROOT
     ? resolve(process.env.EM_LLVM_ROOT)
-    : resolve(emRoot, 'llvm/bin');
+    : emsdkLayout
+      ? resolve(dirname(compilerDir), 'bin')
+      : resolve(emRoot, 'llvm/bin');
   const binaryenRoot = process.env.EM_BINARYEN_ROOT
     ? resolve(process.env.EM_BINARYEN_ROOT)
-    : resolve(emRoot, 'binaryen');
+    : emsdkLayout
+      ? resolve(dirname(compilerDir))
+      : resolve(emRoot, 'binaryen');
   const nodeLookup = process.env.EM_NODE_JS
     ? process.env.EM_NODE_JS
     : (await run('which', ['node'])).stdout.trim();
@@ -169,23 +265,45 @@ if __name__ == '__main__':
     useCompilerWrapper ? `COMPILER_WRAPPER = ${JSON.stringify(compilerWrapperPath)}` : null,
     '',
   ].filter(Boolean).join('\n');
-  await writeFile(emConfig, configBody, 'utf8');
+  const mode = explicitRootsRequested ? 'explicit-roots' : 'autodetect';
+  const meta = {
+    emRoot,
+    llvmRoot,
+    binaryenRoot,
+    nodePath,
+  };
+  const { clangPath, binaryenTool } = await validateSynthesizedToolchain(meta);
+  await writeFile(synthesizedEmConfigPath, configBody, 'utf8');
 
   resolvedToolchain = {
-    EM_CONFIG: emConfig,
-    EM_CACHE: emCache,
-    EMSCRIPTEN_ROOT: emRoot,
-    EM_LLVM_ROOT: llvmRoot,
-    EM_BINARYEN_ROOT: binaryenRoot,
-    EM_NODE_JS: nodePath,
-    ...(useCompilerWrapper ? { EM_COMPILER_WRAPPER: compilerWrapperPath } : {}),
+    mode,
+    env: {
+      EM_CONFIG: synthesizedEmConfigPath,
+      EM_CACHE: emCache,
+      EMSCRIPTEN_ROOT: emRoot,
+      EM_LLVM_ROOT: llvmRoot,
+      EM_BINARYEN_ROOT: binaryenRoot,
+      EM_NODE_JS: nodePath,
+      ...(useCompilerWrapper ? { EM_COMPILER_WRAPPER: compilerWrapperPath } : {}),
+    },
+    meta: {
+      ...meta,
+      synthesizedEmConfigPath,
+      clangPath,
+      binaryenTool,
+    },
   };
   return resolvedToolchain;
 }
 
 async function ensureCompilerAvailable() {
   try {
-    await resolveToolchain();
+    const toolchain = await resolveToolchain();
+    if (toolchain.mode === 'active-config') {
+      log(`Using active Emscripten config at ${toolchain.meta.activeConfigPath}`);
+    } else {
+      log(`Resolved ${toolchain.mode} toolchain: ${formatPathDetails(toolchain.meta)}`);
+    }
     const invocation = compilerInvocation(['--version']);
     const { stdout, stderr } = await run(invocation.cmd, invocation.args);
     const banner = (stdout || stderr).trim().split('\n')[0] || 'unknown em++ version';

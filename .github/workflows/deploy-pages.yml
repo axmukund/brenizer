@@ -45,11 +45,15 @@ jobs:
           cd "${RUNNER_TEMP}/emsdk"
           EMSDK_PYTHON=python3 ./emsdk install 5.0.2
           EMSDK_PYTHON=python3 ./emsdk activate 5.0.2
-          echo "${RUNNER_TEMP}/emsdk" >> "${GITHUB_PATH}"
-          echo "${RUNNER_TEMP}/emsdk/upstream/emscripten" >> "${GITHUB_PATH}"
 
       - name: Build
-        run: npm run build
+        shell: bash
+        run: |
+          source "${RUNNER_TEMP}/emsdk/emsdk_env.sh"
+          em++ --version
+          echo "EM_CONFIG=${EM_CONFIG}"
+          test -x "${RUNNER_TEMP}/emsdk/upstream/bin/clang"
+          npm run build
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
