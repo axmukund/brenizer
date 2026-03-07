@@ -2697,7 +2697,8 @@ async function renderWarpedPreview(
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0.05, 0.05, 0.1, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.disable(gl.BLEND);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
   // Draw composite as a quad, adjusting UVs to show only the content region.
   // FBO textures have v=0 at bottom (GL convention), so flip V to display right-side up.
@@ -2719,6 +2720,7 @@ async function renderWarpedPreview(
     }
   }
   warpRenderer.drawMesh(currentCompTex.texture, screenMesh, viewMat, 1.0, 1.0);
+  gl.disable(gl.BLEND);
   const uMin = hasCrop ? cropL / compW : 0;
   const uMax = hasCrop ? (cropR + 1) / compW : 1;
   const vMin = hasCrop ? cropB / compH : 0;

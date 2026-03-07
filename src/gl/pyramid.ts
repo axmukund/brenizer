@@ -107,8 +107,29 @@ void main() {
   vec4 f = texture(u_fallback, v_uv);
   // Blend by primary alpha: smooth transition avoids hard edges
   // that would create ringing in the Laplacian pyramid.
-  fragColor = mix(f, p, p.a);
-  fragColor.a = max(p.a, f.a);
+  fragColor = vec4(mix(f.rgb, p.rgb, p.a), p.a);
+}
+`;
+
+// ── Finalise output alpha from the original inputs ──────────────────
+// The pyramid prefill step needs fallback RGB outside the image support,
+// but that RGB must not leak into the final composite footprint. Restore
+// alpha from the original full-resolution inputs so only true covered
+// pixels survive in preview/export outputs.
+
+const FINALIZE_FRAG = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_rgb;
+uniform sampler2D u_composite;
+uniform sampler2D u_newImage;
+out vec4 fragColor;
+void main() {
+  vec3 rgb = texture(u_rgb, v_uv).rgb;
+  float compA = texture(u_composite, v_uv).a;
+  float newA = texture(u_newImage, v_uv).a;
+  float alpha = max(compA, newA);
+  fragColor = vec4(rgb, alpha);
 }
 `;
 
@@ -206,6 +227,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
   const downsampleProg = createProgram(gl, FS_VERT, DOWNSAMPLE_FRAG);
   const upsampleProg = createProgram(gl, FS_VERT, UPSAMPLE_FRAG);
   const prefillProg = createProgram(gl, FS_VERT, PREFILL_FRAG);
+  const finalizeProg = createProgram(gl, FS_VERT, FINALIZE_FRAG);
   const laplacianProg = createProgram(gl, FS_VERT, useFloat ? LAPLACIAN_FLOAT_FRAG : LAPLACIAN_FRAG);
   const blendLapProg = createProgram(gl, FS_VERT, BLEND_LAP_FRAG);
   const reconstructProg = createProgram(gl, FS_VERT, useFloat ? RECONSTRUCT_FLOAT_FRAG : RECONSTRUCT_FRAG);
@@ -234,6 +256,11 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
   const pfLoc = {
     uPrimary: gl.getUniformLocation(prefillProg, 'u_primary'),
     uFallback: gl.getUniformLocation(prefillProg, 'u_fallback'),
+  };
+  const finLoc = {
+    uRgb: gl.getUniformLocation(finalizeProg, 'u_rgb'),
+    uComposite: gl.getUniformLocation(finalizeProg, 'u_composite'),
+    uNewImage: gl.getUniformLocation(finalizeProg, 'u_newImage'),
   };
 
   // Fullscreen quad VAO
@@ -314,6 +341,33 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, srcTex);
     gl.uniform1i(usLoc.uTex, 0);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /** Restore alpha from the original composite inputs. */
+  function finalizeAlpha(
+    rgbTex: WebGLTexture,
+    compositeTex: WebGLTexture,
+    newImageTex: WebGLTexture,
+    dstFBO: WebGLFramebuffer | null,
+    w: number,
+    h: number,
+  ) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFBO);
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(finalizeProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, rgbTex);
+    gl.uniform1i(finLoc.uRgb, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, compositeTex);
+    gl.uniform1i(finLoc.uComposite, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, newImageTex);
+    gl.uniform1i(finLoc.uNewImage, 2);
     gl.bindVertexArray(quadVAO);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
@@ -475,19 +529,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
         current = result;
       }
 
-      // Copy result to output
-      if (outputFBO === null) {
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, current.fbo.fbo);
-        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-        gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.LINEAR);
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
-      } else {
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, current.fbo.fbo);
-        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, outputFBO);
-        gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, gl.COLOR_BUFFER_BIT, gl.LINEAR);
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
-        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-      }
+      finalizeAlpha(current.tex.texture, compositeTex, newImageTex, outputFBO, width, height);
 
       // Cleanup
       if (current !== lapBlended[numLevels - 1]) freeLevel(current);
@@ -505,6 +547,7 @@ export function createPyramidBlender(gl: WebGL2RenderingContext, useFloat: boole
       gl.deleteProgram(downsampleProg);
       gl.deleteProgram(upsampleProg);
       gl.deleteProgram(prefillProg);
+      gl.deleteProgram(finalizeProg);
       gl.deleteProgram(laplacianProg);
       gl.deleteProgram(blendLapProg);
       gl.deleteProgram(reconstructProg);
