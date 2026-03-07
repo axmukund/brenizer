@@ -2,6 +2,7 @@ import { getState, setState, subscribe, type ImageEntry } from './appState';
 import { capsSummary, type Capabilities } from './capabilities';
 import { getPreset } from './presets';
 import { parseExifMetadata, normalizeImageBlobOrientation } from './exif';
+import { applyTurboModePreference } from './runtimeAcceleration';
 import heic2any from 'heic2any';
 import UTIF from 'utif';
 
@@ -476,7 +477,7 @@ function updateActionButtons(): void {
 /** Build the interactive settings panel from current PipelineSettings. */
 export function buildSettingsPanel(): void {
   const panel = $('settings-panel');
-  const { settings } = getState();
+  const { settings, turboModeEnabled } = getState();
   if (!settings) return;
 
   panel.innerHTML = '<h3>Pipeline Settings</h3>';
@@ -538,6 +539,29 @@ export function buildSettingsPanel(): void {
     panel.appendChild(row);
   };
 
+  const externalToggle = (label: string, checked: boolean, onChange: (checked: boolean) => Promise<void> | void) => {
+    const row = document.createElement('div');
+    row.className = 'setting-row';
+    const lbl = document.createElement('label');
+    lbl.textContent = label;
+    lbl.style.cssText = 'flex:1; font-size:12px;';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = checked;
+    cb.style.cssText = 'width:auto;';
+    cb.addEventListener('change', async () => {
+      cb.disabled = true;
+      try {
+        await onChange(cb.checked);
+      } finally {
+        cb.disabled = false;
+      }
+    });
+    row.appendChild(lbl);
+    row.appendChild(cb);
+    panel.appendChild(row);
+  };
+
   // Helper: add a select row
   const select = (label: string, key: keyof typeof settings, options: { value: string; label: string }[]) => {
     const row = document.createElement('div');
@@ -590,6 +614,24 @@ export function buildSettingsPanel(): void {
   toggle('Multi-band Blend', 'multibandEnabled');
   slider('Pyramid Levels (0=auto)', 'multibandLevels', 0, 7, 1);
   toggle('Exposure Compensation', 'exposureComp');
+
+  // ── Runtime ──
+  section('Runtime');
+  externalToggle('Turbo Mode (COI SW)', turboModeEnabled, async (checked) => {
+    setState({ turboModeEnabled: checked });
+    setStatus(`${checked ? 'Enabling' : 'Disabling'} turbo mode…`);
+    const result = await applyTurboModePreference(checked);
+    if (!result.reloading) {
+      if (checked && result.active) {
+        setStatus('Turbo mode active.');
+      } else if (checked) {
+        setStatus(`Turbo mode fallback: ${result.reason || 'cross-origin isolation unavailable'}`);
+      } else {
+        setStatus('Turbo mode disabled.');
+      }
+      buildSettingsPanel();
+    }
+  });
 
   // ── AI / ML ──
   section('AI / ML');

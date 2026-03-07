@@ -20,7 +20,7 @@
  * The same pipeline is used for both preview and export, with export using
  * a separate exportScale (or full-resolution when maxResExport is enabled).
  */
-import { detectCapabilities } from './capabilities';
+import { detectCapabilities, type Capabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel } from './ui';
@@ -41,6 +41,7 @@ import {
   getLastFaces, getLastSaliency, getLastVignette,
 } from './pipelineController';
 import type { SeamResultMsg } from './workers/workerTypes';
+import { getTurboModePreference } from './runtimeAcceleration';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -92,6 +93,10 @@ declare global {
   interface Window {
     __brenizerPerf?: {
       seamJobs: SeamJobMetrics[];
+    };
+    __brenizerRuntime?: {
+      caps: Capabilities | null;
+      turboModeEnabled: boolean;
     };
   }
 }
@@ -1057,7 +1062,7 @@ export function renderKeypointOverlay(imageId: string, imgW: number, imgH: numbe
   kpRenderer.drawKeypoints(scaledKps, viewMat, color, 6);
 }
 
-async function boot(): Promise<void> {
+export async function boot(): Promise<void> {
   // Init UI first so elements are wired
   initUI();
   setRenderImagePreview(renderImagePreview);
@@ -1070,10 +1075,12 @@ async function boot(): Promise<void> {
 
   // Detect capabilities
   setStatus('Detecting capabilities…');
+  const turboModeEnabled = getTurboModePreference();
   const caps = await detectCapabilities();
-  setState({ capabilities: caps });
+  setState({ capabilities: caps, turboModeEnabled });
   renderCapabilities(caps);
   ensurePerfStore().seamJobs.length = 0;
+  window.__brenizerRuntime = { caps, turboModeEnabled };
 
   // Resolve mode and apply preset
   const { userMode, mobileSafeFlag } = getState();
@@ -1094,6 +1101,7 @@ async function boot(): Promise<void> {
     seamAccelerator = createSeamAccelerator(glCtx.gl, glCtx.floatFBO);
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
     console.log('Seam acceleration tier:', caps.seamAccelerationTier);
+    console.log('Cross-origin isolation mode:', caps.crossOriginIsolationMode);
   } catch (e) {
     console.warn('WebGL2 init failed:', e);
     setStatus('Warning: WebGL2 not available — rendering disabled');
@@ -3405,8 +3413,3 @@ async function exportComposite(): Promise<void> {
   newImageFBO?.dispose(); newImageTex?.dispose();
   }
 }
-
-boot().catch(err => {
-  console.error('Boot failed:', err);
-  document.getElementById('status-bar')!.textContent = `Error: ${err.message}`;
-});

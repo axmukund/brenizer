@@ -2,6 +2,8 @@
  *  Probes the browser/device for GPU, memory, concurrency, etc.
  *  Results are used by the preset/mode selector. */
 
+import { detectCrossOriginIsolationMode, type CrossOriginIsolationMode } from './runtimeAcceleration';
+
 export interface Capabilities {
   isMobile: boolean;
   deviceMemory: number | null;      // GB, null if API unavailable
@@ -16,6 +18,7 @@ export interface Capabilities {
   wasmSimd: boolean;
   wasmThreads: boolean;
   browserFamily: 'chromium' | 'firefox' | 'safari' | 'other';
+  crossOriginIsolationMode: CrossOriginIsolationMode;
   seamAccelerationTier: 'desktopTurbo' | 'webgpu' | 'webglGrid' | 'legacyCpu';
 }
 
@@ -134,6 +137,7 @@ export async function detectCapabilities(): Promise<Capabilities> {
     wasmSimd: detectWasmSimd(),
     wasmThreads: detectWasmThreads(crossOriginIsolated),
     browserFamily: detectBrowserFamily(),
+    crossOriginIsolationMode: detectCrossOriginIsolationMode(crossOriginIsolated),
   };
 
   const caps: Capabilities = {
@@ -172,7 +176,10 @@ export function capsSummary(c: Capabilities): { label: string; status: 'ok' | 'w
       status: c.deviceMemory >= 4 ? 'ok' : 'warn',
     });
   }
-  items.push({ label: `COOP/COEP`, status: c.crossOriginIsolated ? 'ok' : 'warn' });
+  items.push({
+    label: `Isolation ${c.crossOriginIsolationMode}`,
+    status: c.crossOriginIsolated ? 'ok' : 'warn',
+  });
 
   if (c.glRenderer) {
     items.push({ label: c.glRenderer.slice(0, 30), status: 'ok' });

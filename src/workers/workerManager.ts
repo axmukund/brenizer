@@ -160,7 +160,14 @@ export function createWorkerManager(): WorkerManager {
       if (enableSeam) {
         try {
           const w = createSeam();
-          w.postMessage({ type: 'init', baseUrl, maxflowPath: 'wasm/maxflow/maxflow.js' });
+          w.postMessage({
+            type: 'init',
+            baseUrl,
+            maxflowPath: new URL('wasm/maxflow/maxflow-simd.js', baseUrl).toString(),
+            wasmPathSimd: new URL('wasm/maxflow/maxflow-simd.js', baseUrl).toString(),
+            wasmPathThreads: new URL('wasm/maxflow/maxflow-threads.js', baseUrl).toString(),
+            wasmWorkerPathThreads: new URL('wasm/maxflow/maxflow-threads.worker.js', baseUrl).toString(),
+          });
           await waitForMsg(seamHandlers, 'progress', 60000);
           results.seam = true;
           console.log('seam-worker ready');

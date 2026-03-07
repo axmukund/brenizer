@@ -3,13 +3,14 @@
  *
  * Primary path:
  *  - compact seam graph IR from main thread
- *  - typed-array push-relabel maxflow
+ *  - external WASM candidate when available
+ *  - typed-array push-relabel maxflow fallback
  *
  * Recovery path:
  *  - legacy Edmonds-Karp solver for explicit fallback/debug use
  *
  * Messages in:
- *  - {type:'init', baseUrl, maxflowPath}
+ *  - {type:'init', baseUrl, maxflowPath?, wasmPathSimd?, wasmPathThreads?, wasmWorkerPathThreads?}
  *  - {type:'solve', jobId, gridW, gridH, dataCostsBuffer, edgeWeightsHBuffer?, edgeWeightsVBuffer?, hardConstraintsBuffer, params}
  *
  * Messages out:
@@ -20,20 +21,140 @@
 
 let ready = false;
 let solverBackendId = 'js-push-relabel';
+let solverInitDetail = 'using built-in JS solver';
+let externalSolver = null;
+
+function detectWasmSimd() {
+  try {
+    return WebAssembly.validate(new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d,
+      0x01, 0x00, 0x00, 0x00,
+      0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
+      0x03, 0x02, 0x01, 0x00,
+      0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x0b,
+    ]));
+  } catch {
+    return false;
+  }
+}
+
+function deriveWasmBinaryUrl(scriptUrl) {
+  if (!scriptUrl) return '';
+  return scriptUrl.replace(/\.js(\?.*)?$/, '.wasm$1');
+}
+
+async function tryLoadExternalWasmCandidate(kind, scriptUrl, workerUrl) {
+  if (!scriptUrl) return { ok: false, reason: `${kind} candidate missing script URL` };
+
+  try {
+    importScripts(scriptUrl);
+  } catch (err) {
+    return { ok: false, reason: `${kind} loader import failed: ${err?.message || err}` };
+  }
+
+  const loaders = self.__brenizerMaxflowAssetLoaders || {};
+  const loader = loaders[kind];
+  if (typeof loader !== 'function') {
+    return { ok: false, reason: `${kind} loader did not register a factory` };
+  }
+
+  try {
+    const solver = await loader({
+      scriptUrl,
+      wasmUrl: deriveWasmBinaryUrl(scriptUrl),
+      workerUrl,
+      crossOriginIsolated: self.crossOriginIsolated === true,
+    });
+    if (!solver || typeof solver.solve !== 'function') {
+      return { ok: false, reason: `${kind} loader returned no solver implementation` };
+    }
+    return {
+      ok: true,
+      solver,
+      backendId: solver.backendId || `wasm-${kind}`,
+      detail: solver.description || `loaded ${kind} candidate`,
+    };
+  } catch (err) {
+    return { ok: false, reason: `${kind} candidate unavailable: ${err?.message || err}` };
+  }
+}
+
+async function initializeSolverBackend(msg) {
+  externalSolver = null;
+  solverBackendId = 'js-push-relabel';
+  solverInitDetail = 'using built-in JS solver';
+
+  const simdScript = msg.wasmPathSimd || msg.maxflowPath || '';
+  const threadsScript = msg.wasmPathThreads || '';
+  const threadsWorkerScript = msg.wasmWorkerPathThreads || '';
+  const attempts = [];
+
+  if (self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined' && threadsScript) {
+    attempts.push(await tryLoadExternalWasmCandidate('threads', threadsScript, threadsWorkerScript));
+  }
+  if (detectWasmSimd() && simdScript) {
+    attempts.push(await tryLoadExternalWasmCandidate('simd', simdScript, ''));
+  }
+
+  const loaded = attempts.find((attempt) => attempt.ok);
+  if (loaded) {
+    externalSolver = loaded.solver;
+    solverBackendId = loaded.backendId;
+    solverInitDetail = loaded.detail;
+    return;
+  }
+
+  const failureReason = attempts.find((attempt) => attempt.reason)?.reason;
+  if (failureReason) {
+    solverInitDetail = `${solverInitDetail}; ${failureReason}`;
+  }
+}
+
+async function solveMinCutExternal(gridW, gridH, dataCosts, edgeWeightsH, edgeWeightsV, hard, onProgress, progressEveryMs) {
+  if (!externalSolver || typeof externalSolver.solve !== 'function') {
+    throw new Error('External solver requested without a loaded implementation');
+  }
+
+  onProgress('seam-solve-external', 55, `Using ${solverBackendId}`);
+  const startedAt = performance.now();
+  const result = await externalSolver.solve({
+    gridW,
+    gridH,
+    dataCosts,
+    edgeWeightsH,
+    edgeWeightsV,
+    hardConstraints: hard,
+    progressEveryMs,
+  }, onProgress);
+  const labels = result?.labels instanceof Uint8Array
+    ? result.labels
+    : result?.labels
+      ? new Uint8Array(result.labels)
+      : null;
+  if (!labels) {
+    throw new Error('External solver returned no label buffer');
+  }
+  return {
+    labels,
+    backendId: result.backendId || solverBackendId,
+    solverMs: Number(result.solverMs) || Math.round(performance.now() - startedAt),
+    pushes: Number(result.pushes) || 0,
+    relabels: Number(result.relabels) || 0,
+    globalRelabels: Number(result.globalRelabels) || 0,
+  };
+}
 
 self.addEventListener('message', async (ev) => {
   const msg = ev.data;
   try {
     if (msg.type === 'init') {
-      // maxflowPath remains reserved for an external WASM backend. When no
-      // external solver is present, the worker always has a typed-array JS
-      // push-relabel fallback available.
+      await initializeSolverBackend(msg);
       ready = true;
       postMessage({
         type: 'progress',
         stage: 'seam-init',
         percent: 100,
-        info: `maxflow ready (${solverBackendId})`,
+        info: `maxflow ready (${solverBackendId}; ${solverInitDetail})`,
         backendId: solverBackendId,
       });
       return;
@@ -91,7 +212,9 @@ self.addEventListener('message', async (ev) => {
 
       const solveResult = preferLegacy
         ? solveMinCutLegacy(gridW, gridH, dataCosts, edgeWeightsH, edgeWeightsV, hard, emitProgress, progressEveryMs)
-        : solveMinCutPushRelabel(gridW, gridH, dataCosts, edgeWeightsH, edgeWeightsV, hard, emitProgress, progressEveryMs);
+        : externalSolver
+          ? await solveMinCutExternal(gridW, gridH, dataCosts, edgeWeightsH, edgeWeightsV, hard, emitProgress, progressEveryMs)
+          : solveMinCutPushRelabel(gridW, gridH, dataCosts, edgeWeightsH, edgeWeightsV, hard, emitProgress, progressEveryMs);
 
       emitProgress('seam-solve-done', 100, 'Seam solve complete', {
         solverMs: solveResult.solverMs,

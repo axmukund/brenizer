@@ -135,9 +135,19 @@ const TIMEOUTS = {
   protocolMs: 1_800_000,
 };
 
+function parseBooleanish(raw) {
+  if (raw == null || raw === '') return null;
+  if (/^(1|true|yes|on)$/i.test(raw)) return true;
+  if (/^(0|false|no|off)$/i.test(raw)) return false;
+  return null;
+}
+
 const SEAM_TIER_OVERRIDE = (process.env.SEAM_TIER || '').trim() || null;
+const TURBO_MODE_OVERRIDE = parseBooleanish(process.env.TURBO_MODE);
+const EXPECT_COI = /^(1|true|yes)$/i.test(process.env.EXPECT_COI || '');
 const RUN_SEAM_BENCHMARKS = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK || '');
 const BENCHMARK_ASSERT = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK_ASSERT || '');
+const SCENARIO_ID_FILTER = (process.env.SCENARIO_ID || '').trim();
 const BENCHMARK_TIER_MATRIX = (process.env.SEAM_BENCHMARK_TIERS || 'legacyCpu,webglGrid')
   .split(',')
   .map(v => v.trim())
@@ -160,10 +170,14 @@ function formatMetrics(m) {
   ].join(', ');
 }
 
-function withSeamTier(baseUrl, seamTier) {
-  if (!seamTier) return baseUrl;
+function withRuntimeOptions(baseUrl, options = {}) {
   const url = new URL(baseUrl);
-  url.searchParams.set('seamTier', seamTier);
+  if (options.seamTier) {
+    url.searchParams.set('seamTier', options.seamTier);
+  }
+  if (typeof options.turboMode === 'boolean') {
+    url.searchParams.set('turboMode', options.turboMode ? '1' : '0');
+  }
   return url.toString();
 }
 
@@ -222,10 +236,46 @@ function extractBenchmarkStats(seamJobs) {
   };
 }
 
+function isTransientNavigationError(err) {
+  if (!(err instanceof Error)) return false;
+  return /Execution context was destroyed|Cannot find context with specified id|Target closed/i.test(err.message);
+}
+
+async function waitForRuntimeBootstrap(page, scenarioLabel) {
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await page.waitForFunction(
+        () => {
+          const runtime = window.__brenizerRuntime;
+          const stitchBtn = document.getElementById('btn-stitch');
+          return !!runtime?.caps && !!stitchBtn;
+        },
+        { timeout: TIMEOUTS.pageLoadMs },
+      );
+      return;
+    } catch (err) {
+      if (!isTransientNavigationError(err) || attempt === maxAttempts) {
+        throw err;
+      }
+      console.log(`[${scenarioLabel}] Waiting through bootstrap reload (${attempt}/${maxAttempts})...`);
+      await page.waitForNavigation({
+        waitUntil: 'networkidle0',
+        timeout: TIMEOUTS.pageLoadMs,
+      }).catch(() => undefined);
+    }
+  }
+}
+
 async function runScenario(browser, scenario, options = {}) {
   const seamTier = options.seamTier ?? SEAM_TIER_OVERRIDE;
-  const scenarioUrl = withSeamTier(APP_URL, seamTier);
-  const scenarioLabel = seamTier ? `${scenario.id}@${seamTier}` : scenario.id;
+  const turboMode = typeof options.turboMode === 'boolean' ? options.turboMode : TURBO_MODE_OVERRIDE;
+  const scenarioUrl = withRuntimeOptions(APP_URL, { seamTier, turboMode });
+  const suffix = [
+    seamTier ? `seam=${seamTier}` : '',
+    typeof turboMode === 'boolean' ? `turbo=${turboMode ? 'on' : 'off'}` : '',
+  ].filter(Boolean).join(',');
+  const scenarioLabel = suffix ? `${scenario.id}@${suffix}` : scenario.id;
   const page = await browser.newPage();
   page.on('console', msg => console.log(`[${scenarioLabel}] PAGE:`, msg.text()));
   page.on('pageerror', err => console.error(`[${scenarioLabel}] PAGE ERROR:`, err));
@@ -235,6 +285,7 @@ async function runScenario(browser, scenario, options = {}) {
       waitUntil: 'networkidle0',
       timeout: TIMEOUTS.pageLoadMs,
     });
+    await waitForRuntimeBootstrap(page, scenarioLabel);
 
     const result = await page.evaluate(async (sc, timeouts) => {
       function sleep(ms) {
@@ -567,11 +618,19 @@ async function runScenario(browser, scenario, options = {}) {
         failures.push(`edgeEnergy ${quality.edgeEnergy.toFixed(4)} < ${t.edgeEnergyMin}`);
       }
 
+      const runtime = {
+        crossOriginIsolated: self.crossOriginIsolated === true,
+        turboModeEnabled: window.__brenizerRuntime?.turboModeEnabled ?? null,
+        seamTier: window.__brenizerRuntime?.caps?.seamAccelerationTier ?? null,
+        crossOriginIsolationMode: window.__brenizerRuntime?.caps?.crossOriginIsolationMode ?? 'none',
+      };
+
       return {
         ok: failures.length === 0,
         phase: failures.length === 0 ? 'done' : 'quality',
         reason: failures.join('; '),
         status: finalStatus,
+        runtime,
         seamJobs: Array.isArray(window.__brenizerPerf?.seamJobs)
           ? window.__brenizerPerf.seamJobs
           : [],
@@ -593,11 +652,21 @@ async function runScenario(browser, scenario, options = {}) {
 }
 
 async function main() {
+  const selectedScenarios = SCENARIO_ID_FILTER
+    ? SCENARIOS.filter(s => s.id === SCENARIO_ID_FILTER)
+    : SCENARIOS;
+
   console.log('--- Brenizer E2E suite: multi-scenario composite quality checks ---');
   console.log(`Server: ${APP_URL}`);
   if (SEAM_TIER_OVERRIDE) console.log(`Forced seam tier: ${SEAM_TIER_OVERRIDE}`);
-  console.log(`Scenarios: ${SCENARIOS.map(s => s.id).join(', ')}`);
+  if (typeof TURBO_MODE_OVERRIDE === 'boolean') console.log(`Forced turbo mode: ${TURBO_MODE_OVERRIDE ? 'on' : 'off'}`);
+  console.log(`Scenarios: ${selectedScenarios.map(s => s.id).join(', ')}`);
   console.log();
+
+  if (selectedScenarios.length === 0) {
+    console.error(`No scenarios matched SCENARIO_ID=${SCENARIO_ID_FILTER}`);
+    process.exit(1);
+  }
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -613,17 +682,34 @@ async function main() {
 
   const failures = [];
   try {
-    for (const scenario of SCENARIOS) {
+    for (const scenario of selectedScenarios) {
       console.log(`Running scenario: ${scenario.id} (${scenario.files.length} images)`);
       const result = await runScenario(browser, scenario);
+      if (EXPECT_COI && !result.runtime?.crossOriginIsolated) {
+        result.ok = false;
+        result.phase = 'runtime';
+        result.reason = 'crossOriginIsolated was false';
+      }
       if (!result.ok) {
         failures.push({ scenario: scenario.id, result });
         console.log(`  FAIL [${result.phase}] ${result.reason || 'unknown reason'}`);
         if (result.status) console.log(`  status: ${result.status}`);
+        if (result.runtime) {
+          console.log(
+            `  runtime: coi=${result.runtime.crossOriginIsolated} mode=${result.runtime.crossOriginIsolationMode} ` +
+            `turbo=${result.runtime.turboModeEnabled} seamTier=${result.runtime.seamTier}`,
+          );
+        }
         console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
       } else {
         console.log(`  PASS ${formatMetrics(result.metrics)}`);
         console.log(`  status: ${result.status}`);
+        if (result.runtime) {
+          console.log(
+            `  runtime: coi=${result.runtime.crossOriginIsolated} mode=${result.runtime.crossOriginIsolationMode} ` +
+            `turbo=${result.runtime.turboModeEnabled} seamTier=${result.runtime.seamTier}`,
+          );
+        }
         console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
       }
       console.log();
@@ -631,13 +717,13 @@ async function main() {
 
     if (RUN_SEAM_BENCHMARKS) {
       console.log('--- Seam benchmark matrix ---');
-      const benchmarkScenarios = SCENARIOS.filter(s => BENCHMARK_SCENARIO_IDS.has(s.id));
+      const benchmarkScenarios = selectedScenarios.filter(s => BENCHMARK_SCENARIO_IDS.has(s.id));
       const benchmarkResults = [];
 
       for (const scenario of benchmarkScenarios) {
         for (const seamTier of BENCHMARK_TIER_MATRIX) {
           console.log(`Benchmark scenario: ${scenario.id} @ ${seamTier}`);
-          const result = await runScenario(browser, scenario, { seamTier });
+          const result = await runScenario(browser, scenario, { seamTier, turboMode: TURBO_MODE_OVERRIDE });
           if (!result.ok) {
             failures.push({ scenario: `${scenario.id}@${seamTier}`, result });
             console.log(`  FAIL [${result.phase}] ${result.reason || 'unknown reason'}`);
@@ -698,7 +784,7 @@ async function main() {
 
   console.log('==========================================');
   if (failures.length > 0) {
-    console.log(`E2E FAILED: ${failures.length}/${SCENARIOS.length} scenario(s) failed`);
+    console.log(`E2E FAILED: ${failures.length}/${selectedScenarios.length} scenario(s) failed`);
     for (const f of failures) {
       console.log(`- ${f.scenario}: [${f.result.phase}] ${f.result.reason}`);
       if (f.result.status) console.log(`  status: ${f.result.status}`);
@@ -706,7 +792,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`E2E PASSED: ${SCENARIOS.length}/${SCENARIOS.length} scenarios`);
+  console.log(`E2E PASSED: ${selectedScenarios.length}/${selectedScenarios.length} scenarios`);
   process.exit(0);
 }
 

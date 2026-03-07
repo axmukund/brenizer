@@ -264,7 +264,10 @@ export type CVOutMsg =
 export interface SeamInitMsg {
   type: 'init';
   baseUrl: string;
-  maxflowPath: string;
+  maxflowPath?: string;
+  wasmPathSimd?: string;
+  wasmPathThreads?: string;
+  wasmWorkerPathThreads?: string;
 }
 
 export interface SeamSolveMsg {

@@ -26,6 +26,7 @@ export interface AppState {
   images: ImageEntry[];
   keyImageId: string | null;
   capabilities: Capabilities | null;
+  turboModeEnabled: boolean;
   userMode: ModeName;
   mobileSafeFlag: boolean;
   resolvedMode: string;
@@ -38,6 +39,7 @@ let _state: AppState = {
   images: [],
   keyImageId: null,
   capabilities: null,
+  turboModeEnabled: false,
   userMode: 'auto',
   mobileSafeFlag: false,
   resolvedMode: 'auto',
