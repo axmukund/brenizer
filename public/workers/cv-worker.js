@@ -430,41 +430,62 @@ self.addEventListener('message', async (ev) => {
     if (msg.type === 'computeVignetting') {
       const ids = Object.keys(images);
       const pooled = msg.pooled || false; // If true, estimate single model for all images
+      const nBins = 10;
+      const step = 8;
 
-      if (pooled && ids.length >= 2) {
-        // ── Pooled vignetting estimation ─────────────────────────
-        // When all images share the same lens+aperture (Brenizer method),
-        // pool radial luminance samples from ALL images for a single,
-        // more robust vignetting model.  N images = N× more data,
-        // greatly reducing noise in the polynomial fit.
-        const nBins = 10;
+      function sampleRadialBinProfile(gray, w, h) {
         const binSum = new Float64Array(nBins);
         const binCount = new Float64Array(nBins);
-        const step = 8;
-
-        for (const id of ids) {
-          const img = images[id];
-          const w = img.width, h = img.height;
-          const gray = img.gray;
-          const cx = w / 2, cy = h / 2;
-          const maxR = Math.sqrt(cx * cx + cy * cy);
-          for (let y = 0; y < h; y += step) {
-            for (let x = 0; x < w; x += step) {
-              const dx = x - cx, dy = y - cy;
-              const r = Math.sqrt(dx * dx + dy * dy) / maxR;
-              const bin = Math.min(Math.floor(r * nBins), nBins - 1);
-              binSum[bin] += gray[y * w + x];
-              binCount[bin]++;
-            }
+        const cx = w / 2;
+        const cy = h / 2;
+        const maxR = Math.sqrt(cx * cx + cy * cy);
+        for (let y = 0; y < h; y += step) {
+          for (let x = 0; x < w; x += step) {
+            const lum = gray[y * w + x];
+            // Ignore clipped highlights and deep shadows; they are dominated by
+            // scene content and sensor limits, not lens shading.
+            if (lum <= 8 || lum >= 247) continue;
+            const dx = x - cx;
+            const dy = y - cy;
+            const r = Math.sqrt(dx * dx + dy * dy) / maxR;
+            const bin = Math.min(Math.floor(r * nBins), nBins - 1);
+            binSum[bin] += lum;
+            binCount[bin]++;
           }
         }
-
         const binMean = new Float64Array(nBins);
-        const centerMean = binCount[0] > 0 ? binSum[0] / binCount[0] : 128;
         for (let i = 0; i < nBins; i++) {
-          binMean[i] = binCount[i] > 0 ? binSum[i] / binCount[i] : centerMean;
+          binMean[i] = binCount[i] > 0 ? (binSum[i] / binCount[i]) : 0;
         }
+        return { binMean, binCount };
+      }
 
+      function radialTargetsFromProfile(binMean, binCount) {
+        const inner = [];
+        for (let i = 0; i < Math.min(3, nBins); i++) {
+          if (binCount[i] >= 8 && binMean[i] > 8) inner.push(binMean[i]);
+        }
+        // Use the brightest robust inner-bin estimate as the reference.
+        // This avoids learning a dark subject near the exact centre as
+        // "negative vignette", which would darken the corners even more.
+        const reference = inner.length > 0 ? Math.max(...inner) : 128;
+        const targets = new Float64Array(nBins);
+        let prev = 0;
+        for (let i = 1; i < nBins; i++) {
+          let target = prev;
+          if (binCount[i] >= 8 && binMean[i] > 8 && reference > 8) {
+            target = clampScalar(reference / binMean[i] - 1.0, 0, 2);
+          }
+          // Real vignetting should not brighten toward the corners, so keep the
+          // radial target non-decreasing with radius.
+          if (target < prev) target = prev;
+          targets[i] = target;
+          prev = target;
+        }
+        return targets;
+      }
+
+      function solveVignetteFromTargets(targets) {
         let sumR4 = 0, sumR6 = 0, sumR8 = 0, sumR10 = 0, sumR12 = 0;
         let sumR2T = 0, sumR4T = 0, sumR6T = 0;
         for (let i = 1; i < nBins; i++) {
@@ -475,8 +496,7 @@ self.addEventListener('message', async (ev) => {
           const r8 = r4 * r4;
           const r10 = r8 * r2;
           const r12 = r6 * r6;
-          const target = (centerMean > 10 && binMean[i] > 10)
-            ? (centerMean / binMean[i] - 1.0) : 0;
+          const target = clampScalar(targets[i], 0, 2);
           sumR4 += r4;
           sumR6 += r6;
           sumR8 += r8;
@@ -498,91 +518,61 @@ self.addEventListener('message', async (ev) => {
           b = solved[1];
           c = solved[2];
         }
-        a = Math.max(-2, Math.min(2, a));
-        b = Math.max(-2, Math.min(2, b));
-        c = Math.max(-2, Math.min(2, c));
+        return {
+          a: clampScalar(a, 0, 2),
+          b: clampScalar(b, 0, 2),
+          c: clampScalar(c, 0, 2),
+        };
+      }
 
-        // Broadcast same params to all images
+      if (pooled && ids.length >= 2) {
+        // ── Pooled vignetting estimation ─────────────────────────
+        // Estimate per-image normalized radial falloff first, then pool those
+        // ratios with a robust median. Pooling raw luminance directly lets
+        // scene brightness bias the model (e.g. windows near the centre and
+        // dark furniture near the corners), which produces the tile-lighting
+        // artifacts the user is seeing.
+        const pooledTargets = Array.from({ length: nBins }, () => []);
+        for (const id of ids) {
+          const img = images[id];
+          const { binMean, binCount } = sampleRadialBinProfile(img.gray, img.width, img.height);
+          const targets = radialTargetsFromProfile(binMean, binCount);
+          for (let i = 1; i < nBins; i++) {
+            if (binCount[i] >= 8 && Number.isFinite(targets[i])) {
+              pooledTargets[i].push(targets[i]);
+            }
+          }
+        }
+
+        const robustTargets = new Float64Array(nBins);
+        let prev = 0;
+        for (let i = 1; i < nBins; i++) {
+          const med = pooledTargets[i].length > 0 ? medianOfValues(pooledTargets[i]) : prev;
+          robustTargets[i] = Math.max(prev, clampScalar(med, 0, 2));
+          prev = robustTargets[i];
+        }
+
+        const { a, b, c } = solveVignetteFromTargets(robustTargets);
+
         for (const id of ids) {
           images[id].vignetteParams = { a, b, c };
           postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b, c } });
         }
-        postMessage({type:'progress', stage:'vignetting', percent:100, info:`pooled: a=${a.toFixed(4)}, b=${b.toFixed(4)}, c=${c.toFixed(4)}`});
+        postMessage({
+          type:'progress',
+          stage:'vignetting',
+          percent:100,
+          info:`pooled-robust: a=${a.toFixed(4)}, b=${b.toFixed(4)}, c=${c.toFixed(4)}`,
+        });
         return;
       }
 
-      // Per-image vignetting (original path)
+      // Per-image vignetting fit with the same non-negative monotonic target model.
       for (const id of ids) {
         const img = images[id];
-        const w = img.width, h = img.height;
-        const gray = img.gray;
-        const cx = w / 2, cy = h / 2;
-        const maxR = Math.sqrt(cx * cx + cy * cy);
-
-        // Bin luminance by radial distance (10 bins)
-        const nBins = 10;
-        const binSum = new Float64Array(nBins);
-        const binCount = new Float64Array(nBins);
-        const step = 8; // sample every 8th pixel for speed
-        for (let y = 0; y < h; y += step) {
-          for (let x = 0; x < w; x += step) {
-            const dx = x - cx, dy = y - cy;
-            const r = Math.sqrt(dx * dx + dy * dy) / maxR;
-            const bin = Math.min(Math.floor(r * nBins), nBins - 1);
-            binSum[bin] += gray[y * w + x];
-            binCount[bin]++;
-          }
-        }
-
-        // Compute mean luminance per bin
-        const binMean = new Float64Array(nBins);
-        const centerMean = binCount[0] > 0 ? binSum[0] / binCount[0] : 128;
-        for (let i = 0; i < nBins; i++) {
-          binMean[i] = binCount[i] > 0 ? binSum[i] / binCount[i] : centerMean;
-        }
-
-        // Fit polynomial: V(r) = 1 + a*r² + b*r⁴ + c*r⁶
-        // We want V(r) * observed(r) ≈ centerMean → V(r) ≈ centerMean / observed(r)
-        // Least-squares fit: minimize Σ_i (V(r_i) - target_i)²
-        // where target_i = centerMean / binMean[i], r_i = bin center
-        let sumR4 = 0, sumR6 = 0, sumR8 = 0, sumR10 = 0, sumR12 = 0;
-        let sumR2T = 0, sumR4T = 0, sumR6T = 0;
-        for (let i = 1; i < nBins; i++) { // skip center bin
-          const r = (i + 0.5) / nBins;
-          const r2 = r * r;
-          const r4 = r2 * r2;
-          const r6 = r4 * r2;
-          const r8 = r4 * r4;
-          const r10 = r8 * r2;
-          const r12 = r6 * r6;
-          const target = (centerMean > 10 && binMean[i] > 10)
-            ? (centerMean / binMean[i] - 1.0) : 0;
-          sumR4 += r4;
-          sumR6 += r6;
-          sumR8 += r8;
-          sumR10 += r10;
-          sumR12 += r12;
-          sumR2T += r2 * target;
-          sumR4T += r4 * target;
-          sumR6T += r6 * target;
-        }
-        let a = 0, b = 0, c = 0;
-        const solved = solveLinear3x3(
-          sumR4, sumR6, sumR8,
-          sumR6, sumR8, sumR10,
-          sumR8, sumR10, sumR12,
-          sumR2T, sumR4T, sumR6T,
-        );
-        if (solved) {
-          a = solved[0];
-          b = solved[1];
-          c = solved[2];
-        }
-        // Clamp to physically reasonable range
-        a = Math.max(-2, Math.min(2, a));
-        b = Math.max(-2, Math.min(2, b));
-        c = Math.max(-2, Math.min(2, c));
-
+        const { binMean, binCount } = sampleRadialBinProfile(img.gray, img.width, img.height);
+        const targets = radialTargetsFromProfile(binMean, binCount);
+        const { a, b, c } = solveVignetteFromTargets(targets);
         img.vignetteParams = { a, b, c };
         postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b, c } });
       }
