@@ -31,7 +31,7 @@ import {
   makeViewMatrix, computeBlockCosts, labelsToMask, buildAdaptiveBlendMask,
   createMaskTexture, createSeamAccelerator,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
-  type PyramidBlender, type ManagedTexture, type FaceRectComposite,
+  type PyramidBlender, type ManagedTexture, type FaceRectComposite, type MeshData,
   type SeamAccelerator, type SeamAccelerationTier, type CompactSeamGraphBuildResult,
 } from './gl';
 import {
@@ -42,6 +42,11 @@ import {
 } from './pipelineController';
 import type { SeamResultMsg } from './workers/workerTypes';
 import { getTurboModePreference } from './runtimeAcceleration';
+import {
+  createWebGPUSeamBuilder,
+  type WebGPUSeamBuilder,
+  type WebGPUSeamCompositeState,
+} from './webgpu/seamBuilder';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -49,6 +54,7 @@ let kpRenderer: KeypointRenderer | null = null;
 let compositor: Compositor | null = null;
 let pyramidBlender: PyramidBlender | null = null;
 let seamAccelerator: SeamAccelerator | null = null;
+let webgpuSeamBuilder: WebGPUSeamBuilder | null = null;
 let editorZoom = 1.0;
 let editorRotationDeg = 0.0;
 let editorPanX = 0.0;
@@ -809,6 +815,18 @@ interface BuildAndSolveSeamOptions {
   wm: SeamWorkerClient;
   progressEveryMs: number;
   forceLegacy?: boolean;
+  webgpuSeam?: {
+    builder: WebGPUSeamBuilder;
+    compositeState: WebGPUSeamCompositeState;
+    imageFile: File;
+    sourceWidth: number;
+    sourceHeight: number;
+    mesh: MeshData;
+    viewMatrix: Float32Array;
+    gain: [number, number, number];
+    vignette: { a: number; b: number; c: number };
+    toneMap: boolean;
+  } | null;
   onStatus: (snapshot: SeamSolveStatusSnapshot) => void;
 }
 
@@ -818,6 +836,7 @@ interface ResolvedSeamMaskResult {
   correctedTex: ManagedTexture | null;
   graph: CompactSeamGraphBuildResult;
   solver: SeamResultMsg;
+  nextWebgpuCompositeState: WebGPUSeamCompositeState | null;
 }
 
 function splitLegacySeamEdgeWeights(
@@ -863,20 +882,59 @@ function buildGpuFeatherMask(
   });
 }
 
+function canUseDedicatedWebGPUSeamBuilder(tier: SeamAccelerationTier): boolean {
+  return (tier === 'desktopTurbo' || tier === 'webgpu') && !!webgpuSeamBuilder;
+}
+
+async function tryBuildWebGPUCompactGraph(
+  opts: BuildAndSolveSeamOptions,
+  tier: SeamAccelerationTier,
+  colorTransfer?: Pick<NonNullable<CompactSeamGraphBuildResult['colorTransferStats']>, 'gain' | 'offset'> | null,
+): Promise<CompactSeamGraphBuildResult | null> {
+  if (!opts.webgpuSeam) return null;
+  try {
+    return await opts.webgpuSeam.builder.buildCompactGraph({
+      imageId: opts.imageId,
+      imageFile: opts.webgpuSeam.imageFile,
+      sourceWidth: opts.webgpuSeam.sourceWidth,
+      sourceHeight: opts.webgpuSeam.sourceHeight,
+      width: opts.width,
+      height: opts.height,
+      blockSize: opts.blockSize,
+      mesh: opts.webgpuSeam.mesh,
+      viewMatrix: opts.webgpuSeam.viewMatrix,
+      gain: opts.webgpuSeam.gain,
+      vignette: opts.webgpuSeam.vignette,
+      toneMap: opts.webgpuSeam.toneMap,
+      faceRects: opts.faceRects,
+      saliencyGrid: opts.saliencyGrid,
+      tier,
+      compositeState: opts.webgpuSeam.compositeState,
+      colorTransfer: colorTransfer ?? null,
+    });
+  } catch (err) {
+    console.warn(`[seam] WebGPU compact graph build failed for ${opts.stage}:${opts.imageId}; falling back to WebGL summaries.`, err);
+    return null;
+  }
+}
+
 async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<ResolvedSeamMaskResult> {
   if (!seamAccelerator) throw new Error('Seam accelerator unavailable');
   const tier = getResolvedSeamTier();
   const startedAt = performance.now();
-  let graph = seamAccelerator.buildCompactGraph({
-    compositeTex: opts.currentCompTex,
-    newTex: opts.newImageTex,
-    width: opts.width,
-    height: opts.height,
-    blockSize: opts.blockSize,
-    faceRects: opts.faceRects,
-    saliencyGrid: opts.saliencyGrid,
-    tier,
-  });
+  let graph = await tryBuildWebGPUCompactGraph(opts, tier);
+  if (!graph) {
+    graph = seamAccelerator.buildCompactGraph({
+      compositeTex: opts.currentCompTex,
+      newTex: opts.newImageTex,
+      width: opts.width,
+      height: opts.height,
+      blockSize: opts.blockSize,
+      faceRects: opts.faceRects,
+      saliencyGrid: opts.saliencyGrid,
+      tier,
+    });
+  }
   if (!graph) {
     throw new Error('Compact seam graph unavailable');
   }
@@ -890,16 +948,17 @@ async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<Resolv
   if (!opts.sameCameraSettings && graph.colorTransferStats.apply) {
     correctedTex = seamAccelerator.applyColorTransfer(opts.newImageTex, opts.width, opts.height, graph.colorTransferStats);
     blendTex = correctedTex.texture;
-    const correctedGraph = seamAccelerator.buildCompactGraph({
-      compositeTex: opts.currentCompTex,
-      newTex: blendTex,
-      width: opts.width,
-      height: opts.height,
-      blockSize: opts.blockSize,
-      faceRects: opts.faceRects,
-      saliencyGrid: opts.saliencyGrid,
-      tier,
-    });
+    const correctedGraph = await tryBuildWebGPUCompactGraph(opts, tier, graph.colorTransferStats)
+      ?? seamAccelerator.buildCompactGraph({
+        compositeTex: opts.currentCompTex,
+        newTex: blendTex,
+        width: opts.width,
+        height: opts.height,
+        blockSize: opts.blockSize,
+        faceRects: opts.faceRects,
+        saliencyGrid: opts.saliencyGrid,
+        tier,
+      });
     if (correctedGraph) {
       totalSummaryMs += correctedGraph.summaryMs;
       totalGraphMs += correctedGraph.buildMs;
@@ -928,6 +987,14 @@ async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<Resolv
 
   const maskStartedAt = performance.now();
   const labels = new Uint8Array(solver.labelsBuffer);
+  let nextWebgpuCompositeState: WebGPUSeamCompositeState | null = null;
+  if (opts.webgpuSeam && graph.backendId === 'compact-webgpu-grid') {
+    nextWebgpuCompositeState = opts.webgpuSeam.builder.commitCompositeState(
+      opts.webgpuSeam.compositeState,
+      graph,
+      labels,
+    );
+  }
   const maskTex = seamAccelerator.buildMaskTexture({
     labels,
     gridW: graph.gridW,
@@ -974,6 +1041,7 @@ async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<Resolv
       readbackBytes: totalReadbackBytes,
     },
     solver,
+    nextWebgpuCompositeState,
   };
 }
 
@@ -1099,6 +1167,7 @@ export async function boot(): Promise<void> {
     compositor = createCompositor(glCtx.gl);
     pyramidBlender = createPyramidBlender(glCtx.gl, glCtx.floatFBO);
     seamAccelerator = createSeamAccelerator(glCtx.gl, glCtx.floatFBO);
+    webgpuSeamBuilder = caps.webgpuAvailable ? createWebGPUSeamBuilder() : null;
     console.log('WebGL2 context initialised, max tex:', glCtx.maxTextureSize);
     console.log('Seam acceleration tier:', caps.seamAccelerationTier);
     console.log('Cross-origin isolation mode:', caps.crossOriginIsolationMode);
@@ -1869,6 +1938,8 @@ async function renderWarpedPreview(
   const seamTier = getResolvedSeamTier();
   const useAcceleratedSeam = seamTier !== 'legacyCpu' && !!seamAccelerator && glCtx.floatFBO;
   const previewSeamBlockSize = resolvePreviewSeamBlockSize(blockSize, seamTier, compW, compH);
+  let useDedicatedWebGPUSeamPrep = useGraphCut && useAcceleratedSeam && canUseDedicatedWebGPUSeamBuilder(seamTier);
+  let previewWebgpuCompositeState: WebGPUSeamCompositeState | null = null;
   const _compPixels = useAcceleratedSeam ? null : new Uint8Array(compW * compH * 4);
   const _newPixels = useAcceleratedSeam ? null : new Uint8Array(compW * compH * 4);
   let keyCoverageMask: Uint8Array | null = null;
@@ -2004,6 +2075,32 @@ async function renderWarpedPreview(
       gl.blitFramebuffer(0, 0, compW, compH, 0, 0, compW, compH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+      if (useDedicatedWebGPUSeamPrep && webgpuSeamBuilder) {
+        try {
+          previewWebgpuCompositeState = await webgpuSeamBuilder.seedCompositeState({
+            imageId: imgId,
+            imageFile: img.file,
+            sourceWidth: alignW,
+            sourceHeight: alignH,
+            width: compW,
+            height: compH,
+            blockSize: previewSeamBlockSize,
+            mesh,
+            viewMatrix: compViewMat,
+            gain,
+            vignette: { a: vigA, b: vigB, c: vigC },
+            toneMap: needsToneMap,
+            tier: seamTier,
+          });
+          if (!previewWebgpuCompositeState) {
+            useDedicatedWebGPUSeamPrep = false;
+          }
+        } catch (err) {
+          console.warn(`[seam] Failed to seed preview WebGPU seam state for ${imgId}; falling back to WebGL summaries.`, err);
+          useDedicatedWebGPUSeamPrep = false;
+          previewWebgpuCompositeState = null;
+        }
+      }
     } else if (useGraphCut && useAcceleratedSeam) {
       const seamFaces: FaceRectComposite[] = [];
       for (const prevId of mstOrder.slice(0, imgIdx)) {
@@ -2035,6 +2132,20 @@ async function renderWarpedPreview(
         keyCoverageTex: keyCoverageTex?.texture ?? null,
         wm: wm!,
         progressEveryMs: PREVIEW_SEAM_PROGRESS_INTERVAL_MS,
+        webgpuSeam: useDedicatedWebGPUSeamPrep && webgpuSeamBuilder && previewWebgpuCompositeState
+          ? {
+            builder: webgpuSeamBuilder,
+            compositeState: previewWebgpuCompositeState,
+            imageFile: img.file,
+            sourceWidth: alignW,
+            sourceHeight: alignH,
+            mesh,
+            viewMatrix: compViewMat,
+            gain,
+            vignette: { a: vigA, b: vigB, c: vigC },
+            toneMap: needsToneMap,
+          }
+          : null,
         onStatus: ({ percent, remainingMs, info }) => {
           setStatus(`Compositing ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
         },
@@ -2062,6 +2173,14 @@ async function renderWarpedPreview(
       }
       seamResult.maskTex.dispose();
       seamResult.correctedTex?.dispose();
+      if (useDedicatedWebGPUSeamPrep) {
+        if (seamResult.nextWebgpuCompositeState) {
+          previewWebgpuCompositeState = seamResult.nextWebgpuCompositeState;
+        } else {
+          useDedicatedWebGPUSeamPrep = false;
+          previewWebgpuCompositeState = null;
+        }
+      }
 
       [currentCompTex, altCompTex] = [altCompTex, currentCompTex];
       [currentCompFBO, altCompFBO] = [altCompFBO, currentCompFBO];
@@ -2847,6 +2966,9 @@ async function exportComposite(): Promise<void> {
   const exportSeamPlan = useGraphCut ? chooseExportSeamPlan(outW, outH, blockSize) : null;
   const useGraphCutForExport = useGraphCut && exportSeamPlan !== null && !exportSeamPlan.forceFeather;
   const useAcceleratedGraphCutForExport = useGraphCutForExport && useAcceleratedSeam;
+  const exportGraphBlockSize = exportSeamPlan?.blockSize ?? blockSize;
+  let useDedicatedWebGPUExportSeam = useAcceleratedGraphCutForExport && canUseDedicatedWebGPUSeamBuilder(seamTier);
+  let exportWebgpuCompositeState: WebGPUSeamCompositeState | null = null;
 
   if (useGraphCut && exportSeamPlan) {
     if (exportSeamPlan.forceFeather) {
@@ -2914,7 +3036,7 @@ async function exportComposite(): Promise<void> {
   let keyCoverageMask: Uint8Array | null = null;
   let keyCoverageTex: ManagedTexture | null = null;
   const exportFeatherWidth = Math.max(1, Math.round(featherWidth * compositeScale));
-  const exportGhostBlockSize = (exportSeamPlan?.blockSize ?? blockSize) * 2;
+  const exportGhostBlockSize = exportGraphBlockSize * 2;
 
   const blendWithMaskTexture = (
     maskTex: WebGLTexture,
@@ -3136,6 +3258,32 @@ async function exportComposite(): Promise<void> {
       gl.blitFramebuffer(0, 0, outW, outH, 0, 0, outW, outH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
       gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+      if (useDedicatedWebGPUExportSeam && webgpuSeamBuilder) {
+        try {
+          exportWebgpuCompositeState = await webgpuSeamBuilder.seedCompositeState({
+            imageId: imgId,
+            imageFile: img.file,
+            sourceWidth: texW,
+            sourceHeight: texH,
+            width: outW,
+            height: outH,
+            blockSize: exportGraphBlockSize,
+            mesh,
+            viewMatrix: compViewMat,
+            gain,
+            vignette: { a: expVigA, b: expVigB, c: expVigC },
+            toneMap: expNeedsToneMap,
+            tier: seamTier,
+          });
+          if (!exportWebgpuCompositeState) {
+            useDedicatedWebGPUExportSeam = false;
+          }
+        } catch (err) {
+          console.warn(`[seam] Failed to seed export WebGPU seam state for ${imgId}; falling back to WebGL summaries.`, err);
+          useDedicatedWebGPUExportSeam = false;
+          exportWebgpuCompositeState = null;
+        }
+      }
     } else if (useGraphCutForExport && useAcceleratedGraphCutForExport) {
       const seamFacesExport: FaceRectComposite[] = [];
       for (const prevId of mstOrder.slice(0, imgIdx)) {
@@ -3149,7 +3297,7 @@ async function exportComposite(): Promise<void> {
         for (const f of curFacesExport) seamFacesExport.push({ ...f, imageLabel: 1 });
       }
 
-      const seamBlockSize = exportSeamPlan?.blockSize ?? blockSize;
+      const seamBlockSize = exportGraphBlockSize;
       const saliencyGrid = settings?.blurAwareStitching
         ? projectSaliencyToGrid(
           imgId,
@@ -3180,6 +3328,20 @@ async function exportComposite(): Promise<void> {
           keyCoverageTex: keyCoverageTex?.texture ?? null,
           wm,
           progressEveryMs: EXPORT_SEAM_PROGRESS_INTERVAL_MS,
+          webgpuSeam: useDedicatedWebGPUExportSeam && webgpuSeamBuilder && exportWebgpuCompositeState
+            ? {
+              builder: webgpuSeamBuilder,
+              compositeState: exportWebgpuCompositeState,
+              imageFile: img.file,
+              sourceWidth: texW,
+              sourceHeight: texH,
+              mesh,
+              viewMatrix: compViewMat,
+              gain,
+              vignette: { a: expVigA, b: expVigB, c: expVigC },
+              toneMap: expNeedsToneMap,
+            }
+            : null,
           onStatus: ({ percent, remainingMs, info }) => {
             setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
           },
@@ -3190,6 +3352,14 @@ async function exportComposite(): Promise<void> {
           seamResult.maskTex.dispose();
           seamResult.correctedTex?.dispose();
         }
+        if (useDedicatedWebGPUExportSeam) {
+          if (seamResult.nextWebgpuCompositeState) {
+            exportWebgpuCompositeState = seamResult.nextWebgpuCompositeState;
+          } else {
+            useDedicatedWebGPUExportSeam = false;
+            exportWebgpuCompositeState = null;
+          }
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (message.includes('stalled')) {
@@ -3199,6 +3369,8 @@ async function exportComposite(): Promise<void> {
           console.warn(`Export seam solve failed for ${imgId}; falling back to GPU feather blend.`, err);
           setStatus(`Export: ${imgIdx + 1}/${mstOrder.length} — seam failed, using feather fallback`);
         }
+        useDedicatedWebGPUExportSeam = false;
+        exportWebgpuCompositeState = null;
         blendGpuFeather();
       }
     } else if (useGraphCutForExport) {

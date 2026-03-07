@@ -37,6 +37,18 @@ export interface CompactSeamGraphBuildResult {
   ghostThreshold: number;
   lightingSoftStart: number;
   lightingSoftEnd: number;
+  summaryBuffers: CompactSeamSummaryBuffers;
+}
+
+export interface CompactSeamSummaryBuffers {
+  gridW: number;
+  gridH: number;
+  blockSize: number;
+  sampleGrid: number;
+  compMean: Float32Array;
+  compSq: Float32Array;
+  newMean: Float32Array;
+  newSq: Float32Array;
 }
 
 export interface BuildCompactSeamGraphArgs {
@@ -48,6 +60,22 @@ export interface BuildCompactSeamGraphArgs {
   faceRects?: FaceRectComposite[];
   saliencyGrid?: Float32Array | null;
   tier: SeamAccelerationTier;
+}
+
+export interface BuildCompactGraphFromSummariesArgs {
+  width: number;
+  height: number;
+  blockSize: number;
+  sampleGrid: number;
+  compMean: Float32Array;
+  compSq: Float32Array;
+  newMean: Float32Array;
+  newSq: Float32Array;
+  faceRects?: FaceRectComposite[];
+  saliencyGrid?: Float32Array | null;
+  summaryMs: number;
+  readbackBytes: number;
+  backendId: string;
 }
 
 export interface BuildMaskTextureArgs {
@@ -415,6 +443,205 @@ function computeColorTransferStats(
   };
 }
 
+export function resolveCompactSeamGrid(
+  width: number,
+  height: number,
+  blockSize: number,
+): { gridW: number; gridH: number } {
+  return {
+    gridW: Math.max(1, Math.ceil(width / blockSize)),
+    gridH: Math.max(1, Math.ceil(height / blockSize)),
+  };
+}
+
+export function resolveCompactSummarySampleGrid(tier: SeamAccelerationTier): number {
+  return tier === 'desktopTurbo' ? 5 : 4;
+}
+
+export function buildCompactGraphFromSummaries(
+  args: BuildCompactGraphFromSummariesArgs,
+): CompactSeamGraphBuildResult {
+  const { gridW, gridH } = resolveCompactSeamGrid(args.width, args.height, args.blockSize);
+  const buildStart = performance.now();
+  const nNodes = gridW * gridH;
+  const dataCosts = new Float32Array(nNodes * 2);
+  const hardConstraints = new Uint8Array(nNodes);
+  const compHas = new Uint8Array(nNodes);
+  const newHas = new Uint8Array(nNodes);
+  const ghostPenalty = new Float32Array(nNodes);
+  const expandedFaces = createExpandedFaces(args.faceRects ?? []);
+  const saliencyGrid = args.saliencyGrid && args.saliencyGrid.length >= nNodes ? args.saliencyGrid : null;
+
+  for (let i = 0; i < nNodes; i++) {
+    const off = i * 4;
+    compHas[i] = args.compMean[off + 3] >= 0.45 ? 1 : 0;
+    newHas[i] = args.newMean[off + 3] >= 0.45 ? 1 : 0;
+    ghostPenalty[i] = colorMismatchNormalized(args.compMean, off, args.newMean, off);
+  }
+
+  const compDist = computeBlockDistanceField(compHas, gridW, gridH);
+  const newDist = computeBlockDistanceField(newHas, gridW, gridH);
+  let maxCompDist = 1;
+  let maxNewDist = 1;
+  for (let i = 0; i < nNodes; i++) {
+    if (compDist[i] > maxCompDist) maxCompDist = compDist[i];
+    if (newDist[i] > maxNewDist) maxNewDist = newDist[i];
+  }
+
+  const means: number[] = [];
+  for (let i = 0; i < nNodes; i++) {
+    if (compHas[i] && newHas[i]) means.push(ghostPenalty[i]);
+  }
+  means.sort((a, b) => a - b);
+  const ghostMedianDiff = means.length > 0 ? means[(means.length - 1) >> 1] : 0;
+  const ghostThreshold = Math.max(ghostMedianDiff * 3, 30 / 255);
+  const lightingSoftStart = Math.max(6 / 255, ghostMedianDiff * 1.15);
+  const lightingSoftEnd = Math.max(lightingSoftStart + 12 / 255, ghostMedianDiff * 3.2);
+
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      const nodeIdx = gy * gridW + gx;
+      const cHas = compHas[nodeIdx];
+      const nHas = newHas[nodeIdx];
+      if (!cHas && !nHas) {
+        dataCosts[nodeIdx * 2] = 0;
+        dataCosts[nodeIdx * 2 + 1] = 0;
+        continue;
+      }
+      if (cHas && !nHas) {
+        hardConstraints[nodeIdx] = 1;
+        continue;
+      }
+      if (!cHas && nHas) {
+        hardConstraints[nodeIdx] = 2;
+        continue;
+      }
+      const cD = compDist[nodeIdx] / maxCompDist;
+      const nD = newDist[nodeIdx] / maxNewDist;
+      const colorDiff = ghostPenalty[nodeIdx];
+      dataCosts[nodeIdx * 2] = 0.8 * (1 - cD) + 0.2 * colorDiff;
+      dataCosts[nodeIdx * 2 + 1] = 0.8 * (1 - nD) + 0.2 * colorDiff;
+      if (saliencyGrid) {
+        const salPenalty = saliencyGrid[nodeIdx] * 5.0;
+        dataCosts[nodeIdx * 2] += salPenalty;
+        dataCosts[nodeIdx * 2 + 1] += salPenalty;
+      }
+      const blockLeft = gx * args.blockSize;
+      const blockTop = gy * args.blockSize;
+      const blockRight = blockLeft + args.blockSize;
+      const blockBottom = blockTop + args.blockSize;
+      for (const face of expandedFaces) {
+        if (
+          blockLeft < face.right
+          && blockRight > face.left
+          && blockTop < face.bottom
+          && blockBottom > face.top
+        ) {
+          const facePenalty = 10.0;
+          if (face.imageLabel === 0) dataCosts[nodeIdx * 2 + 1] += facePenalty;
+          else dataCosts[nodeIdx * 2] += facePenalty;
+        }
+      }
+    }
+  }
+
+  const edgeWeightsH = new Float32Array(Math.max(0, (gridW - 1) * gridH));
+  const edgeWeightsV = new Float32Array(Math.max(0, gridW * (gridH - 1)));
+  const getSal = (idxA: number, idxB: number): number => {
+    if (!saliencyGrid) return 1;
+    return (saliencyGrid[idxA] + saliencyGrid[idxB]) * 0.5;
+  };
+
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW - 1; gx++) {
+      const a = gy * gridW + gx;
+      const b = a + 1;
+      const offA = a * 4;
+      const offB = b * 4;
+      const compGrad =
+        (Math.abs(args.compMean[offB] - args.compMean[offA])
+        + Math.abs(args.compMean[offB + 1] - args.compMean[offA + 1])
+        + Math.abs(args.compMean[offB + 2] - args.compMean[offA + 2])) / 3;
+      const newGrad =
+        (Math.abs(args.newMean[offB] - args.newMean[offA])
+        + Math.abs(args.newMean[offB + 1] - args.newMean[offA + 1])
+        + Math.abs(args.newMean[offB + 2] - args.newMean[offA + 2])) / 3;
+      const crossGrad = colorMismatchNormalized(args.compMean, offB, args.newMean, offB);
+      const gradientAgreement = Math.max(
+        0.01,
+        1
+          - colorMismatchNormalized(args.compMean, offA, args.newMean, offA) * 0.5
+          - colorMismatchNormalized(args.compMean, offB, args.newMean, offB) * 0.5,
+      );
+      const edgeStrength = Math.max(0.01, 1 - Math.max(compGrad, newGrad, crossGrad));
+      const blurDiscount = 0.2 + 0.8 * getSal(a, b);
+      edgeWeightsH[gy * (gridW - 1) + gx] = (0.4 * edgeStrength + 0.6 * gradientAgreement) * blurDiscount;
+    }
+  }
+  for (let gy = 0; gy < gridH - 1; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      const a = gy * gridW + gx;
+      const b = a + gridW;
+      const offA = a * 4;
+      const offB = b * 4;
+      const compGrad =
+        (Math.abs(args.compMean[offB] - args.compMean[offA])
+        + Math.abs(args.compMean[offB + 1] - args.compMean[offA + 1])
+        + Math.abs(args.compMean[offB + 2] - args.compMean[offA + 2])) / 3;
+      const newGrad =
+        (Math.abs(args.newMean[offB] - args.newMean[offA])
+        + Math.abs(args.newMean[offB + 1] - args.newMean[offA + 1])
+        + Math.abs(args.newMean[offB + 2] - args.newMean[offA + 2])) / 3;
+      const crossGrad = colorMismatchNormalized(args.compMean, offB, args.newMean, offB);
+      const gradientAgreement = Math.max(
+        0.01,
+        1
+          - colorMismatchNormalized(args.compMean, offA, args.newMean, offA) * 0.5
+          - colorMismatchNormalized(args.compMean, offB, args.newMean, offB) * 0.5,
+      );
+      const edgeStrength = Math.max(0.01, 1 - Math.max(compGrad, newGrad, crossGrad));
+      const blurDiscount = 0.2 + 0.8 * getSal(a, b);
+      edgeWeightsV[gy * gridW + gx] = (0.4 * edgeStrength + 0.6 * gradientAgreement) * blurDiscount;
+    }
+  }
+
+  const colorTransfer = computeColorTransferStats(args.compMean, args.compSq, args.newMean, args.newSq, gridW, gridH);
+  const buildMs = performance.now() - buildStart;
+
+  return {
+    gridW,
+    gridH,
+    dataCosts,
+    edgeWeightsH,
+    edgeWeightsV,
+    hardConstraints,
+    ghostPenalty,
+    colorTransferStats: colorTransfer.stats,
+    colorTransferStatsBuffer: colorTransfer.buffer,
+    ghostPenaltyBuffer: ghostPenalty,
+    readbackBytes: args.readbackBytes,
+    summaryMs: args.summaryMs,
+    buildMs,
+    backendId: args.backendId,
+    resolvedBlockSize: args.blockSize,
+    sampleGrid: args.sampleGrid,
+    ghostMedianDiff,
+    ghostThreshold,
+    lightingSoftStart,
+    lightingSoftEnd,
+    summaryBuffers: {
+      gridW,
+      gridH,
+      blockSize: args.blockSize,
+      sampleGrid: args.sampleGrid,
+      compMean: args.compMean,
+      compSq: args.compSq,
+      newMean: args.newMean,
+      newSq: args.newSq,
+    },
+  };
+}
+
 export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: boolean): SeamAccelerator {
   const summaryProg = createProgram(gl, FULLSCREEN_VERT, BLOCK_SUMMARY_FRAG);
   const colorProg = createProgram(gl, FULLSCREEN_VERT, COLOR_TRANSFER_FRAG);
@@ -496,173 +723,28 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
   function buildCompactGraph(args: BuildCompactSeamGraphArgs): CompactSeamGraphBuildResult | null {
     if (!floatFBO) return null;
     const summaryStart = performance.now();
-    const gridW = Math.max(1, Math.ceil(args.width / args.blockSize));
-    const gridH = Math.max(1, Math.ceil(args.height / args.blockSize));
-    const sampleGrid = args.tier === 'desktopTurbo' ? 5 : 4;
+    const { gridW, gridH } = resolveCompactSeamGrid(args.width, args.height, args.blockSize);
+    const sampleGrid = resolveCompactSummarySampleGrid(args.tier);
     const compMean = renderBlockSummary(args.compositeTex, args.width, args.height, gridW, gridH, args.blockSize, sampleGrid, 0);
     const compSq = renderBlockSummary(args.compositeTex, args.width, args.height, gridW, gridH, args.blockSize, sampleGrid, 1);
     const newMean = renderBlockSummary(args.newTex, args.width, args.height, gridW, gridH, args.blockSize, sampleGrid, 0);
     const newSq = renderBlockSummary(args.newTex, args.width, args.height, gridW, gridH, args.blockSize, sampleGrid, 1);
     const summaryMs = performance.now() - summaryStart;
-
-    const buildStart = performance.now();
-    const nNodes = gridW * gridH;
-    const dataCosts = new Float32Array(nNodes * 2);
-    const hardConstraints = new Uint8Array(nNodes);
-    const compHas = new Uint8Array(nNodes);
-    const newHas = new Uint8Array(nNodes);
-    const ghostPenalty = new Float32Array(nNodes);
-    const expandedFaces = createExpandedFaces(args.faceRects ?? []);
-    const saliencyGrid = args.saliencyGrid && args.saliencyGrid.length >= nNodes ? args.saliencyGrid : null;
-
-    for (let i = 0; i < nNodes; i++) {
-      const off = i * 4;
-      compHas[i] = compMean[off + 3] >= 0.45 ? 1 : 0;
-      newHas[i] = newMean[off + 3] >= 0.45 ? 1 : 0;
-      ghostPenalty[i] = colorMismatchNormalized(compMean, off, newMean, off);
-    }
-
-    const compDist = computeBlockDistanceField(compHas, gridW, gridH);
-    const newDist = computeBlockDistanceField(newHas, gridW, gridH);
-    let maxCompDist = 1;
-    let maxNewDist = 1;
-    for (let i = 0; i < nNodes; i++) {
-      if (compDist[i] > maxCompDist) maxCompDist = compDist[i];
-      if (newDist[i] > maxNewDist) maxNewDist = newDist[i];
-    }
-
-    const means: number[] = [];
-    for (let i = 0; i < nNodes; i++) {
-      if (compHas[i] && newHas[i]) means.push(ghostPenalty[i]);
-    }
-    means.sort((a, b) => a - b);
-    const ghostMedianDiff = means.length > 0 ? means[(means.length - 1) >> 1] : 0;
-    const ghostThreshold = Math.max(ghostMedianDiff * 3, 30 / 255);
-    const lightingSoftStart = Math.max(6 / 255, ghostMedianDiff * 1.15);
-    const lightingSoftEnd = Math.max(lightingSoftStart + 12 / 255, ghostMedianDiff * 3.2);
-
-    for (let gy = 0; gy < gridH; gy++) {
-      for (let gx = 0; gx < gridW; gx++) {
-        const nodeIdx = gy * gridW + gx;
-        const cHas = compHas[nodeIdx];
-        const nHas = newHas[nodeIdx];
-        if (!cHas && !nHas) {
-          dataCosts[nodeIdx * 2] = 0;
-          dataCosts[nodeIdx * 2 + 1] = 0;
-          continue;
-        }
-        if (cHas && !nHas) {
-          hardConstraints[nodeIdx] = 1;
-          continue;
-        }
-        if (!cHas && nHas) {
-          hardConstraints[nodeIdx] = 2;
-          continue;
-        }
-        const cD = compDist[nodeIdx] / maxCompDist;
-        const nD = newDist[nodeIdx] / maxNewDist;
-        const colorDiff = ghostPenalty[nodeIdx];
-        dataCosts[nodeIdx * 2] = 0.8 * (1 - cD) + 0.2 * colorDiff;
-        dataCosts[nodeIdx * 2 + 1] = 0.8 * (1 - nD) + 0.2 * colorDiff;
-        if (saliencyGrid) {
-          const salPenalty = saliencyGrid[nodeIdx] * 5.0;
-          dataCosts[nodeIdx * 2] += salPenalty;
-          dataCosts[nodeIdx * 2 + 1] += salPenalty;
-        }
-        const blockLeft = gx * args.blockSize;
-        const blockTop = gy * args.blockSize;
-        const blockRight = blockLeft + args.blockSize;
-        const blockBottom = blockTop + args.blockSize;
-        for (const face of expandedFaces) {
-          if (
-            blockLeft < face.right
-            && blockRight > face.left
-            && blockTop < face.bottom
-            && blockBottom > face.top
-          ) {
-            const facePenalty = 10.0;
-            if (face.imageLabel === 0) dataCosts[nodeIdx * 2 + 1] += facePenalty;
-            else dataCosts[nodeIdx * 2] += facePenalty;
-          }
-        }
-      }
-    }
-
-    const edgeWeightsH = new Float32Array(Math.max(0, (gridW - 1) * gridH));
-    const edgeWeightsV = new Float32Array(Math.max(0, gridW * (gridH - 1)));
-    const getSal = (idxA: number, idxB: number): number => {
-      if (!saliencyGrid) return 1;
-      return (saliencyGrid[idxA] + saliencyGrid[idxB]) * 0.5;
-    };
-
-    for (let gy = 0; gy < gridH; gy++) {
-      for (let gx = 0; gx < gridW - 1; gx++) {
-        const a = gy * gridW + gx;
-        const b = a + 1;
-        const offA = a * 4;
-        const offB = b * 4;
-        const compGrad =
-          (Math.abs(compMean[offB] - compMean[offA])
-          + Math.abs(compMean[offB + 1] - compMean[offA + 1])
-          + Math.abs(compMean[offB + 2] - compMean[offA + 2])) / 3;
-        const newGrad =
-          (Math.abs(newMean[offB] - newMean[offA])
-          + Math.abs(newMean[offB + 1] - newMean[offA + 1])
-          + Math.abs(newMean[offB + 2] - newMean[offA + 2])) / 3;
-        const crossGrad = colorMismatchNormalized(compMean, offB, newMean, offB);
-        const gradientAgreement = Math.max(0.01, 1 - colorMismatchNormalized(compMean, offA, newMean, offA) * 0.5 - colorMismatchNormalized(compMean, offB, newMean, offB) * 0.5);
-        const edgeStrength = Math.max(0.01, 1 - Math.max(compGrad, newGrad, crossGrad));
-        const blurDiscount = 0.2 + 0.8 * getSal(a, b);
-        edgeWeightsH[gy * (gridW - 1) + gx] = (0.4 * edgeStrength + 0.6 * gradientAgreement) * blurDiscount;
-      }
-    }
-    for (let gy = 0; gy < gridH - 1; gy++) {
-      for (let gx = 0; gx < gridW; gx++) {
-        const a = gy * gridW + gx;
-        const b = a + gridW;
-        const offA = a * 4;
-        const offB = b * 4;
-        const compGrad =
-          (Math.abs(compMean[offB] - compMean[offA])
-          + Math.abs(compMean[offB + 1] - compMean[offA + 1])
-          + Math.abs(compMean[offB + 2] - compMean[offA + 2])) / 3;
-        const newGrad =
-          (Math.abs(newMean[offB] - newMean[offA])
-          + Math.abs(newMean[offB + 1] - newMean[offA + 1])
-          + Math.abs(newMean[offB + 2] - newMean[offA + 2])) / 3;
-        const crossGrad = colorMismatchNormalized(compMean, offB, newMean, offB);
-        const gradientAgreement = Math.max(0.01, 1 - colorMismatchNormalized(compMean, offA, newMean, offA) * 0.5 - colorMismatchNormalized(compMean, offB, newMean, offB) * 0.5);
-        const edgeStrength = Math.max(0.01, 1 - Math.max(compGrad, newGrad, crossGrad));
-        const blurDiscount = 0.2 + 0.8 * getSal(a, b);
-        edgeWeightsV[gy * gridW + gx] = (0.4 * edgeStrength + 0.6 * gradientAgreement) * blurDiscount;
-      }
-    }
-
-    const colorTransfer = computeColorTransferStats(compMean, compSq, newMean, newSq, gridW, gridH);
-    const buildMs = performance.now() - buildStart;
-
-    return {
-      gridW,
-      gridH,
-      dataCosts,
-      edgeWeightsH,
-      edgeWeightsV,
-      hardConstraints,
-      ghostPenalty,
-      colorTransferStats: colorTransfer.stats,
-      colorTransferStatsBuffer: colorTransfer.buffer,
-      ghostPenaltyBuffer: ghostPenalty,
-      readbackBytes: compMean.byteLength + compSq.byteLength + newMean.byteLength + newSq.byteLength,
-      summaryMs,
-      buildMs,
-      backendId: 'compact-webgl-grid',
-      resolvedBlockSize: args.blockSize,
+    return buildCompactGraphFromSummaries({
+      width: args.width,
+      height: args.height,
+      blockSize: args.blockSize,
       sampleGrid,
-      ghostMedianDiff,
-      ghostThreshold,
-      lightingSoftStart,
-      lightingSoftEnd,
-    };
+      compMean,
+      compSq,
+      newMean,
+      newSq,
+      faceRects: args.faceRects,
+      saliencyGrid: args.saliencyGrid,
+      summaryMs,
+      readbackBytes: compMean.byteLength + compSq.byteLength + newMean.byteLength + newSq.byteLength,
+      backendId: 'compact-webgl-grid',
+    });
   }
 
   function renderColorAdjustedTexture(
@@ -720,6 +802,10 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
 
   function buildMaskTexture(args: BuildMaskTextureArgs): ManagedTexture {
     ensureMaskTargets(args.width, args.height);
+    const normalizedLabels = new Uint8Array(args.labels.length);
+    for (let i = 0; i < args.labels.length; i++) {
+      normalizedLabels[i] = args.labels[i] ? 255 : 0;
+    }
     const labelTex = createTextureFromData(
       gl,
       args.gridW,
@@ -727,7 +813,7 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
       gl.R8,
       gl.RED,
       gl.UNSIGNED_BYTE,
-      args.labels,
+      normalizedLabels,
       { unpackAlignment: 1 },
     );
     const penaltyTex = createTextureFromData(
