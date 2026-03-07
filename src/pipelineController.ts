@@ -61,6 +61,8 @@ export interface MatchEdge {
   isDuplicate: boolean;
   objectScore: number;
   exifScore: number;
+  lineScore: number;
+  lineMatchCount: number;
 }
 let lastEdges: MatchEdge[] = [];
 
@@ -1567,6 +1569,8 @@ export async function runStitchPreview(): Promise<void> {
     isDuplicate: e.isDuplicate || false,
     objectScore: e.objectScore ?? 0,
     exifScore: e.exifScore ?? 0,
+    lineScore: e.lineScore ?? 0,
+    lineMatchCount: e.lineMatchCount ?? 0,
   }));
 
   // Handle near-duplicates: mark one image in each duplicate pair as excluded

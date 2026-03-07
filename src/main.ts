@@ -1792,17 +1792,18 @@ async function renderWarpedPreview(
     if (order.length <= 2) return order;
 
     // Build edge quality index: for each pair, store best inlier count and RMS
-    const edgeQuality = new Map<string, { inlierCount: number; rms: number; objectScore: number; exifScore: number }>();
+    const edgeQuality = new Map<string, { inlierCount: number; rms: number; objectScore: number; exifScore: number; lineScore: number }>();
     const allEdges = getLastEdges();
     for (const e of allEdges) {
       const key1 = `${e.i}|${e.j}`;
       const key2 = `${e.j}|${e.i}`;
-      const q = {
-        inlierCount: e.inlierCount,
-        rms: e.rms,
-        objectScore: e.objectScore ?? 0,
-        exifScore: e.exifScore ?? 0,
-      };
+        const q = {
+          inlierCount: e.inlierCount,
+          rms: e.rms,
+          objectScore: e.objectScore ?? 0,
+          exifScore: e.exifScore ?? 0,
+          lineScore: e.lineScore ?? 0,
+        };
       edgeQuality.set(key1, q);
       edgeQuality.set(key2, q);
     }
@@ -1825,7 +1826,8 @@ async function renderWarpedPreview(
           const q = edgeQuality.get(`${pid}|${cand}`);
           if (q) {
             const score = (q.inlierCount / (q.rms + 1)) * (1 + q.objectScore * 0.35 + q.exifScore * 0.04);
-            candScore = Math.max(candScore, score);
+            const lineBoost = 1 + q.lineScore * 0.20;
+            candScore = Math.max(candScore, score * lineBoost);
           }
         }
         if (candScore > bestScore) {

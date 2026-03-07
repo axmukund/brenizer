@@ -7,7 +7,9 @@
  *
  * Pipeline stages implemented:
  *  - Feature extraction: ORB with CLAHE preprocessing for low-texture regions
- *  - Saliency: gradient magnitude (Sobel) + colour distinctness (Achanta) + focus (Laplacian)
+ *    plus line-segment extraction for poles/window bars and other linear cues
+ *  - Saliency: gradient magnitude (Sobel) + colour distinctness (Achanta)
+ *    + focus (Laplacian) + linear-structure heat
  *  - Vignetting: radial polynomial V(r) = 1 + ar² + br⁴ estimated from luminance falloff
  *  - Matching: cross-checked kNN with MAGSAC++ σ-consensus scoring
  *  - MST: maximum spanning tree with BFS transform propagation + perspective validation
@@ -42,7 +44,7 @@
  */
 
 let cvReady = false;
-let images = {}; // imageId -> {width,height,gray,rgbSmall?,depth?,keypoints,descriptors,descCols,objectProposals?}
+let images = {}; // imageId -> {width,height,gray,rgbSmall?,depth?,keypoints,descriptors,descCols,objectProposals?,lineSegments?,lineSignature?}
 let edges = [];  // [{i, j, H:Float64Array, inliers:[{xi,yi,xj,yj}], rms, inlierCount}]
 let transforms = {}; // imageId -> Float64Array(9) col-major 3x3
 let refId = null;
@@ -192,6 +194,15 @@ self.addEventListener('message', async (ev) => {
           keypoints = new cv.KeyPointVector();
           descriptors = new cv.Mat();
           mask = new cv.Mat();
+
+          try {
+            const lineSegments = extractLineSegmentsFromGrayMat(enhancedMat, img.gray, img.width, img.height);
+            img.lineSegments = lineSegments;
+            img.lineSignature = summarizeLineSegments(lineSegments, img.width, img.height);
+          } catch {
+            img.lineSegments = [];
+            img.lineSignature = null;
+          }
 
           // Run ORB on CLAHE-enhanced image for better keypoints
           orb.detectAndCompute(enhancedMat, mask, keypoints, descriptors);
@@ -364,9 +375,18 @@ self.addEventListener('message', async (ev) => {
           for (let i = 0; i < focusMap.length; i++) focusMap[i] /= maxFocus;
         }
 
-        // Combine: saliency = 0.4 * gradient + 0.3 * colorDistinctness + 0.3 * focus
+        // 4. Linear structure heat from the dominant detected line segments.
+        // This explicitly protects poles, bars, mullions, chair edges, and
+        // similar long structures from being treated as low-value overlap.
+        const lineHeat = rasterizeLineHeatmap(img.lineSegments || [], w, h);
+
+        // Combine: saliency = gradient + colour + focus + linear structure.
         for (let i = 0; i < w * h; i++) {
-          saliency[i] = 0.4 * gradMag[i] + 0.3 * colDist[i] + 0.3 * focusMap[i];
+          saliency[i] =
+            0.28 * gradMag[i]
+            + 0.22 * colDist[i]
+            + 0.20 * focusMap[i]
+            + 0.30 * lineHeat[i];
         }
 
         // Store on image for later use in matching and seam placement
@@ -709,6 +729,8 @@ self.addEventListener('message', async (ev) => {
       };
       const exifPairScores = new Map();
       const getExifPairScore = (idA, idB) => exifPairScores.get(makePairKey(idA, idB)) || 0;
+      const linePairScores = new Map();
+      const getLinePairScore = (idA, idB) => linePairScores.get(makePairKey(idA, idB)) || 0;
 
       if (objectAware && ids.length >= 2) {
         for (let a = 0; a < ids.length; a++) {
@@ -733,6 +755,17 @@ self.addEventListener('message', async (ev) => {
             const idB = ids[b];
             const score = computeExifPairSimilarity(images[idA]?.exif, images[idB]?.exif);
             if (score > 0) exifPairScores.set(makePairKey(idA, idB), score);
+          }
+        }
+      }
+
+      if (ids.length >= 2) {
+        for (let a = 0; a < ids.length; a++) {
+          for (let b = a + 1; b < ids.length; b++) {
+            const idA = ids[a];
+            const idB = ids[b];
+            const score = computeLinePairSimilarity(images[idA]?.lineSignature, images[idB]?.lineSignature);
+            if (score > 0) linePairScores.set(makePairKey(idA, idB), score);
           }
         }
       }
@@ -817,6 +850,39 @@ self.addEventListener('message', async (ev) => {
         }
       }
 
+      if (!matchAllPairs && ids.length >= 3) {
+        const maxExtraPairs = Math.min(40, Math.max(6, ids.length * 2));
+        let addedExtra = 0;
+        for (const idA of ids) {
+          if (addedExtra >= maxExtraPairs) break;
+          const ia = idOrder.get(idA) ?? 0;
+          const scored = [];
+          for (const idB of ids) {
+            if (idA === idB) continue;
+            const ib = idOrder.get(idB) ?? 0;
+            if (Math.abs(ia - ib) <= windowW) continue;
+            const key = makePairKey(idA, idB);
+            if (pairKeys.has(key)) continue;
+            const lineScore = getLinePairScore(idA, idB);
+            if (lineScore < 0.72) continue;
+            scored.push([idB, lineScore]);
+          }
+          scored.sort((a, b) => b[1] - a[1]);
+          if (scored.length > 0) {
+            const [idB] = scored[0];
+            if (addUniquePair(initialPairs, idA, idB)) addedExtra++;
+          }
+        }
+        if (addedExtra > 0) {
+          postMessage({
+            type:'progress',
+            stage:'matching',
+            percent:0,
+            info:`Line-aware pairing added ${addedExtra} candidate pair(s).`,
+          });
+        }
+      }
+
       const tryMatchPair = (idI, idJ, params) => {
         const imgI = images[idI];
         const imgJ = images[idJ];
@@ -833,10 +899,13 @@ self.addEventListener('message', async (ev) => {
         const numJ = imgJ.descriptors.length / descColsJ;
         const objectScore = clampScalar(params.objectScore || 0, 0, 1);
         const exifScore = clampScalar(params.exifScore || 0, 0, 1);
+        const linePriorScore = clampScalar(params.lineScore || 0, 0, 1);
         const effectiveRatio = params.ratio;
         const effectiveRansacThresh = params.ransacThreshPx;
         // EXIF support is a weak prior: only a small relaxation on the inlier floor.
-        const minInliersForPair = Math.max(4, Math.round(params.minInliers * (1 - exifScore * 0.04)));
+        const minInliersForPair = Math.max(4, Math.round(
+          params.minInliers * (1 - exifScore * 0.04 - linePriorScore * 0.05),
+        ));
         if (numI < 4 || numJ < 4) return null;
 
         let matI = null, matJ = null;
@@ -901,132 +970,83 @@ self.addEventListener('message', async (ev) => {
           const fitPtsI = filtered.pointsI;
           const fitPtsJ = filtered.pointsJ;
           if (fitPtsI.length / 2 < minInliersForPair) return null;
-
-          let srcPts = null, dstPts = null, inlierMask = null, H = null;
-          try {
-            srcPts = cv.matFromArray(fitPtsI.length / 2, 1, cv.CV_32FC2, new Float32Array(fitPtsI));
-            dstPts = cv.matFromArray(fitPtsJ.length / 2, 1, cv.CV_32FC2, new Float32Array(fitPtsJ));
-            inlierMask = new cv.Mat();
-            H = cv.findHomography(srcPts, dstPts, cv.RANSAC, effectiveRansacThresh, inlierMask);
-            if (!H || H.rows !== 3 || H.cols !== 3) return null;
-
-            const hd = H.data64F;
-            const nPts = fitPtsI.length / 2;
-            const reproj2 = new Float64Array(nPts);
-            for (let k = 0; k < nPts; k++) {
-              const xi = fitPtsI[k * 2];
-              const yi = fitPtsI[k * 2 + 1];
-              const xj = fitPtsJ[k * 2];
-              const yj = fitPtsJ[k * 2 + 1];
-              const d = hd[6] * xi + hd[7] * yi + hd[8];
-              if (Math.abs(d) < 1e-10) {
-                reproj2[k] = 1e6;
-                continue;
-              }
-              const px = (hd[0] * xi + hd[1] * yi + hd[2]) / d;
-              const py = (hd[3] * xi + hd[4] * yi + hd[5]) / d;
-              reproj2[k] = (px - xj) ** 2 + (py - yj) ** 2;
-            }
-
-            const sigmaMax = effectiveRansacThresh * 3;
-            const sigmaMax2 = sigmaMax * sigmaMax;
-            let magsacInlierCount = 0;
-            const inliers = [];
-            const inlierPtsI = [];
-            const inlierPtsJ = [];
-            const softInlierThresh2 = effectiveRansacThresh * effectiveRansacThresh * 4;
-            for (let k = 0; k < nPts; k++) {
-              const u = reproj2[k] / sigmaMax2;
-              if (u >= 1.0) continue;
-              const w = (1.0 - u) * (1.0 - u);
-              if (reproj2[k] <= softInlierThresh2) {
-                magsacInlierCount++;
-                const xi = fitPtsI[k * 2];
-                const yi = fitPtsI[k * 2 + 1];
-                const xj = fitPtsJ[k * 2];
-                const yj = fitPtsJ[k * 2 + 1];
-                inliers.push({ xi, yi, xj, yj, magsacWeight: w, origIdx: k });
-                inlierPtsI.push(xi, yi);
-                inlierPtsJ.push(xj, yj);
-              }
-            }
-            if (magsacInlierCount < minInliersForPair) return null;
-
-            let wRmsSum = 0;
-            let wSum = 0;
-            for (const inl of inliers) {
-              wRmsSum += inl.magsacWeight * reproj2[inl.origIdx];
-              wSum += inl.magsacWeight;
-            }
-            let rms;
-            if (wSum > 1e-6) {
-              rms = Math.sqrt(wRmsSum / wSum);
-            } else {
-              let rmsSum = 0;
-              for (const inl of inliers) {
-                const d = hd[6] * inl.xi + hd[7] * inl.yi + hd[8];
-                if (Math.abs(d) < 1e-10) continue;
-                const px = (hd[0] * inl.xi + hd[1] * inl.yi + hd[2]) / d;
-                const py = (hd[3] * inl.xi + hd[4] * inl.yi + hd[5]) / d;
-                rmsSum += (px - inl.xj) ** 2 + (py - inl.yj) ** 2;
-              }
-              rms = magsacInlierCount > 0 ? Math.sqrt(rmsSum / magsacInlierCount) : 1e6;
-            }
-
-            const HBuf = new Float64Array(9);
-            HBuf.set(hd.slice(0, 9));
-            if (!isHomographyValid(HBuf, imgI.width, imgI.height)) return null;
-
-            const spread = computeInlierSpread(
-              inlierPtsI, inlierPtsJ,
-              imgI.width, imgI.height,
-              imgJ.width, imgJ.height,
-            );
-            const strongSupport = magsacInlierCount >= Math.max(minInliersForPair + 6, Math.round(minInliersForPair * 1.7));
-            const mediumSupport = magsacInlierCount >= Math.max(minInliersForPair + 3, Math.round(minInliersForPair * 1.35));
-            if ((spread.minBBoxCoverage < 0.006 || spread.minCellCoverage < 0.08) && !strongSupport) {
-              return null;
-            }
-            if (!params.relaxedSpread && (spread.minBBoxCoverage < 0.012 || spread.minCellCoverage < 0.14) && !mediumSupport) {
-              return null;
-            }
-            if (filtered.keptRatio < 0.20 && !strongSupport) {
-              return null;
-            }
-
-            const inlierRatio = magsacInlierCount / nPts;
-            const tx = HBuf[2], ty = HBuf[5];
-            const maxDim = Math.max(imgI.width, imgI.height);
-            const translation = Math.sqrt(tx * tx + ty * ty);
-            const translationRatio = translation / Math.max(1, maxDim);
-            const isDuplicate = (rms < 2.0 && inlierRatio > 0.8 && translationRatio < 0.05);
-
-            const inliersBuf = new Float32Array(magsacInlierCount * 4);
-            for (let k = 0; k < magsacInlierCount; k++) {
-              inliersBuf[k * 4] = inliers[k].xi;
-              inliersBuf[k * 4 + 1] = inliers[k].yi;
-              inliersBuf[k * 4 + 2] = inliers[k].xj;
-              inliersBuf[k * 4 + 3] = inliers[k].yj;
-            }
-
-            return {
-              i: idI,
-              j: idJ,
-              H: HBuf,
-              inliers,
-              inliersBuf,
-              rms,
-              inlierCount: magsacInlierCount,
-              isDuplicate,
-              objectScore,
-              exifScore,
-            };
-          } finally {
-            if (srcPts) srcPts.delete();
-            if (dstPts) dstPts.delete();
-            if (inlierMask) inlierMask.delete();
-            if (H) H.delete();
+          const baseModel = fitHomographyModel(
+            fitPtsI,
+            fitPtsJ,
+            imgI.width,
+            imgI.height,
+            imgJ.width,
+            imgJ.height,
+            effectiveRansacThresh,
+            minInliersForPair,
+            params.relaxedSpread,
+          );
+          if (!baseModel) return null;
+          if (filtered.keptRatio < 0.20 && baseModel.inlierCount < Math.max(minInliersForPair + 6, Math.round(minInliersForPair * 1.7))) {
+            return null;
           }
+
+          let finalModel = baseModel;
+          let lineMatchCount = 0;
+          let matchedLineScore = 0;
+          const lineMatches = matchLineSegmentsUnderHomography(
+            imgI.lineSegments || [],
+            imgJ.lineSegments || [],
+            baseModel.H,
+            imgJ.width,
+            imgJ.height,
+          );
+          if (lineMatches.length > 0) {
+            const pseudo = buildLinePseudoCorrespondences(lineMatches);
+            lineMatchCount = pseudo.lineMatchCount;
+            matchedLineScore = pseudo.avgScore;
+            if (pseudo.pointsI.length >= 4) {
+              const augPtsI = new Float32Array(fitPtsI.length + pseudo.pointsI.length);
+              const augPtsJ = new Float32Array(fitPtsJ.length + pseudo.pointsJ.length);
+              augPtsI.set(fitPtsI, 0);
+              augPtsI.set(pseudo.pointsI, fitPtsI.length);
+              augPtsJ.set(fitPtsJ, 0);
+              augPtsJ.set(pseudo.pointsJ, fitPtsJ.length);
+              const metadata = new Array((augPtsI.length / 2)).fill(null);
+              for (let k = 0; k < pseudo.metadata.length; k++) {
+                metadata[(fitPtsI.length / 2) + k] = pseudo.metadata[k];
+              }
+              const augmentedModel = fitHomographyModel(
+                augPtsI,
+                augPtsJ,
+                imgI.width,
+                imgI.height,
+                imgJ.width,
+                imgJ.height,
+                effectiveRansacThresh,
+                minInliersForPair,
+                params.relaxedSpread,
+                metadata,
+              );
+              if (
+                augmentedModel
+                && augmentedModel.rms <= baseModel.rms * 1.12
+                && augmentedModel.inlierCount >= baseModel.inlierCount - Math.min(2, pseudo.lineMatchCount)
+              ) {
+                finalModel = augmentedModel;
+              }
+            }
+          }
+
+          return {
+            i: idI,
+            j: idJ,
+            H: finalModel.H,
+            inliers: finalModel.inliers,
+            inliersBuf: finalModel.inliersBuf,
+            rms: finalModel.rms,
+            inlierCount: finalModel.inlierCount,
+            isDuplicate: finalModel.isDuplicate,
+            objectScore,
+            exifScore,
+            lineScore: Math.max(matchedLineScore, linePriorScore * 0.5),
+            lineMatchCount,
+          };
         } finally {
           if (matI) matI.delete();
           if (matJ) matJ.delete();
@@ -1051,6 +1071,7 @@ self.addEventListener('message', async (ev) => {
             objectAware,
             objectScore: getObjectPairScore(idI, idJ),
             exifScore: getExifPairScore(idI, idJ),
+            lineScore: getLinePairScore(idI, idJ),
           });
           if (edge) {
             edges.push(edge);
@@ -1178,6 +1199,8 @@ self.addEventListener('message', async (ev) => {
         isDuplicate: e.isDuplicate || false,
         objectScore: e.objectScore || 0,
         exifScore: e.exifScore || 0,
+        lineScore: e.lineScore || 0,
+        lineMatchCount: e.lineMatchCount || 0,
       }));
       postMessage({type:'edges', edges: edgeMessages, duplicatePairs});
       return;
@@ -1211,7 +1234,8 @@ self.addEventListener('message', async (ev) => {
       for (const e of edges) {
         const objectBoost = 1 + clampScalar(e.objectScore || 0, 0, 1) * 0.12;
         const exifBoost = 1 + clampScalar(e.exifScore || 0, 0, 1) * 0.04;
-        const w = (e.inlierCount / (e.rms + 0.1)) * objectBoost * exifBoost;
+        const lineBoost = 1 + clampScalar(e.lineScore || 0, 0, 1) * 0.18;
+        const w = (e.inlierCount / (e.rms + 0.1)) * objectBoost * exifBoost * lineBoost;
         weightSum[e.i] = (weightSum[e.i] || 0) + w;
         weightSum[e.j] = (weightSum[e.j] || 0) + w;
         degree[e.i] = (degree[e.i] || 0) + 1;
@@ -1234,10 +1258,12 @@ self.addEventListener('message', async (ev) => {
       const sortedEdges = [...edges].sort((a, b) => {
         const wa = (a.inlierCount / (a.rms + 0.1))
           * (1 + clampScalar(a.objectScore || 0, 0, 1) * 0.12)
-          * (1 + clampScalar(a.exifScore || 0, 0, 1) * 0.04);
+          * (1 + clampScalar(a.exifScore || 0, 0, 1) * 0.04)
+          * (1 + clampScalar(a.lineScore || 0, 0, 1) * 0.18);
         const wb = (b.inlierCount / (b.rms + 0.1))
           * (1 + clampScalar(b.objectScore || 0, 0, 1) * 0.12)
-          * (1 + clampScalar(b.exifScore || 0, 0, 1) * 0.04);
+          * (1 + clampScalar(b.exifScore || 0, 0, 1) * 0.04)
+          * (1 + clampScalar(b.lineScore || 0, 0, 1) * 0.18);
         return wb - wa;
       });
 
@@ -2357,6 +2383,7 @@ self.addEventListener('message', async (ev) => {
       // correspondences for each mesh vertex, not just pairwise.
       const srcPts = []; // [x, y] in this image's coords
       const dstPts = []; // [X, Y] in global coords
+      const corrMeta = [];
 
       for (const edge of edges) {
         let isI = false, isJ = false;
@@ -2388,6 +2415,7 @@ self.addEventListener('message', async (ev) => {
 
           srcPts.push([si_x, si_y]);
           dstPts.push([gx, gy]);
+          corrMeta.push(inl);
         }
       }
 
@@ -2485,6 +2513,11 @@ self.addEventListener('message', async (ev) => {
                 ws *= 3.0;
                 break; // only boost once per correspondence
               }
+            }
+
+            const meta = corrMeta[k];
+            if (meta && meta.source === 'line') {
+              ws *= 1.8 * (0.8 + 0.4 * clampScalar(meta.lineScore || 0.5, 0, 1));
             }
 
             weights[k] = ws;
@@ -2829,6 +2862,517 @@ function computeInlierSpread(pointsI, pointsJ, wI, hI, wJ, hJ) {
     minBBoxCoverage: Math.min(sI.bboxCoverage, sJ.bboxCoverage),
     minCellCoverage: Math.min(sI.cellCoverage, sJ.cellCoverage),
   };
+}
+
+function normalizeLineAngleRad(theta) {
+  let out = theta % Math.PI;
+  if (out < 0) out += Math.PI;
+  return out;
+}
+
+function lineAngularDistance(a, b) {
+  const diff = Math.abs(normalizeLineAngleRad(a) - normalizeLineAngleRad(b));
+  return Math.min(diff, Math.PI - diff);
+}
+
+function makeLineSegment(x0, y0, x1, y1, strength = 1) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const len = Math.hypot(dx, dy);
+  if (!Number.isFinite(len) || len < 1e-3) return null;
+  return {
+    x0, y0, x1, y1,
+    mx: 0.5 * (x0 + x1),
+    my: 0.5 * (y0 + y1),
+    dx,
+    dy,
+    len,
+    angle: normalizeLineAngleRad(Math.atan2(dy, dx)),
+    strength,
+  };
+}
+
+function sampleLinePoint(line, t) {
+  return [
+    line.x0 + (line.x1 - line.x0) * t,
+    line.y0 + (line.y1 - line.y0) * t,
+  ];
+}
+
+function pointToSegmentDistanceSq(px, py, x0, y0, x1, y1) {
+  const vx = x1 - x0;
+  const vy = y1 - y0;
+  const len2 = vx * vx + vy * vy;
+  if (len2 < 1e-10) {
+    const dx = px - x0;
+    const dy = py - y0;
+    return dx * dx + dy * dy;
+  }
+  const t = clampScalar(((px - x0) * vx + (py - y0) * vy) / len2, 0, 1);
+  const qx = x0 + vx * t;
+  const qy = y0 + vy * t;
+  const dx = px - qx;
+  const dy = py - qy;
+  return dx * dx + dy * dy;
+}
+
+function dedupeLineSegments(lines, width, height) {
+  if (!lines || lines.length <= 1) return lines || [];
+  const diag = Math.hypot(width, height);
+  const kept = [];
+  const sorted = [...lines].sort((a, b) => (b.len * b.strength) - (a.len * a.strength));
+  for (const line of sorted) {
+    let duplicate = false;
+    for (const other of kept) {
+      if (lineAngularDistance(line.angle, other.angle) > (7 * Math.PI / 180)) continue;
+      const midDist = Math.hypot(line.mx - other.mx, line.my - other.my);
+      if (midDist > diag * 0.05) continue;
+      const perp = Math.sqrt(pointToSegmentDistanceSq(line.mx, line.my, other.x0, other.y0, other.x1, other.y1));
+      if (perp <= Math.max(8, diag * 0.012)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) kept.push(line);
+    if (kept.length >= 24) break;
+  }
+  return kept;
+}
+
+function extractLineSegmentsFromGrayMat(grayMat, gray, width, height) {
+  if (
+    typeof cv === 'undefined'
+    || typeof cv.Canny !== 'function'
+    || typeof cv.HoughLinesP !== 'function'
+    || !grayMat
+    || width < 32
+    || height < 32
+  ) {
+    return [];
+  }
+
+  let resized = null;
+  let edgesMat = null;
+  let linesMat = null;
+  try {
+    const maxDim = 384;
+    const scale = Math.min(1, maxDim / Math.max(width, height));
+    let workMat = grayMat;
+    if (scale < 0.999) {
+      const rw = Math.max(64, Math.round(width * scale));
+      const rh = Math.max(64, Math.round(height * scale));
+      resized = new cv.Mat();
+      cv.resize(grayMat, resized, new cv.Size(rw, rh), 0, 0, cv.INTER_AREA);
+      workMat = resized;
+    }
+
+    const detectW = workMat.cols;
+    const detectH = workMat.rows;
+    const minDim = Math.min(detectW, detectH);
+    edgesMat = new cv.Mat();
+    cv.Canny(workMat, edgesMat, 50, 150, 3, true);
+
+    linesMat = new cv.Mat();
+    cv.HoughLinesP(
+      edgesMat,
+      linesMat,
+      1,
+      Math.PI / 180,
+      Math.max(18, Math.round(minDim * 0.12)),
+      Math.max(14, Math.round(minDim * 0.14)),
+      Math.max(4, Math.round(minDim * 0.05)),
+    );
+
+    const raw = linesMat.data32S;
+    if (!raw || raw.length < 4) return [];
+
+    const invScale = scale > 0 ? 1 / scale : 1;
+    const diag = Math.hypot(width, height);
+    const minLen = Math.max(24, Math.min(width, height) * 0.10);
+    const lines = [];
+    for (let i = 0; i + 3 < raw.length; i += 4) {
+      const x0 = clampScalar(raw[i] * invScale, 0, width - 1);
+      const y0 = clampScalar(raw[i + 1] * invScale, 0, height - 1);
+      const x1 = clampScalar(raw[i + 2] * invScale, 0, width - 1);
+      const y1 = clampScalar(raw[i + 3] * invScale, 0, height - 1);
+      const seg = makeLineSegment(x0, y0, x1, y1);
+      if (!seg || seg.len < minLen) continue;
+
+      const centerX = (seg.mx / Math.max(1, width)) - 0.5;
+      const centerY = (seg.my / Math.max(1, height)) - 0.5;
+      const centreWeight = 1 - Math.min(1, Math.hypot(centerX, centerY) * 1.5);
+      seg.strength = clampScalar(0.55 * (seg.len / Math.max(1, diag)) + 0.45 * centreWeight, 0.1, 1.5);
+      lines.push(seg);
+    }
+    return dedupeLineSegments(lines, width, height);
+  } catch {
+    return [];
+  } finally {
+    if (resized) resized.delete();
+    if (edgesMat) edgesMat.delete();
+    if (linesMat) linesMat.delete();
+  }
+}
+
+function summarizeLineSegments(lines, width, height) {
+  if (!lines || lines.length === 0) return null;
+  const bins = 8;
+  const hist = new Float32Array(bins);
+  const diag = Math.max(1, Math.hypot(width, height));
+  let weightSum = 0;
+  let totalLength = 0;
+  for (const line of lines) {
+    const weight = Math.max(1e-4, line.len * line.strength);
+    const bin = Math.min(bins - 1, Math.floor((line.angle / Math.PI) * bins));
+    hist[bin] += weight;
+    weightSum += weight;
+    totalLength += line.len;
+  }
+  if (weightSum > 1e-6) {
+    const inv = 1 / weightSum;
+    for (let i = 0; i < hist.length; i++) hist[i] *= inv;
+  }
+  return {
+    hist,
+    count: lines.length,
+    density: clampScalar(totalLength / (diag * 6), 0, 1),
+  };
+}
+
+function computeLinePairSimilarity(sigA, sigB) {
+  if (!sigA || !sigB) return 0;
+  const bins = Math.min(sigA.hist.length, sigB.hist.length);
+  let intersection = 0;
+  for (let i = 0; i < bins; i++) intersection += Math.min(sigA.hist[i], sigB.hist[i]);
+  const countScore = 1 - Math.abs(sigA.count - sigB.count) / Math.max(sigA.count, sigB.count, 1);
+  const densityScore = 1 - Math.abs(sigA.density - sigB.density);
+  return clampScalar(0.65 * intersection + 0.20 * densityScore + 0.15 * countScore, 0, 1);
+}
+
+function rasterizeLineHeatmap(lines, width, height) {
+  const heat = new Float32Array(width * height);
+  if (!lines || lines.length === 0) return heat;
+
+  let maxVal = 0;
+  for (const line of lines) {
+    const radius = clampScalar(line.len * 0.015, 2, 8);
+    const radius2 = radius * radius;
+    const left = Math.max(0, Math.floor(Math.min(line.x0, line.x1) - radius - 1));
+    const right = Math.min(width - 1, Math.ceil(Math.max(line.x0, line.x1) + radius + 1));
+    const top = Math.max(0, Math.floor(Math.min(line.y0, line.y1) - radius - 1));
+    const bottom = Math.min(height - 1, Math.ceil(Math.max(line.y0, line.y1) + radius + 1));
+    const lineWeight = 0.4 + 0.6 * clampScalar(line.strength, 0, 1);
+    for (let y = top; y <= bottom; y++) {
+      const row = y * width;
+      for (let x = left; x <= right; x++) {
+        const d2 = pointToSegmentDistanceSq(x + 0.5, y + 0.5, line.x0, line.y0, line.x1, line.y1);
+        if (d2 > radius2 * 4) continue;
+        const value = Math.exp(-d2 / Math.max(1e-6, radius2 * 1.5)) * lineWeight;
+        const idx = row + x;
+        heat[idx] += value;
+        if (heat[idx] > maxVal) maxVal = heat[idx];
+      }
+    }
+  }
+  if (maxVal > 1e-6) {
+    const inv = 1 / maxVal;
+    for (let i = 0; i < heat.length; i++) heat[i] *= inv;
+  }
+  return heat;
+}
+
+function projectPointHomography(H, x, y) {
+  const denom = H[6] * x + H[7] * y + H[8];
+  if (!Number.isFinite(denom) || Math.abs(denom) < 1e-8) return null;
+  return [
+    (H[0] * x + H[1] * y + H[2]) / denom,
+    (H[3] * x + H[4] * y + H[5]) / denom,
+  ];
+}
+
+function projectLineSegmentHomography(H, line, dstW, dstH) {
+  const p0 = projectPointHomography(H, line.x0, line.y0);
+  const p1 = projectPointHomography(H, line.x1, line.y1);
+  if (!p0 || !p1) return null;
+  const margin = Math.max(dstW, dstH) * 0.12;
+  const minX = Math.min(p0[0], p1[0]);
+  const maxX = Math.max(p0[0], p1[0]);
+  const minY = Math.min(p0[1], p1[1]);
+  const maxY = Math.max(p0[1], p1[1]);
+  if (maxX < -margin || minX > dstW + margin || maxY < -margin || minY > dstH + margin) {
+    return null;
+  }
+  const projected = makeLineSegment(p0[0], p0[1], p1[0], p1[1], line.strength);
+  if (!projected || projected.len < 12) return null;
+  return projected;
+}
+
+function lineEndpointError(a, b, flip) {
+  const ax0 = a.x0, ay0 = a.y0, ax1 = a.x1, ay1 = a.y1;
+  const bx0 = flip ? b.x1 : b.x0;
+  const by0 = flip ? b.y1 : b.y0;
+  const bx1 = flip ? b.x0 : b.x1;
+  const by1 = flip ? b.y0 : b.y1;
+  return 0.5 * (Math.hypot(ax0 - bx0, ay0 - by0) + Math.hypot(ax1 - bx1, ay1 - by1));
+}
+
+function matchLineSegmentsUnderHomography(linesI, linesJ, H, dstW, dstH) {
+  if (!linesI || !linesJ || linesI.length === 0 || linesJ.length === 0) return [];
+  const candidates = [];
+  const angleLimit = 14 * Math.PI / 180;
+
+  for (let i = 0; i < linesI.length; i++) {
+    const srcLine = linesI[i];
+    const projected = projectLineSegmentHomography(H, srcLine, dstW, dstH);
+    if (!projected) continue;
+
+    for (let j = 0; j < linesJ.length; j++) {
+      const dstLine = linesJ[j];
+      const angleDiff = lineAngularDistance(projected.angle, dstLine.angle);
+      if (angleDiff > angleLimit) continue;
+
+      const maxLen = Math.max(projected.len, dstLine.len);
+      const minLen = Math.max(1e-6, Math.min(projected.len, dstLine.len));
+      const lenRatio = maxLen / minLen;
+      if (lenRatio > 2.4) continue;
+
+      const midDist = Math.hypot(projected.mx - dstLine.mx, projected.my - dstLine.my);
+      const midLimit = Math.max(18, maxLen * 0.35);
+      if (midDist > midLimit) continue;
+
+      const directErr = lineEndpointError(projected, dstLine, false);
+      const flipErr = lineEndpointError(projected, dstLine, true);
+      const flip = flipErr < directErr;
+      const endpointErr = Math.min(directErr, flipErr);
+      const endpointLimit = Math.max(18, maxLen * 0.45);
+      if (endpointErr > endpointLimit) continue;
+
+      const perpErr = Math.sqrt(pointToSegmentDistanceSq(
+        dstLine.mx,
+        dstLine.my,
+        projected.x0,
+        projected.y0,
+        projected.x1,
+        projected.y1,
+      ));
+      if (perpErr > endpointLimit * 0.7) continue;
+
+      let score = 1.0;
+      score -= 0.35 * (angleDiff / angleLimit);
+      score -= 0.25 * (midDist / midLimit);
+      score -= 0.25 * (endpointErr / endpointLimit);
+      score -= 0.15 * (perpErr / Math.max(1, endpointLimit * 0.7));
+      score *= 0.55 + 0.45 * clampScalar(Math.min(srcLine.strength, dstLine.strength), 0, 1);
+      if (score < 0.35) continue;
+
+      candidates.push({
+        sourceIdx: i,
+        targetIdx: j,
+        source: srcLine,
+        target: dstLine,
+        flip,
+        score,
+      });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const usedSrc = new Set();
+  const usedDst = new Set();
+  const matches = [];
+  for (const cand of candidates) {
+    if (usedSrc.has(cand.sourceIdx) || usedDst.has(cand.targetIdx)) continue;
+    usedSrc.add(cand.sourceIdx);
+    usedDst.add(cand.targetIdx);
+    matches.push(cand);
+    if (matches.length >= 4) break;
+  }
+  return matches;
+}
+
+function buildLinePseudoCorrespondences(lineMatches) {
+  if (!lineMatches || lineMatches.length === 0) {
+    return {
+      pointsI: new Float32Array(0),
+      pointsJ: new Float32Array(0),
+      metadata: [],
+      lineMatchCount: 0,
+      avgScore: 0,
+    };
+  }
+
+  const ptsI = [];
+  const ptsJ = [];
+  const metadata = [];
+  let scoreSum = 0;
+  const selected = lineMatches.slice(0, 4);
+  for (const match of selected) {
+    const sampleTs = match.score >= 0.78
+      ? [0.15, 0.38, 0.62, 0.85]
+      : [0.22, 0.50, 0.78];
+    for (const t of sampleTs) {
+      const [xi, yi] = sampleLinePoint(match.source, t);
+      const [xj, yj] = sampleLinePoint(match.target, match.flip ? 1 - t : t);
+      ptsI.push(xi, yi);
+      ptsJ.push(xj, yj);
+      metadata.push({ source: 'line', lineScore: match.score });
+    }
+    scoreSum += match.score;
+  }
+
+  return {
+    pointsI: new Float32Array(ptsI),
+    pointsJ: new Float32Array(ptsJ),
+    metadata,
+    lineMatchCount: selected.length,
+    avgScore: selected.length > 0 ? scoreSum / selected.length : 0,
+  };
+}
+
+function fitHomographyModel(
+  pointsI,
+  pointsJ,
+  srcW,
+  srcH,
+  dstW,
+  dstH,
+  ransacThreshPx,
+  minInliers,
+  relaxedSpread,
+  metadata = null,
+) {
+  const nPts = Math.min(pointsI.length, pointsJ.length) / 2;
+  if (nPts < Math.max(4, minInliers)) return null;
+
+  let srcPts = null;
+  let dstPts = null;
+  let inlierMask = null;
+  let H = null;
+  try {
+    srcPts = cv.matFromArray(nPts, 1, cv.CV_32FC2, new Float32Array(pointsI));
+    dstPts = cv.matFromArray(nPts, 1, cv.CV_32FC2, new Float32Array(pointsJ));
+    inlierMask = new cv.Mat();
+    H = cv.findHomography(srcPts, dstPts, cv.RANSAC, ransacThreshPx, inlierMask);
+    if (!H || H.rows !== 3 || H.cols !== 3) return null;
+
+    const hd = H.data64F;
+    const reproj2 = new Float64Array(nPts);
+    for (let k = 0; k < nPts; k++) {
+      const xi = pointsI[k * 2];
+      const yi = pointsI[k * 2 + 1];
+      const xj = pointsJ[k * 2];
+      const yj = pointsJ[k * 2 + 1];
+      const d = hd[6] * xi + hd[7] * yi + hd[8];
+      if (Math.abs(d) < 1e-10) {
+        reproj2[k] = 1e6;
+        continue;
+      }
+      const px = (hd[0] * xi + hd[1] * yi + hd[2]) / d;
+      const py = (hd[3] * xi + hd[4] * yi + hd[5]) / d;
+      reproj2[k] = (px - xj) ** 2 + (py - yj) ** 2;
+    }
+
+    const sigmaMax = ransacThreshPx * 3;
+    const sigmaMax2 = sigmaMax * sigmaMax;
+    const softInlierThresh2 = ransacThreshPx * ransacThreshPx * 4;
+    let magsacInlierCount = 0;
+    const inliers = [];
+    const inlierPtsI = [];
+    const inlierPtsJ = [];
+    for (let k = 0; k < nPts; k++) {
+      const u = reproj2[k] / sigmaMax2;
+      if (u >= 1.0) continue;
+      const w = (1.0 - u) * (1.0 - u);
+      if (reproj2[k] <= softInlierThresh2) {
+        magsacInlierCount++;
+        const xi = pointsI[k * 2];
+        const yi = pointsI[k * 2 + 1];
+        const xj = pointsJ[k * 2];
+        const yj = pointsJ[k * 2 + 1];
+        const meta = metadata && metadata[k] ? metadata[k] : null;
+        inliers.push({
+          xi, yi, xj, yj,
+          magsacWeight: w,
+          origIdx: k,
+          source: meta?.source || 'point',
+          lineScore: meta?.lineScore || 0,
+        });
+        inlierPtsI.push(xi, yi);
+        inlierPtsJ.push(xj, yj);
+      }
+    }
+    if (magsacInlierCount < minInliers) return null;
+
+    let wRmsSum = 0;
+    let wSum = 0;
+    for (const inl of inliers) {
+      wRmsSum += inl.magsacWeight * reproj2[inl.origIdx];
+      wSum += inl.magsacWeight;
+    }
+    let rms;
+    if (wSum > 1e-6) {
+      rms = Math.sqrt(wRmsSum / wSum);
+    } else {
+      let rmsSum = 0;
+      for (const inl of inliers) {
+        const d = hd[6] * inl.xi + hd[7] * inl.yi + hd[8];
+        if (Math.abs(d) < 1e-10) continue;
+        const px = (hd[0] * inl.xi + hd[1] * inl.yi + hd[2]) / d;
+        const py = (hd[3] * inl.xi + hd[4] * inl.yi + hd[5]) / d;
+        rmsSum += (px - inl.xj) ** 2 + (py - inl.yj) ** 2;
+      }
+      rms = magsacInlierCount > 0 ? Math.sqrt(rmsSum / magsacInlierCount) : 1e6;
+    }
+
+    const HBuf = new Float64Array(9);
+    HBuf.set(hd.slice(0, 9));
+    if (!isHomographyValid(HBuf, srcW, srcH)) return null;
+
+    const spread = computeInlierSpread(
+      inlierPtsI, inlierPtsJ,
+      srcW, srcH,
+      dstW, dstH,
+    );
+    const strongSupport = magsacInlierCount >= Math.max(minInliers + 6, Math.round(minInliers * 1.7));
+    const mediumSupport = magsacInlierCount >= Math.max(minInliers + 3, Math.round(minInliers * 1.35));
+    if ((spread.minBBoxCoverage < 0.006 || spread.minCellCoverage < 0.08) && !strongSupport) {
+      return null;
+    }
+    if (!relaxedSpread && (spread.minBBoxCoverage < 0.012 || spread.minCellCoverage < 0.14) && !mediumSupport) {
+      return null;
+    }
+
+    const inlierRatio = magsacInlierCount / nPts;
+    const tx = HBuf[2];
+    const ty = HBuf[5];
+    const maxDim = Math.max(srcW, srcH);
+    const translation = Math.sqrt(tx * tx + ty * ty);
+    const translationRatio = translation / Math.max(1, maxDim);
+    const isDuplicate = (rms < 2.0 && inlierRatio > 0.8 && translationRatio < 0.05);
+
+    const inliersBuf = new Float32Array(magsacInlierCount * 4);
+    for (let k = 0; k < magsacInlierCount; k++) {
+      inliersBuf[k * 4] = inliers[k].xi;
+      inliersBuf[k * 4 + 1] = inliers[k].yi;
+      inliersBuf[k * 4 + 2] = inliers[k].xj;
+      inliersBuf[k * 4 + 3] = inliers[k].yj;
+    }
+
+    return {
+      H: HBuf,
+      inliers,
+      inliersBuf,
+      rms,
+      inlierCount: magsacInlierCount,
+      isDuplicate,
+      spread,
+    };
+  } finally {
+    if (srcPts) srcPts.delete();
+    if (dstPts) dstPts.delete();
+    if (inlierMask) inlierMask.delete();
+    if (H) H.delete();
+  }
 }
 
 function detectObjectProposals(gray, rgbSmall, width, height) {

@@ -198,6 +198,8 @@ export interface CVEdge {
   isDuplicate?: boolean;
   objectScore?: number;
   exifScore?: number;
+  lineScore?: number;
+  lineMatchCount?: number;
 }
 
 export interface CVEdgesMsg {
