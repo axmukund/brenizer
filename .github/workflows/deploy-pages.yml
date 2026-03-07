@@ -27,11 +27,26 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install
         run: npm ci
 
       - name: Verify TypeScript
         run: npm run typecheck
+
+      - name: Setup Emscripten
+        shell: bash
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git "${RUNNER_TEMP}/emsdk"
+          cd "${RUNNER_TEMP}/emsdk"
+          EMSDK_PYTHON=python3 ./emsdk install 5.0.2
+          EMSDK_PYTHON=python3 ./emsdk activate 5.0.2
+          echo "${RUNNER_TEMP}/emsdk" >> "${GITHUB_PATH}"
+          echo "${RUNNER_TEMP}/emsdk/upstream/emscripten" >> "${GITHUB_PATH}"
 
       - name: Build
         run: npm run build

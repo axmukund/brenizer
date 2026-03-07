@@ -5,13 +5,15 @@
   "license": "MIT",
   "scripts": {
     "prepare:opencv": "node scripts/prepare-opencv.mjs",
+    "prepare:maxflow": "node scripts/prepare-maxflow.mjs",
     "generate:test-images": "node scripts/generate-test-images.mjs",
-    "predev": "npm run prepare:opencv",
+    "predev": "npm run prepare:opencv && npm run prepare:maxflow",
     "dev": "vite",
-    "prebuild": "npm run prepare:opencv",
+    "prebuild": "npm run prepare:opencv && npm run prepare:maxflow",
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "pretest:e2e": "npm run prepare:maxflow",
     "test:e2e": "bash ./scripts/test-e2e.sh",
     "test": "npm run test:e2e",
     "verify": "npm run typecheck && npm run build && npm run test:e2e"

@@ -1,0 +1,14 @@
+Third-party notices for the compiled maxflow seam solver artifacts.
+
+Files:
+- maxflow-simd.module.js / maxflow-simd.wasm
+- maxflow-threads.module.js / maxflow-threads.wasm
+- maxflow-simd.js / maxflow-threads.js
+
+Included third-party components:
+- AtCoder Library mf_graph (vendored C++ source), licensed under CC0 1.0.
+- Emscripten-generated runtime glue, available under the MIT license and the
+  University of Illinois/NCSA Open Source License.
+
+See LICENSE.atcoder-CC0.txt and LICENSE.emscripten.txt in this directory for
+the full upstream license texts.

@@ -24,20 +24,6 @@ let solverBackendId = 'js-push-relabel';
 let solverInitDetail = 'using built-in JS solver';
 let externalSolver = null;
 
-function detectWasmSimd() {
-  try {
-    return WebAssembly.validate(new Uint8Array([
-      0x00, 0x61, 0x73, 0x6d,
-      0x01, 0x00, 0x00, 0x00,
-      0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
-      0x03, 0x02, 0x01, 0x00,
-      0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x0b,
-    ]));
-  } catch {
-    return false;
-  }
-}
-
 function deriveWasmBinaryUrl(scriptUrl) {
   if (!scriptUrl) return '';
   return scriptUrl.replace(/\.js(\?.*)?$/, '.wasm$1');
@@ -92,7 +78,7 @@ async function initializeSolverBackend(msg) {
   if (self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined' && threadsScript) {
     attempts.push(await tryLoadExternalWasmCandidate('threads', threadsScript, threadsWorkerScript));
   }
-  if (detectWasmSimd() && simdScript) {
+  if (simdScript) {
     attempts.push(await tryLoadExternalWasmCandidate('simd', simdScript, ''));
   }
 
@@ -104,9 +90,11 @@ async function initializeSolverBackend(msg) {
     return;
   }
 
-  const failureReason = attempts.find((attempt) => attempt.reason)?.reason;
-  if (failureReason) {
-    solverInitDetail = `${solverInitDetail}; ${failureReason}`;
+  const failureReasons = attempts
+    .map((attempt) => attempt.reason)
+    .filter((reason) => typeof reason === 'string' && reason.length > 0);
+  if (failureReasons.length > 0) {
+    solverInitDetail = `${solverInitDetail}; ${failureReasons.join('; ')}`;
   }
 }
 

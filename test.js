@@ -145,6 +145,7 @@ function parseBooleanish(raw) {
 const SEAM_TIER_OVERRIDE = (process.env.SEAM_TIER || '').trim() || null;
 const TURBO_MODE_OVERRIDE = parseBooleanish(process.env.TURBO_MODE);
 const EXPECT_COI = /^(1|true|yes)$/i.test(process.env.EXPECT_COI || '');
+const MAXFLOW_SELF_TEST = parseBooleanish(process.env.MAXFLOW_SELF_TEST) ?? true;
 const RUN_SEAM_BENCHMARKS = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK || '');
 const BENCHMARK_ASSERT = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK_ASSERT || '');
 const SCENARIO_ID_FILTER = (process.env.SCENARIO_ID || '').trim();
@@ -241,6 +242,8 @@ function isTransientNavigationError(err) {
   return /Execution context was destroyed|Cannot find context with specified id|Target closed/i.test(err.message);
 }
 
+let maxflowProbeDone = false;
+
 async function waitForRuntimeBootstrap(page, scenarioLabel) {
   const maxAttempts = 4;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -249,13 +252,28 @@ async function waitForRuntimeBootstrap(page, scenarioLabel) {
         () => {
           const runtime = window.__brenizerRuntime;
           const stitchBtn = document.getElementById('btn-stitch');
-          return !!runtime?.caps && !!stitchBtn;
+          const status = document.getElementById('status-bar')?.textContent || '';
+          return !!runtime?.caps && !!stitchBtn && !/^Error:/i.test(status);
         },
         { timeout: TIMEOUTS.pageLoadMs },
       );
       return;
     } catch (err) {
       if (!isTransientNavigationError(err) || attempt === maxAttempts) {
+        try {
+          const snapshot = await page.evaluate(() => ({
+            hasStitchButton: !!document.getElementById('btn-stitch'),
+            hasRuntimeCaps: !!window.__brenizerRuntime?.caps,
+            status: document.getElementById('status-bar')?.textContent || '',
+            readyState: document.readyState,
+          }));
+          console.log(`[${scenarioLabel}] Bootstrap snapshot: ${JSON.stringify(snapshot)}`);
+          if (snapshot.hasStitchButton && snapshot.hasRuntimeCaps && !/^Error:/i.test(snapshot.status)) {
+            return;
+          }
+        } catch {
+          // Ignore evaluation failures and rethrow the original error below.
+        }
         throw err;
       }
       console.log(`[${scenarioLabel}] Waiting through bootstrap reload (${attempt}/${maxAttempts})...`);
@@ -264,6 +282,175 @@ async function waitForRuntimeBootstrap(page, scenarioLabel) {
         timeout: TIMEOUTS.pageLoadMs,
       }).catch(() => undefined);
     }
+  }
+}
+
+async function runMaxflowSelfTest(page, scenarioLabel) {
+  const probe = await page.evaluate(async () => {
+    function buildCase(id, gridW, gridH, dataCosts, edgeWeightsH, edgeWeightsV, hardConstraints) {
+      return {
+        id,
+        gridW,
+        gridH,
+        dataCosts,
+        edgeWeightsH,
+        edgeWeightsV,
+        hardConstraints,
+      };
+    }
+
+    function makeWorker(baseUrl) {
+      return new Worker(new URL('workers/seam-worker.js', baseUrl).toString());
+    }
+
+    function waitForMessage(worker, predicate, timeoutMs) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error('Timed out waiting for worker message'));
+        }, timeoutMs);
+
+        function onMessage(ev) {
+          const msg = ev.data;
+          if (!predicate(msg)) return;
+          cleanup();
+          resolve(msg);
+        }
+
+        function onError(err) {
+          cleanup();
+          reject(new Error(err.message || 'Worker crashed'));
+        }
+
+        function cleanup() {
+          clearTimeout(timer);
+          worker.removeEventListener('message', onMessage);
+          worker.removeEventListener('error', onError);
+        }
+
+        worker.addEventListener('message', onMessage);
+        worker.addEventListener('error', onError);
+      });
+    }
+
+    async function initWorker(worker, baseUrl) {
+      worker.postMessage({
+        type: 'init',
+        baseUrl,
+        maxflowPath: new URL('wasm/maxflow/maxflow-simd.js', baseUrl).toString(),
+        wasmPathSimd: new URL('wasm/maxflow/maxflow-simd.js', baseUrl).toString(),
+        wasmPathThreads: new URL('wasm/maxflow/maxflow-threads.js', baseUrl).toString(),
+        wasmWorkerPathThreads: new URL('wasm/maxflow/maxflow-threads.worker.js', baseUrl).toString(),
+      });
+      return waitForMessage(worker, (msg) => msg.type === 'progress' && msg.stage === 'seam-init', 20000);
+    }
+
+    async function solve(worker, graph, forceLegacy) {
+      const jobId = `${graph.id}:${forceLegacy ? 'legacy' : 'native'}`;
+      const dataCostsBuffer = new Float32Array(graph.dataCosts).buffer;
+      const edgeWeightsHBuffer = new Float32Array(graph.edgeWeightsH).buffer;
+      const edgeWeightsVBuffer = new Float32Array(graph.edgeWeightsV).buffer;
+      const hardConstraintsBuffer = new Uint8Array(graph.hardConstraints).buffer;
+      worker.postMessage({
+        type: 'solve',
+        jobId,
+        gridW: graph.gridW,
+        gridH: graph.gridH,
+        dataCostsBuffer,
+        edgeWeightsHBuffer,
+        edgeWeightsVBuffer,
+        hardConstraintsBuffer,
+        params: forceLegacy ? { forceLegacy: true } : {},
+      }, [dataCostsBuffer, edgeWeightsHBuffer, edgeWeightsVBuffer, hardConstraintsBuffer]);
+
+      const result = await waitForMessage(
+        worker,
+        (msg) => msg.jobId === jobId && (msg.type === 'result' || msg.type === 'error'),
+        20000,
+      );
+      if (result.type === 'error') {
+        throw new Error(result.message || 'Worker solve failed');
+      }
+      return {
+        backendId: result.backendId,
+        labels: Array.from(new Uint8Array(result.labelsBuffer)),
+      };
+    }
+
+    const graphs = [
+      buildCase(
+        'striped-4x3',
+        4,
+        3,
+        [
+          0.2, 2.0, 0.2, 2.0, 2.0, 0.2, 2.0, 0.2,
+          0.2, 2.0, 0.2, 2.0, 2.0, 0.2, 2.0, 0.2,
+          0.2, 2.0, 0.2, 2.0, 2.0, 0.2, 2.0, 0.2,
+        ],
+        [1.3, 1.1, 1.2, 1.3, 1.1, 1.2, 1.3, 1.1, 1.2],
+        [0.9, 0.8, 0.9, 0.9, 0.8, 0.9, 0.9, 0.8],
+        new Array(12).fill(0),
+      ),
+      buildCase(
+        'hard-constraints-3x3',
+        3,
+        3,
+        [
+          0.7, 0.8, 0.9, 0.6, 1.4, 0.2,
+          0.6, 0.8, 1.0, 0.5, 1.5, 0.2,
+          0.7, 0.9, 1.1, 0.4, 1.6, 0.2,
+        ],
+        [0.4, 1.0, 0.5, 0.9, 0.5, 1.1],
+        [1.2, 0.6, 1.0, 1.1, 0.7, 0.9],
+        [1, 0, 2, 1, 0, 2, 1, 0, 2],
+      ),
+    ];
+
+    const baseUrl = new URL('./', window.location.href).toString();
+    const worker = makeWorker(baseUrl);
+    try {
+      const init = await initWorker(worker, baseUrl);
+      const backendId = init.backendId || 'unknown';
+      const expectedBackendPrefix = self.crossOriginIsolated ? 'wasm-threads' : 'wasm-simd';
+      const cases = [];
+
+      for (const graph of graphs) {
+        const compiled = await solve(worker, graph, false);
+        const legacy = await solve(worker, graph, true);
+        const matches = compiled.labels.length === legacy.labels.length
+          && compiled.labels.every((value, idx) => value === legacy.labels[idx]);
+        cases.push({
+          id: graph.id,
+          matches,
+          compiledBackend: compiled.backendId,
+          compiledLabels: compiled.labels,
+          legacyLabels: legacy.labels,
+        });
+      }
+
+      return {
+        ok: backendId.startsWith(expectedBackendPrefix) && cases.every((testCase) => testCase.matches),
+        backendId,
+        expectedBackendPrefix,
+        initInfo: init.info || '',
+        cases,
+      };
+    } finally {
+      worker.terminate();
+    }
+  });
+
+  console.log(
+    `[${scenarioLabel}] maxflow self-test backend=${probe.backendId} expected=${probe.expectedBackendPrefix} ` +
+    `info=${probe.initInfo || 'n/a'} ` +
+    `cases=${probe.cases.map((testCase) => `${testCase.id}:${testCase.matches ? 'ok' : 'mismatch'}`).join(',')}`,
+  );
+  if (!probe.ok) {
+    throw new Error(
+      `Maxflow self-test failed: backend=${probe.backendId}, expected=${probe.expectedBackendPrefix}, ` +
+      `info=${probe.initInfo || 'n/a'}, ` +
+      `cases=${probe.cases.map((testCase) => `${testCase.id}:${testCase.matches ? 'ok' : 'mismatch'}`).join(', ')}`,
+    );
   }
 }
 
@@ -285,7 +472,17 @@ async function runScenario(browser, scenario, options = {}) {
       waitUntil: 'networkidle0',
       timeout: TIMEOUTS.pageLoadMs,
     });
+    if (turboMode) {
+      await page.waitForNavigation({
+        waitUntil: 'networkidle0',
+        timeout: 10000,
+      }).catch(() => undefined);
+    }
     await waitForRuntimeBootstrap(page, scenarioLabel);
+    if (MAXFLOW_SELF_TEST && !maxflowProbeDone) {
+      await runMaxflowSelfTest(page, scenarioLabel);
+      maxflowProbeDone = true;
+    }
 
     const result = await page.evaluate(async (sc, timeouts) => {
       function sleep(ms) {
