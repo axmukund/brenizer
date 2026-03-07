@@ -10,6 +10,10 @@ import { createProgram } from './programs';
 import { createEmptyTexture, type ManagedTexture } from './textures';
 import { createFBO, type ManagedFBO } from './framebuffers';
 
+const CONTENT_ALPHA_THRESHOLD = 10;
+const MASK_HARD_LOW = 8;
+const MASK_HARD_HIGH = 247;
+
 // ── Blend shader: mix(composite, new, mask) ──────────────
 
 const BLEND_VERT = `#version 300 es
@@ -127,6 +131,18 @@ export interface FaceRectComposite {
   imageLabel: 0 | 1;  // 0 = belongs to composite, 1 = belongs to new image
 }
 
+export interface AdaptiveBlendMaskOptions {
+  ghostBlockSize?: number;
+}
+
+export interface AdaptiveBlendMaskResult {
+  mask: Uint8Array;
+  featherRadius: number;
+  ghostPixels: number;
+  ghostThreshold: number;
+  ghostMedianDiff: number;
+}
+
 export function computeBlockCosts(
   compositePixels: Uint8Array,   // RGBA at composite resolution
   newImagePixels: Uint8Array,    // RGBA at composite resolution
@@ -148,8 +164,8 @@ export function computeBlockCosts(
   if (compW <= 0 || compH <= 0) {
     return { gridW: 1, gridH: 1, dataCosts: new Float32Array(2), edgeWeights: new Float32Array(0), hardConstraints: new Uint8Array(1) };
   }
-  const gridW = Math.max(1, Math.floor(compW / blockSize));
-  const gridH = Math.max(1, Math.floor(compH / blockSize));
+  const gridW = Math.max(1, Math.ceil(compW / blockSize));
+  const gridH = Math.max(1, Math.ceil(compH / blockSize));
   const nNodes = gridW * gridH;
 
   const dataCosts = new Float32Array(nNodes * 2);
@@ -164,16 +180,20 @@ export function computeBlockCosts(
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW; gx++) {
       const nodeIdx = gy * gridW + gx;
+      const blockLeft = gx * blockSize;
+      const blockTop = gy * blockSize;
+      const blockW = Math.max(1, Math.min(blockSize, compW - blockLeft));
+      const blockH = Math.max(1, Math.min(blockSize, compH - blockTop));
       // Sample a 3×3 grid within the block for robust alpha detection
       let compCount = 0, newCount = 0;
       const samples = 3;
       for (let sy = 0; sy < samples; sy++) {
         for (let sx = 0; sx < samples; sx++) {
-          const px = Math.min(gx * blockSize + Math.round((sx + 0.5) * blockSize / samples), compW - 1);
-          const py = Math.min(gy * blockSize + Math.round((sy + 0.5) * blockSize / samples), compH - 1);
+          const px = blockLeft + Math.min(blockW - 1, Math.floor(((sx + 0.5) * blockW) / samples));
+          const py = blockTop + Math.min(blockH - 1, Math.floor(((sy + 0.5) * blockH) / samples));
           const idx = (py * compW + px) * 4 + 3;
-          if (compositePixels[idx] > 10) compCount++;
-          if (newImagePixels[idx] > 10) newCount++;
+          if (compositePixels[idx] > CONTENT_ALPHA_THRESHOLD) compCount++;
+          if (newImagePixels[idx] > CONTENT_ALPHA_THRESHOLD) newCount++;
         }
       }
       // Require majority (≥50%) pixel coverage to count as "has data".
@@ -218,15 +238,15 @@ export function computeBlockCosts(
         const cD = compDist[nodeIdx] / maxCompDist;   // 0..1 (0 = near edge, 1 = deep interior)
         const nD = newDist[nodeIdx] / maxNewDist;
 
-        // Sample center pixel for color difference term
-        const cx = Math.min(gx * blockSize + (blockSize >> 1), compW - 1);
-        const cy = Math.min(gy * blockSize + (blockSize >> 1), compH - 1);
-        const pixIdx = (cy * compW + cx) * 4;
-
-        const diffR = Math.abs(compositePixels[pixIdx] - newImagePixels[pixIdx]) / 255;
-        const diffG = Math.abs(compositePixels[pixIdx + 1] - newImagePixels[pixIdx + 1]) / 255;
-        const diffB = Math.abs(compositePixels[pixIdx + 2] - newImagePixels[pixIdx + 2]) / 255;
-        const colorDiff = (diffR + diffG + diffB) / 3;
+        const colorDiff = sampleBlockColorDifference(
+          compositePixels,
+          newImagePixels,
+          compW,
+          compH,
+          gx,
+          gy,
+          blockSize,
+        );
 
         // Cost for label=composite: high when NEAR composite boundary (penalise
         // keeping composite in its thin-coverage zone near the edge).
@@ -462,9 +482,25 @@ function computeBlockDistanceField(
   const dist = new Float32Array(gridW * gridH);
   const INF = gridW + gridH;
 
-  // Initialise: 0 for blocks without data, INF for blocks with data
-  for (let i = 0; i < dist.length; i++) {
-    dist[i] = hasData[i] ? INF : 0;
+  // Initialise: seed distance zero at the true image boundary, not just
+  // at empty blocks. This keeps edge-touching image corners from being
+  // misclassified as deep interior by the graph-cut data term.
+  for (let gy = 0; gy < gridH; gy++) {
+    for (let gx = 0; gx < gridW; gx++) {
+      const idx = gy * gridW + gx;
+      if (!hasData[idx]) {
+        dist[idx] = 0;
+        continue;
+      }
+
+      const touchesGridEdge = gx === 0 || gy === 0 || gx === gridW - 1 || gy === gridH - 1;
+      const touchesVoid =
+        (gx > 0 && !hasData[idx - 1])
+        || (gx + 1 < gridW && !hasData[idx + 1])
+        || (gy > 0 && !hasData[idx - gridW])
+        || (gy + 1 < gridH && !hasData[idx + gridW]);
+      dist[idx] = (touchesGridEdge || touchesVoid) ? 0 : INF;
+    }
   }
 
   // Forward pass (top-left → bottom-right)
@@ -504,71 +540,63 @@ export function estimateOverlapWidth(
   height: number,
   fallback: number,
 ): number {
-  // ── Horizontal overlap: sample rows at 1/4, 1/2, 3/4 height ──
-  const sampleRows = [
-    Math.floor(height * 0.25),
-    Math.floor(height * 0.5),
-    Math.floor(height * 0.75),
-  ];
-  let totalHOverlap = 0;
-  let hSamples = 0;
+  const rowSpans = collectOverlapSpans(compositePixels, newImagePixels, width, height, true);
+  const colSpans = collectOverlapSpans(compositePixels, newImagePixels, width, height, false);
 
-  for (const row of sampleRows) {
-    let overlapStart = -1;
-    let overlapEnd = -1;
-    for (let x = 0; x < width; x++) {
-      const idx = (row * width + x) * 4 + 3;
-      const compHas = compositePixels[idx] > 10;
-      const newHas = newImagePixels[idx] > 10;
-      if (compHas && newHas) {
-        if (overlapStart < 0) overlapStart = x;
-        overlapEnd = x;
-      }
+  const spanCandidates: number[] = [];
+  if (rowSpans.length > 0) spanCandidates.push(quantile(rowSpans, 0.35));
+  if (colSpans.length > 0) spanCandidates.push(quantile(colSpans, 0.35));
+
+  if (spanCandidates.length > 0) {
+    // Bias toward the narrower stable overlap dimension. This avoids
+    // over-feathering when images only touch in a corner or tapered wedge.
+    const narrowOverlap = Math.min(...spanCandidates);
+    if (Number.isFinite(narrowOverlap) && narrowOverlap > 0) {
+      const estimated = Math.max(4, Math.round(narrowOverlap * 0.5));
+      // Keep the adaptive width from collapsing too far below the configured
+      // feather. Coverage clamping already protects corner slivers, so a
+      // modest floor here is safer than opening hairline alpha gaps.
+      const minAdaptive = Math.max(4, Math.round(fallback * 0.5));
+      const maxAdaptive = Math.max(minAdaptive, Math.round(fallback * 2));
+      return Math.max(minAdaptive, Math.min(maxAdaptive, estimated));
     }
-    if (overlapStart >= 0 && overlapEnd > overlapStart) {
-      totalHOverlap += (overlapEnd - overlapStart);
-      hSamples++;
-    }
-  }
-
-  // ── Vertical overlap: sample columns at 1/4, 1/2, 3/4 width ──
-  const sampleCols = [
-    Math.floor(width * 0.25),
-    Math.floor(width * 0.5),
-    Math.floor(width * 0.75),
-  ];
-  let totalVOverlap = 0;
-  let vSamples = 0;
-
-  for (const col of sampleCols) {
-    let overlapStart = -1;
-    let overlapEnd = -1;
-    for (let y = 0; y < height; y++) {
-      const idx = (y * width + col) * 4 + 3;
-      const compHas = compositePixels[idx] > 10;
-      const newHas = newImagePixels[idx] > 10;
-      if (compHas && newHas) {
-        if (overlapStart < 0) overlapStart = y;
-        overlapEnd = y;
-      }
-    }
-    if (overlapStart >= 0 && overlapEnd > overlapStart) {
-      totalVOverlap += (overlapEnd - overlapStart);
-      vSamples++;
-    }
-  }
-
-  // Use the smaller of horizontal and vertical overlap — the feather should
-  // match the narrower dimension of the overlap zone to avoid excessive blurring
-  const avgH = hSamples > 0 ? totalHOverlap / hSamples : Infinity;
-  const avgV = vSamples > 0 ? totalVOverlap / vSamples : Infinity;
-  const avgOverlap = Math.min(avgH, avgV);
-
-  if (isFinite(avgOverlap) && avgOverlap > 0) {
-    // Feather width = ~50% of overlap zone (PTGui uses similar heuristic)
-    return Math.max(4, Math.round(avgOverlap * 0.5));
   }
   return fallback;
+}
+
+/**
+ * Build a feathered seam mask and post-process it against real coverage.
+ * This is shared by preview + export so both paths clamp corners, harden
+ * obvious ghosts, and smooth residual exposure mismatch the same way.
+ */
+export function buildAdaptiveBlendMask(
+  baseMask: Uint8Array,
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  width: number,
+  height: number,
+  fallbackRadius: number,
+  options: AdaptiveBlendMaskOptions = {},
+): AdaptiveBlendMaskResult {
+  const featherRadius = estimateOverlapWidth(compositePixels, newImagePixels, width, height, fallbackRadius);
+  const mask = featherMask(baseMask, width, height, featherRadius);
+  clampBlendMaskToCoverage(mask, compositePixels, newImagePixels);
+  const ghostStats = hardenGhostRegions(
+    mask,
+    compositePixels,
+    newImagePixels,
+    width,
+    height,
+    options.ghostBlockSize,
+  );
+  refineSeamMaskForLighting(mask, compositePixels, newImagePixels, width, height, featherRadius);
+  return {
+    mask,
+    featherRadius,
+    ghostPixels: ghostStats.ghostPixels,
+    ghostThreshold: ghostStats.ghostThreshold,
+    ghostMedianDiff: ghostStats.ghostMedianDiff,
+  };
 }
 
 /**
@@ -592,6 +620,287 @@ export function labelsToMask(
     }
   }
   return mask;
+}
+
+function sampleBlockColorDifference(
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  compW: number,
+  compH: number,
+  gx: number,
+  gy: number,
+  blockSize: number,
+): number {
+  const blockLeft = gx * blockSize;
+  const blockTop = gy * blockSize;
+  const blockW = Math.max(1, Math.min(blockSize, compW - blockLeft));
+  const blockH = Math.max(1, Math.min(blockSize, compH - blockTop));
+  const samples = 3;
+  let sum = 0;
+  let count = 0;
+  let fallbackOff = (Math.min(blockTop + (blockH >> 1), compH - 1) * compW + Math.min(blockLeft + (blockW >> 1), compW - 1)) * 4;
+
+  for (let sy = 0; sy < samples; sy++) {
+    for (let sx = 0; sx < samples; sx++) {
+      const px = blockLeft + Math.min(blockW - 1, Math.floor(((sx + 0.5) * blockW) / samples));
+      const py = blockTop + Math.min(blockH - 1, Math.floor(((sy + 0.5) * blockH) / samples));
+      const off = (py * compW + px) * 4;
+      fallbackOff = off;
+      if (compositePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD || newImagePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD) {
+        continue;
+      }
+      sum += pixelColorMismatch(compositePixels, newImagePixels, off) / 255;
+      count++;
+    }
+  }
+
+  if (count > 0) return sum / count;
+  return pixelColorMismatch(compositePixels, newImagePixels, fallbackOff) / 255;
+}
+
+function createSamplePositions(size: number, maxSamples: number): number[] {
+  const limit = Math.max(1, Math.min(size, maxSamples));
+  const positions: number[] = [];
+  let prev = -1;
+  for (let i = 0; i < limit; i++) {
+    const pos = Math.min(size - 1, Math.max(0, Math.round(((i + 0.5) * size) / limit - 0.5)));
+    if (pos !== prev) {
+      positions.push(pos);
+      prev = pos;
+    }
+  }
+  return positions;
+}
+
+function collectOverlapSpans(
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  width: number,
+  height: number,
+  horizontal: boolean,
+): number[] {
+  const spans: number[] = [];
+  const positions = createSamplePositions(horizontal ? height : width, 24);
+
+  for (const pos of positions) {
+    let runStart = -1;
+    let bestRun = 0;
+    const length = horizontal ? width : height;
+    for (let i = 0; i < length; i++) {
+      const x = horizontal ? i : pos;
+      const y = horizontal ? pos : i;
+      const alphaIdx = (y * width + x) * 4 + 3;
+      const overlaps =
+        compositePixels[alphaIdx] > CONTENT_ALPHA_THRESHOLD
+        && newImagePixels[alphaIdx] > CONTENT_ALPHA_THRESHOLD;
+      if (overlaps) {
+        if (runStart < 0) runStart = i;
+      } else if (runStart >= 0) {
+        bestRun = Math.max(bestRun, i - runStart);
+        runStart = -1;
+      }
+    }
+    if (runStart >= 0) bestRun = Math.max(bestRun, length - runStart);
+    if (bestRun > 0) spans.push(bestRun);
+  }
+
+  return spans;
+}
+
+function quantile(values: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const sorted = Array.from(values).sort((a, b) => a - b);
+  const t = Math.max(0, Math.min(1, q));
+  const idx = (sorted.length - 1) * t;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const frac = idx - lo;
+  return sorted[lo] * (1 - frac) + sorted[hi] * frac;
+}
+
+function clampUnit(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+function pixelColorMismatch(
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  off: number,
+): number {
+  const compR = compositePixels[off];
+  const compG = compositePixels[off + 1];
+  const compB = compositePixels[off + 2];
+  const newR = newImagePixels[off];
+  const newG = newImagePixels[off + 1];
+  const newB = newImagePixels[off + 2];
+  const compLum = 0.2126 * compR + 0.7152 * compG + 0.0722 * compB;
+  const newLum = 0.2126 * newR + 0.7152 * newG + 0.0722 * newB;
+  const lumDiff = Math.abs(compLum - newLum);
+  const chromaDiff = (Math.abs(compR - newR) + Math.abs(compG - newG) + Math.abs(compB - newB)) / 3;
+  return lumDiff * 0.6 + chromaDiff * 0.4;
+}
+
+function clampBlendMaskToCoverage(
+  mask: Uint8Array,
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+): void {
+  for (let px = 0; px < mask.length; px++) {
+    const off = px * 4;
+    const compAlpha = compositePixels[off + 3];
+    const newAlpha = newImagePixels[off + 3];
+    if (newAlpha <= CONTENT_ALPHA_THRESHOLD) {
+      mask[px] = 0;
+    } else if (compAlpha <= CONTENT_ALPHA_THRESHOLD) {
+      mask[px] = 255;
+    }
+  }
+}
+
+function hardenGhostRegions(
+  mask: Uint8Array,
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  width: number,
+  height: number,
+  ghostBlockSize?: number,
+): {
+  ghostPixels: number;
+  ghostThreshold: number;
+  ghostMedianDiff: number;
+} {
+  const blockSize = Math.max(8, Math.round(ghostBlockSize ?? Math.max(16, Math.min(128, width > 0 ? Math.sqrt(width * height) * 0.025 : 16))));
+  const gridW = Math.ceil(width / blockSize);
+  const gridH = Math.ceil(height / blockSize);
+  const blockDiffs = new Float32Array(gridW * gridH);
+  const blockCounts = new Uint32Array(gridW * gridH);
+
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(Math.floor(y / blockSize), gridH - 1);
+    for (let x = 0; x < width; x++) {
+      const px = y * width + x;
+      const off = px * 4;
+      if (compositePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD || newImagePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD) {
+        continue;
+      }
+      const gx = Math.min(Math.floor(x / blockSize), gridW - 1);
+      const gi = gy * gridW + gx;
+      blockDiffs[gi] += pixelColorMismatch(compositePixels, newImagePixels, off);
+      blockCounts[gi]++;
+    }
+  }
+
+  const means: number[] = [];
+  for (let i = 0; i < blockDiffs.length; i++) {
+    if (blockCounts[i] === 0) continue;
+    blockDiffs[i] /= blockCounts[i];
+    means.push(blockDiffs[i]);
+  }
+  if (means.length < 4) {
+    return { ghostPixels: 0, ghostThreshold: 0, ghostMedianDiff: 0 };
+  }
+
+  const ghostMedianDiff = quantile(means, 0.5);
+  const ghostThreshold = Math.max(ghostMedianDiff * 3, 30);
+  let ghostPixels = 0;
+
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(Math.floor(y / blockSize), gridH - 1);
+    for (let x = 0; x < width; x++) {
+      const px = y * width + x;
+      const off = px * 4;
+      if (compositePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD || newImagePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD) {
+        continue;
+      }
+      const gx = Math.min(Math.floor(x / blockSize), gridW - 1);
+      const gi = gy * gridW + gx;
+      if (blockDiffs[gi] <= ghostThreshold) continue;
+      const m = mask[px];
+      if (m <= MASK_HARD_LOW || m >= MASK_HARD_HIGH) continue;
+      mask[px] = m > 127 ? 255 : 0;
+      ghostPixels++;
+    }
+  }
+
+  return { ghostPixels, ghostThreshold, ghostMedianDiff };
+}
+
+function refineSeamMaskForLighting(
+  mask: Uint8Array,
+  compositePixels: Uint8Array,
+  newImagePixels: Uint8Array,
+  width: number,
+  height: number,
+  baseFeatherRadius: number,
+): void {
+  const n = width * height;
+  if (mask.length !== n) return;
+  if (compositePixels.length < n * 4 || newImagePixels.length < n * 4) return;
+
+  const blockSize = Math.max(16, Math.min(96, Math.round(Math.max(12, baseFeatherRadius * 6))));
+  const gridW = Math.ceil(width / blockSize);
+  const gridH = Math.ceil(height / blockSize);
+  const blockDiff = new Float32Array(gridW * gridH);
+  const blockCount = new Uint32Array(gridW * gridH);
+  const overlapMask = new Uint8Array(n);
+
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(Math.floor(y / blockSize), gridH - 1);
+    for (let x = 0; x < width; x++) {
+      const px = y * width + x;
+      const off = px * 4;
+      if (compositePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD || newImagePixels[off + 3] <= CONTENT_ALPHA_THRESHOLD) {
+        continue;
+      }
+      overlapMask[px] = 1;
+      const gx = Math.min(Math.floor(x / blockSize), gridW - 1);
+      const gi = gy * gridW + gx;
+      blockDiff[gi] += pixelColorMismatch(compositePixels, newImagePixels, off);
+      blockCount[gi]++;
+    }
+  }
+
+  const means: number[] = [];
+  for (let gi = 0; gi < blockDiff.length; gi++) {
+    if (blockCount[gi] === 0) continue;
+    blockDiff[gi] /= blockCount[gi];
+    if (blockCount[gi] >= 8) means.push(blockDiff[gi]);
+  }
+  if (means.length < 4) return;
+
+  const median = quantile(means, 0.5);
+  const softStart = Math.max(6, median * 1.15);
+  const softEnd = Math.max(softStart + 12, median * 3.2);
+  const denom = Math.max(1, softEnd - softStart);
+
+  let softened = 0;
+  for (let y = 0; y < height; y++) {
+    const gy = Math.min(Math.floor(y / blockSize), gridH - 1);
+    for (let x = 0; x < width; x++) {
+      const px = y * width + x;
+      if (!overlapMask[px]) continue;
+      const m = mask[px];
+      if (m <= MASK_HARD_LOW || m >= MASK_HARD_HIGH) continue;
+      const gx = Math.min(Math.floor(x / blockSize), gridW - 1);
+      const d = blockDiff[gy * gridW + gx];
+      if (d <= softStart) continue;
+      const t = clampUnit((d - softStart) / denom);
+      const blend = 0.08 + 0.26 * t;
+      mask[px] = Math.round(m * (1 - blend) + 128 * blend);
+      softened++;
+    }
+  }
+  if (softened < 32) return;
+
+  const microRadius = Math.max(1, Math.round(baseFeatherRadius * 0.22));
+  const smoothed = featherMask(mask, width, height, microRadius, 2);
+  for (let px = 0; px < n; px++) {
+    if (!overlapMask[px]) continue;
+    const m = mask[px];
+    if (m <= MASK_HARD_LOW || m >= MASK_HARD_HIGH) continue;
+    mask[px] = Math.round(m * 0.7 + smoothed[px] * 0.3);
+  }
 }
 
 /**

@@ -13,12 +13,14 @@ export {
 } from './mesh';
 export {
   createCompositor,
+  buildAdaptiveBlendMask,
   computeBlockCosts,
   labelsToMask,
   featherMask,
   estimateOverlapWidth,
   createMaskTexture,
   type Compositor,
+  type AdaptiveBlendMaskResult,
   type FaceRectComposite,
 } from './composition';
 export {

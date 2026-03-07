@@ -185,7 +185,7 @@ export interface CVSaliencyMsg {
 export interface CVVignettingMsg {
   type: 'vignetting';
   imageId: string;
-  vignetteParams: { a: number; b: number };
+  vignetteParams: { a: number; b: number; c: number };
 }
 
 export interface CVEdge {

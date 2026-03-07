@@ -165,6 +165,7 @@ export interface VignetteParams {
   imageId: string;
   a: number;
   b: number;
+  c: number;
 }
 let lastVignette: Map<string, VignetteParams> = new Map();
 
@@ -1444,6 +1445,7 @@ export async function runStitchPreview(): Promise<void> {
           imageId: vmsg.imageId,
           a: vmsg.vignetteParams.a,
           b: vmsg.vignetteParams.b,
+          c: Number.isFinite(vmsg.vignetteParams.c) ? vmsg.vignetteParams.c : 0,
         });
       }
     });

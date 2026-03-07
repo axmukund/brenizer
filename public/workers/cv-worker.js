@@ -401,7 +401,7 @@ self.addEventListener('message', async (ev) => {
 
     // ── Vignetting estimation ─────────────────────────────────────────
     // Estimates radial vignetting from the image luminance distribution.
-    // Models vignetting as V(r) = 1 + a*r² + b*r⁴ where r = normalized
+    // Models vignetting as V(r) = 1 + a*r² + b*r⁴ + c*r⁶ where r = normalized
     // distance from image center (0 at center, 1 at corners).
     // The coefficients are estimated by comparing the mean luminance at
     // different radial distances — natural images are assumed to have
@@ -445,31 +445,49 @@ self.addEventListener('message', async (ev) => {
           binMean[i] = binCount[i] > 0 ? binSum[i] / binCount[i] : centerMean;
         }
 
-        let sumR2R2 = 0, sumR2R4 = 0, sumR4R4 = 0;
-        let sumR2T = 0, sumR4T = 0;
+        let sumR4 = 0, sumR6 = 0, sumR8 = 0, sumR10 = 0, sumR12 = 0;
+        let sumR2T = 0, sumR4T = 0, sumR6T = 0;
         for (let i = 1; i < nBins; i++) {
           const r = (i + 0.5) / nBins;
-          const r2 = r * r, r4 = r2 * r2;
+          const r2 = r * r;
+          const r4 = r2 * r2;
+          const r6 = r4 * r2;
+          const r8 = r4 * r4;
+          const r10 = r8 * r2;
+          const r12 = r6 * r6;
           const target = (centerMean > 10 && binMean[i] > 10)
             ? (centerMean / binMean[i] - 1.0) : 0;
-          sumR2R2 += r2 * r2; sumR2R4 += r2 * r4; sumR4R4 += r4 * r4;
-          sumR2T += r2 * target; sumR4T += r4 * target;
+          sumR4 += r4;
+          sumR6 += r6;
+          sumR8 += r8;
+          sumR10 += r10;
+          sumR12 += r12;
+          sumR2T += r2 * target;
+          sumR4T += r4 * target;
+          sumR6T += r6 * target;
         }
-        const det = sumR2R2 * sumR4R4 - sumR2R4 * sumR2R4;
-        let a = 0, b = 0;
-        if (Math.abs(det) > 1e-10) {
-          a = (sumR4R4 * sumR2T - sumR2R4 * sumR4T) / det;
-          b = (sumR2R2 * sumR4T - sumR2R4 * sumR2T) / det;
+        let a = 0, b = 0, c = 0;
+        const solved = solveLinear3x3(
+          sumR4, sumR6, sumR8,
+          sumR6, sumR8, sumR10,
+          sumR8, sumR10, sumR12,
+          sumR2T, sumR4T, sumR6T,
+        );
+        if (solved) {
+          a = solved[0];
+          b = solved[1];
+          c = solved[2];
         }
         a = Math.max(-2, Math.min(2, a));
         b = Math.max(-2, Math.min(2, b));
+        c = Math.max(-2, Math.min(2, c));
 
         // Broadcast same params to all images
         for (const id of ids) {
-          images[id].vignetteParams = { a, b };
-          postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b } });
+          images[id].vignetteParams = { a, b, c };
+          postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b, c } });
         }
-        postMessage({type:'progress', stage:'vignetting', percent:100, info:`pooled: a=${a.toFixed(4)}, b=${b.toFixed(4)}`});
+        postMessage({type:'progress', stage:'vignetting', percent:100, info:`pooled: a=${a.toFixed(4)}, b=${b.toFixed(4)}, c=${c.toFixed(4)}`});
         return;
       }
 
@@ -503,32 +521,50 @@ self.addEventListener('message', async (ev) => {
           binMean[i] = binCount[i] > 0 ? binSum[i] / binCount[i] : centerMean;
         }
 
-        // Fit polynomial: V(r) = 1 + a*r² + b*r⁴
+        // Fit polynomial: V(r) = 1 + a*r² + b*r⁴ + c*r⁶
         // We want V(r) * observed(r) ≈ centerMean → V(r) ≈ centerMean / observed(r)
         // Least-squares fit: minimize Σ_i (V(r_i) - target_i)²
         // where target_i = centerMean / binMean[i], r_i = bin center
-        let sumR2R2 = 0, sumR2R4 = 0, sumR4R4 = 0;
-        let sumR2T = 0, sumR4T = 0;
+        let sumR4 = 0, sumR6 = 0, sumR8 = 0, sumR10 = 0, sumR12 = 0;
+        let sumR2T = 0, sumR4T = 0, sumR6T = 0;
         for (let i = 1; i < nBins; i++) { // skip center bin
           const r = (i + 0.5) / nBins;
-          const r2 = r * r, r4 = r2 * r2;
+          const r2 = r * r;
+          const r4 = r2 * r2;
+          const r6 = r4 * r2;
+          const r8 = r4 * r4;
+          const r10 = r8 * r2;
+          const r12 = r6 * r6;
           const target = (centerMean > 10 && binMean[i] > 10)
             ? (centerMean / binMean[i] - 1.0) : 0;
-          sumR2R2 += r2 * r2; sumR2R4 += r2 * r4; sumR4R4 += r4 * r4;
-          sumR2T += r2 * target; sumR4T += r4 * target;
+          sumR4 += r4;
+          sumR6 += r6;
+          sumR8 += r8;
+          sumR10 += r10;
+          sumR12 += r12;
+          sumR2T += r2 * target;
+          sumR4T += r4 * target;
+          sumR6T += r6 * target;
         }
-        const det = sumR2R2 * sumR4R4 - sumR2R4 * sumR2R4;
-        let a = 0, b = 0;
-        if (Math.abs(det) > 1e-10) {
-          a = (sumR4R4 * sumR2T - sumR2R4 * sumR4T) / det;
-          b = (sumR2R2 * sumR4T - sumR2R4 * sumR2T) / det;
+        let a = 0, b = 0, c = 0;
+        const solved = solveLinear3x3(
+          sumR4, sumR6, sumR8,
+          sumR6, sumR8, sumR10,
+          sumR8, sumR10, sumR12,
+          sumR2T, sumR4T, sumR6T,
+        );
+        if (solved) {
+          a = solved[0];
+          b = solved[1];
+          c = solved[2];
         }
         // Clamp to physically reasonable range
         a = Math.max(-2, Math.min(2, a));
         b = Math.max(-2, Math.min(2, b));
+        c = Math.max(-2, Math.min(2, c));
 
-        img.vignetteParams = { a, b };
-        postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b } });
+        img.vignetteParams = { a, b, c };
+        postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b, c } });
       }
       postMessage({type:'progress', stage:'vignetting', percent:100, info:'done'});
       return;
@@ -2643,6 +2679,36 @@ self.addEventListener('message', async (ev) => {
 
 function clampScalar(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function solveLinear3x3(
+  m00, m01, m02,
+  m10, m11, m12,
+  m20, m21, m22,
+  b0, b1, b2,
+) {
+  const det =
+    m00 * (m11 * m22 - m12 * m21)
+    - m01 * (m10 * m22 - m12 * m20)
+    + m02 * (m10 * m21 - m11 * m20);
+  if (!Number.isFinite(det) || Math.abs(det) < 1e-12) return null;
+
+  const invDet = 1 / det;
+  const i00 = (m11 * m22 - m12 * m21) * invDet;
+  const i01 = (m02 * m21 - m01 * m22) * invDet;
+  const i02 = (m01 * m12 - m02 * m11) * invDet;
+  const i10 = (m12 * m20 - m10 * m22) * invDet;
+  const i11 = (m00 * m22 - m02 * m20) * invDet;
+  const i12 = (m02 * m10 - m00 * m12) * invDet;
+  const i20 = (m10 * m21 - m11 * m20) * invDet;
+  const i21 = (m01 * m20 - m00 * m21) * invDet;
+  const i22 = (m00 * m11 - m01 * m10) * invDet;
+
+  return [
+    i00 * b0 + i01 * b1 + i02 * b2,
+    i10 * b0 + i11 * b1 + i12 * b2,
+    i20 * b0 + i21 * b1 + i22 * b2,
+  ];
 }
 
 function medianOfValues(values) {

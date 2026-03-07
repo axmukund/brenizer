@@ -28,8 +28,8 @@ import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
   createPyramidBlender,
   createIdentityMesh, createTextureFromImage, createEmptyTexture, createFBO,
-  makeViewMatrix, computeBlockCosts, labelsToMask, featherMask,
-  createMaskTexture, estimateOverlapWidth,
+  makeViewMatrix, computeBlockCosts, labelsToMask, buildAdaptiveBlendMask,
+  createMaskTexture,
   type GLContext, type WarpRenderer, type KeypointRenderer, type Compositor,
   type PyramidBlender, type ManagedTexture, type FaceRectComposite,
 } from './gl';
@@ -1645,9 +1645,10 @@ async function renderWarpedPreview(
     const vigParams = vignettes.get(imgId);
     const vigA = vigParams?.a ?? 0;
     const vigB = vigParams?.b ?? 0;
+    const vigC = vigParams?.c ?? 0;
     // Enable Reinhard tone mapping when gain exceeds 2× to handle extreme exposure
     const needsToneMap = gain.some((g: number) => g > 2.0 || g < 0.5);
-    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, vigA, vigB, needsToneMap);
+    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, vigA, vigB, vigC, needsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 
@@ -1807,101 +1808,21 @@ async function renderWarpedPreview(
       // get narrow feathers (avoids bleeding) while wide overlaps get wide
       // feathers (smooth transitions).
       const baseFW = Math.max(1, Math.round(featherWidth * compositeScale));
-      const adaptiveFW = estimateOverlapWidth(compPixels, newPixels, compW, compH, baseFW);
-      const feathered = featherMask(pixelMask, compW, compH, adaptiveFW);
-
-      // ── Mask clamping to valid alpha ───────────────────────────
-      // After feathering, the mask can extend beyond the new image's actual
-      // coverage (alpha=0 regions from warping).  Clamp the mask so that
-      // only pixels where the new image has content can contribute.
-      // Similarly clamp against composite alpha to prevent blending into
-      // void on the composite side (mask=0 where composite is empty).
-      for (let px = 0; px < compW * compH; px++) {
-        const newAlpha = newPixels[px * 4 + 3];
-        const compAlpha = compPixels[px * 4 + 3];
-        // In overlap (both have content), keep feathered mask as-is.
-        // Where only new image exists, force mask=255 (use new content).
-        // Where only composite exists, force mask=0 (keep composite).
-        // Where neither exists, mask=0.
-        if (newAlpha < 10 && compAlpha < 10) {
-          feathered[px] = 0;
-        } else if (newAlpha < 10) {
-          feathered[px] = 0;
-        } else if (compAlpha < 10) {
-          feathered[px] = 255;
-        }
-        // else: both have content → keep feathered value (seam-based)
-      }
-
-      // ── Ghost detection in overlap regions ───────────────────────
-      // Moving objects cause large per-pixel differences between the composite
-      // and new image in the overlap zone.  We detect these "ghost" regions
-      // by computing per-block color difference.  For blocks in the overlap
-      // where the difference is abnormally high, we force the mask to choose
-      // one side completely (the one with more surrounding support), preventing
-      // semi-transparent ghosting from the feathered blend.
-      {
-        const ghostBlockSize = blockSize * 2; // coarser blocks for ghost detection
-        const gW = Math.ceil(compW / ghostBlockSize);
-        const gH = Math.ceil(compH / ghostBlockSize);
-        const blockDiffs = new Float32Array(gW * gH);
-        const blockOverlapCount = new Uint32Array(gW * gH);
-
-        // Compute per-block mean absolute difference in overlap
-        for (let py = 0; py < compH; py++) {
-          const gy = Math.min(Math.floor(py / ghostBlockSize), gH - 1);
-          for (let px = 0; px < compW; px++) {
-            const off = (py * compW + px) * 4;
-            if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
-              const gx = Math.min(Math.floor(px / ghostBlockSize), gW - 1);
-              const gi = gy * gW + gx;
-              let diff = 0;
-              for (let ch = 0; ch < 3; ch++) {
-                diff += Math.abs(compPixels[off + ch] - newPixels[off + ch]);
-              }
-              blockDiffs[gi] += diff / 3; // average across channels
-              blockOverlapCount[gi]++;
-            }
-          }
-        }
-
-        // Compute block mean differences
-        const meanDiffs: number[] = [];
-        for (let gi = 0; gi < gW * gH; gi++) {
-          if (blockOverlapCount[gi] > 0) {
-            blockDiffs[gi] /= blockOverlapCount[gi];
-            meanDiffs.push(blockDiffs[gi]);
-          }
-        }
-
-        if (meanDiffs.length > 4) {
-          meanDiffs.sort((a, b) => a - b);
-          const medianDiff = meanDiffs[Math.floor(meanDiffs.length / 2)];
-          // Ghost threshold: blocks with > 3× median difference
-          const ghostThresh = Math.max(medianDiff * 3, 30); // minimum 30 to avoid false positives
-
-          let ghostPixels = 0;
-          for (let py = 0; py < compH; py++) {
-            const gy = Math.min(Math.floor(py / ghostBlockSize), gH - 1);
-            for (let px = 0; px < compW; px++) {
-              const off = (py * compW + px) * 4;
-              if (compPixels[off + 3] > 10 && newPixels[off + 3] > 10) {
-                const gx = Math.min(Math.floor(px / ghostBlockSize), gW - 1);
-                const gi = gy * gW + gx;
-                if (blockDiffs[gi] > ghostThresh) {
-                  // Ghost detected: force mask to whichever side the seam already
-                  // preferred (binary choice, no blend in ghost regions)
-                  const pi = py * compW + px;
-                  feathered[pi] = feathered[pi] > 128 ? 255 : 0;
-                  ghostPixels++;
-                }
-              }
-            }
-          }
-          if (ghostPixels > 0) {
-            console.log(`[ghost] Forced ${ghostPixels} pixels to binary mask (threshold=${ghostThresh.toFixed(1)}, median=${medianDiff.toFixed(1)})`);
-          }
-        }
+      const maskResult = buildAdaptiveBlendMask(
+        pixelMask,
+        compPixels,
+        newPixels,
+        compW,
+        compH,
+        baseFW,
+        { ghostBlockSize: blockSize * 2 },
+      );
+      const feathered = maskResult.mask;
+      if (maskResult.ghostPixels > 0) {
+        console.log(
+          `[ghost] Forced ${maskResult.ghostPixels} pixels to binary mask ` +
+          `(threshold=${maskResult.ghostThreshold.toFixed(1)}, median=${maskResult.ghostMedianDiff.toFixed(1)})`,
+        );
       }
 
       enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
@@ -1946,21 +1867,15 @@ async function renderWarpedPreview(
       }
       // Adaptive feather
       const baseFW = Math.max(1, Math.round(featherWidth * compositeScale));
-      const adaptiveFW = estimateOverlapWidth(compPixels, newPixels, compW, compH, baseFW);
-      const feathered = featherMask(alphaMask, compW, compH, adaptiveFW);
-
-      // Clamp mask to valid alpha (same logic as graph-cut path)
-      for (let px = 0; px < compW * compH; px++) {
-        const newAlpha = newPixels[px * 4 + 3];
-        const compAlpha = compPixels[px * 4 + 3];
-        if (newAlpha < 10 && compAlpha < 10) {
-          feathered[px] = 0;
-        } else if (newAlpha < 10) {
-          feathered[px] = 0;
-        } else if (compAlpha < 10) {
-          feathered[px] = 255;
-        }
-      }
+      const feathered = buildAdaptiveBlendMask(
+        alphaMask,
+        compPixels,
+        newPixels,
+        compW,
+        compH,
+        baseFW,
+        { ghostBlockSize: blockSize * 2 },
+      ).mask;
       enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
 
@@ -2561,6 +2476,7 @@ async function exportComposite(): Promise<void> {
   const _expNewPixels = new Uint8Array(outW * outH * 4);
   let keyCoverageMask: Uint8Array | null = null;
   const exportFeatherWidth = Math.max(1, Math.round(featherWidth * compositeScale));
+  const exportGhostBlockSize = (exportSeamPlan?.blockSize ?? blockSize) * 2;
 
   const blendWithMask = (maskPixels: Uint8Array): void => {
     const maskTex = createMaskTexture(gl, maskPixels, outW, outH);
@@ -2581,7 +2497,6 @@ async function exportComposite(): Promise<void> {
   ): void => {
     const alphaMask = new Uint8Array(outW * outH);
     for (let i = 0; i < outW * outH; i++) alphaMask[i] = newPixels[i * 4 + 3];
-    const feathered = featherMask(alphaMask, outW, outH, exportFeatherWidth);
     let comp = compPixels;
     if (!comp) {
       comp = new Uint8Array(outW * outH * 4);
@@ -2589,6 +2504,15 @@ async function exportComposite(): Promise<void> {
       gl.readPixels(0, 0, outW, outH, gl.RGBA, gl.UNSIGNED_BYTE, comp);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
+    const feathered = buildAdaptiveBlendMask(
+      alphaMask,
+      comp,
+      newPixels,
+      outW,
+      outH,
+      exportFeatherWidth,
+      { ghostBlockSize: exportGhostBlockSize },
+    ).mask;
     enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, currentImageId, comp, newPixels);
     blendWithMask(feathered);
   };
@@ -2719,8 +2643,9 @@ async function exportComposite(): Promise<void> {
     const expVigParams = getLastVignette().get(imgId);
     const expVigA = expVigParams?.a ?? 0;
     const expVigB = expVigParams?.b ?? 0;
+    const expVigC = expVigParams?.c ?? 0;
     const expNeedsToneMap = gain.some((g: number) => g > 2.0 || g < 0.5);
-    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, expVigA, expVigB, expNeedsToneMap);
+    warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, expVigA, expVigB, expVigC, expNeedsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
 
@@ -2785,7 +2710,15 @@ async function exportComposite(): Promise<void> {
         );
         const blockLabels = new Uint8Array(seamResult.labelsBuffer);
         const pixelMask = labelsToMask(blockLabels, costs.gridW, costs.gridH, seamBlockSize, outW, outH);
-        const feathered = featherMask(pixelMask, outW, outH, exportFeatherWidth);
+        const feathered = buildAdaptiveBlendMask(
+          pixelMask,
+          compPixels,
+          newPixels,
+          outW,
+          outH,
+          exportFeatherWidth,
+          { ghostBlockSize: exportGhostBlockSize },
+        ).mask;
         enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
         blendWithMask(feathered);
       } catch (err) {
