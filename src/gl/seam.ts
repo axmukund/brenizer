@@ -113,6 +113,7 @@ export interface BuildMaskTextureArgs {
   compositeTex: WebGLTexture;
   newTex: WebGLTexture;
   keyCoverageTex?: WebGLTexture | null;
+  sameCameraSettings?: boolean;
 }
 
 export interface SeamAccelerator {
@@ -887,7 +888,18 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
     gl.uniform1f(gl.getUniformLocation(expandProg, 'u_alphaThreshold'), CONTENT_ALPHA_THRESHOLD);
     drawFullscreen(maskFboA!.fbo, args.width, args.height, expandProg);
 
-    const featherRadius = Math.max(1, Math.round(args.featherRadius));
+    const sameCameraSettings = !!args.sameCameraSettings;
+    const featherRadius = sameCameraSettings
+      ? Math.max(
+        Math.max(6, Math.round(args.featherRadius * 0.85)),
+        Math.round(Math.max(1, args.featherRadius) * 1.35),
+      )
+      : Math.max(1, Math.round(args.featherRadius));
+    const hardThreshold = sameCameraSettings
+      ? clampUnit(Math.min(1, args.ghostThreshold * 1.8))
+      : clampUnit(args.ghostThreshold);
+    const softStart = sameCameraSettings ? 1 : clampUnit(args.lightingSoftStart);
+    const softEnd = sameCameraSettings ? 1 : clampUnit(args.lightingSoftEnd);
     blurInto(maskTexA!.texture, maskFboB!.fbo, maskFboA!.fbo, args.width, args.height, featherRadius);
 
     gl.useProgram(refineProg);
@@ -914,9 +926,9 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
     gl.uniform2f(gl.getUniformLocation(refineProg, 'u_outputSize'), args.width, args.height);
     gl.uniform1f(gl.getUniformLocation(refineProg, 'u_blockSize'), args.blockSize);
     gl.uniform1f(gl.getUniformLocation(refineProg, 'u_alphaThreshold'), CONTENT_ALPHA_THRESHOLD);
-    gl.uniform1f(gl.getUniformLocation(refineProg, 'u_hardThreshold'), clampUnit(args.ghostThreshold));
-    gl.uniform1f(gl.getUniformLocation(refineProg, 'u_softStart'), clampUnit(args.lightingSoftStart));
-    gl.uniform1f(gl.getUniformLocation(refineProg, 'u_softEnd'), clampUnit(args.lightingSoftEnd));
+    gl.uniform1f(gl.getUniformLocation(refineProg, 'u_hardThreshold'), hardThreshold);
+    gl.uniform1f(gl.getUniformLocation(refineProg, 'u_softStart'), softStart);
+    gl.uniform1f(gl.getUniformLocation(refineProg, 'u_softEnd'), softEnd);
     drawFullscreen(maskFboB!.fbo, args.width, args.height, refineProg);
 
     const outTex = createEmptyTexture(gl, args.width, args.height);

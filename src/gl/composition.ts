@@ -133,6 +133,7 @@ export interface FaceRectComposite {
 
 export interface AdaptiveBlendMaskOptions {
   ghostBlockSize?: number;
+  sameCameraSettings?: boolean;
 }
 
 export interface AdaptiveBlendMaskResult {
@@ -580,7 +581,17 @@ export function buildAdaptiveBlendMask(
   fallbackRadius: number,
   options: AdaptiveBlendMaskOptions = {},
 ): AdaptiveBlendMaskResult {
-  const featherRadius = estimateOverlapWidth(compositePixels, newImagePixels, width, height, fallbackRadius);
+  const sameCameraSettings = !!options.sameCameraSettings;
+  const estimatedFeatherRadius = estimateOverlapWidth(compositePixels, newImagePixels, width, height, fallbackRadius);
+  const featherRadius = sameCameraSettings
+    ? Math.max(
+      Math.max(6, Math.round(fallbackRadius * 0.85)),
+      Math.min(
+        Math.max(estimatedFeatherRadius, Math.round(fallbackRadius * 2.5)),
+        Math.round(Math.max(estimatedFeatherRadius, fallbackRadius) * 1.35),
+      ),
+    )
+    : estimatedFeatherRadius;
   const mask = featherMask(baseMask, width, height, featherRadius);
   clampBlendMaskToCoverage(mask, compositePixels, newImagePixels);
   const ghostStats = hardenGhostRegions(
@@ -590,8 +601,11 @@ export function buildAdaptiveBlendMask(
     width,
     height,
     options.ghostBlockSize,
+    sameCameraSettings ? 1.8 : 1,
   );
-  refineSeamMaskForLighting(mask, compositePixels, newImagePixels, width, height, featherRadius);
+  if (!sameCameraSettings) {
+    refineSeamMaskForLighting(mask, compositePixels, newImagePixels, width, height, featherRadius);
+  }
   return {
     mask,
     featherRadius,
@@ -776,6 +790,7 @@ function hardenGhostRegions(
   width: number,
   height: number,
   ghostBlockSize?: number,
+  thresholdScale: number = 1,
 ): {
   ghostPixels: number;
   ghostThreshold: number;
@@ -813,7 +828,7 @@ function hardenGhostRegions(
   }
 
   const ghostMedianDiff = quantile(means, 0.5);
-  const ghostThreshold = Math.max(ghostMedianDiff * 3, 30);
+  const ghostThreshold = Math.max(ghostMedianDiff * 3 * thresholdScale, 30 * thresholdScale);
   let ghostPixels = 0;
 
   for (let y = 0; y < height; y++) {

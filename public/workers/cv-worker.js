@@ -542,12 +542,12 @@ self.addEventListener('message', async (ev) => {
 
       function clampVignetteForLockedCapture(params) {
         if (!minimalAdjustment) return params;
-        const MAX_CORNER_BOOST = 1.06;
+        const MAX_CORNER_BOOST = 1.10;
         const cornerBoost = 1 + params.a * 2 + params.b * 4 + params.c * 8;
         const scaled = {
-          a: params.a * 0.25,
-          b: params.b * 0.25,
-          c: params.c * 0.25,
+          a: params.a * 0.55,
+          b: params.b * 0.55,
+          c: params.c * 0.55,
         };
         const scaledCornerBoost = 1 + scaled.a * 2 + scaled.b * 4 + scaled.c * 8;
         if (scaledCornerBoost <= MAX_CORNER_BOOST) return scaled;
@@ -2306,7 +2306,7 @@ self.addEventListener('message', async (ev) => {
           // Regularization toward gain=1. Keep it conservative for locked
           // sequences so we still correct residual vignetting/light loss in
           // overlaps instead of flattening everything back to 1.0.
-          const regWeight = sameCam ? (minimalAdjustment ? 0.45 : 0.12) : 0.01;
+          const regWeight = sameCam ? (minimalAdjustment ? 0.9 : 0.12) : 0.01;
           for (let i = 0; i < n; i++) AtA[i * n + i] += regWeight;
 
           const logGains = solveLinearN(AtA, Atb, n);
@@ -2356,7 +2356,7 @@ self.addEventListener('message', async (ev) => {
       });
 
       if (lockColorBalance) {
-        const channelFreedom = sameCam ? 0.18 : 0.35;
+        const channelFreedom = sameCam ? (minimalAdjustment ? 0.08 : 0.18) : 0.35;
         for (const g of gains) {
           const base = Math.max(0.05, Math.min(20, Number.isFinite(g.gain) ? g.gain : 1.0));
           const logBase = Math.log(base);
@@ -2374,7 +2374,7 @@ self.addEventListener('message', async (ev) => {
 
       if (sameCam && minimalAdjustment) {
         for (const g of gains) {
-          const base = Math.max(0.96, Math.min(1.04, Math.exp(Math.log(Math.max(1e-6, g.gain)) * 0.18)));
+          const base = Math.max(0.985, Math.min(1.015, Math.exp(Math.log(Math.max(1e-6, g.gain)) * 0.12)));
           g.gain = base;
           g.gainR = base;
           g.gainG = base;
@@ -2387,10 +2387,10 @@ self.addEventListener('message', async (ev) => {
       // final mosaic, so keep this threshold tight.
       if (sameCam) {
         const allNear1 = gains.every(g =>
-          Math.abs(g.gain - 1) < (minimalAdjustment ? 0.008 : 0.015) &&
-          Math.abs(g.gainR - 1) < (minimalAdjustment ? 0.008 : 0.015) &&
-          Math.abs(g.gainG - 1) < (minimalAdjustment ? 0.008 : 0.015) &&
-          Math.abs(g.gainB - 1) < (minimalAdjustment ? 0.008 : 0.015)
+          Math.abs(g.gain - 1) < (minimalAdjustment ? 0.005 : 0.015) &&
+          Math.abs(g.gainR - 1) < (minimalAdjustment ? 0.005 : 0.015) &&
+          Math.abs(g.gainG - 1) < (minimalAdjustment ? 0.005 : 0.015) &&
+          Math.abs(g.gainB - 1) < (minimalAdjustment ? 0.005 : 0.015)
         );
         if (allNear1) {
           for (const g of gains) {

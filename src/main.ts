@@ -392,11 +392,11 @@ function resolveAppliedPhotometricAdjustment(
   }
 
   const avgLogGain = (Math.log(rawGain[0]) + Math.log(rawGain[1]) + Math.log(rawGain[2])) / 3;
-  const scalarGain = clampGainTowardUnity(Math.exp(avgLogGain), 0.35, 0.97, 1.03);
+  const scalarGain = clampGainTowardUnity(Math.exp(avgLogGain), 0.18, 0.985, 1.015);
   let scaledVignette = {
-    a: rawVignette.a * 0.35,
-    b: rawVignette.b * 0.35,
-    c: rawVignette.c * 0.35,
+    a: rawVignette.a * 0.8,
+    b: rawVignette.b * 0.8,
+    c: rawVignette.c * 0.8,
   };
   const cornerBoost = 1 + scaledVignette.a * 2 + scaledVignette.b * 4 + scaledVignette.c * 8;
   const maxCornerBoost = 1.05;
@@ -913,12 +913,16 @@ function buildGpuFeatherMask(
   width: number,
   height: number,
   featherRadius: number,
+  sameCameraSettings: boolean,
   currentCompTex: WebGLTexture,
   newImageTex: WebGLTexture,
   keyCoverageTex?: WebGLTexture | null,
 ): ManagedTexture {
   if (!seamAccelerator) throw new Error('Seam accelerator unavailable');
   const labels = new Uint8Array([255]);
+  const resolvedFeatherRadius = sameCameraSettings
+    ? Math.max(Math.max(6, Math.round(featherRadius * 0.85)), Math.round(Math.max(1, featherRadius) * 1.35))
+    : featherRadius;
   return seamAccelerator.buildMaskTexture({
     labels,
     gridW: 1,
@@ -926,7 +930,7 @@ function buildGpuFeatherMask(
     width,
     height,
     blockSize: Math.max(width, height),
-    featherRadius,
+    featherRadius: resolvedFeatherRadius,
     ghostPenalty: new Float32Array([0]),
     ghostThreshold: 1,
     lightingSoftStart: 1,
@@ -934,6 +938,7 @@ function buildGpuFeatherMask(
     compositeTex: currentCompTex,
     newTex: newImageTex,
     keyCoverageTex,
+    sameCameraSettings,
   });
 }
 
@@ -1083,6 +1088,7 @@ async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<Resolv
     compositeTex: opts.currentCompTex,
     newTex: blendTex,
     keyCoverageTex: opts.keyCoverageTex,
+    sameCameraSettings: opts.sameCameraSettings,
   });
   const maskMs = performance.now() - maskStartedAt;
 
@@ -2414,7 +2420,10 @@ async function renderWarpedPreview(
         compW,
         compH,
         baseFW,
-        { ghostBlockSize: blockSize * 2 },
+        {
+          ghostBlockSize: blockSize * 2,
+          sameCameraSettings: !!settings?.sameCameraSettings,
+        },
       );
       const feathered = maskResult.mask;
       if (maskResult.ghostPixels > 0) {
@@ -2452,6 +2461,7 @@ async function renderWarpedPreview(
         compW,
         compH,
         Math.max(1, Math.round(featherWidth * compositeScale)),
+        !!settings?.sameCameraSettings,
         currentCompTex.texture,
         newImageTex.texture,
         keyCoverageTex?.texture ?? null,
@@ -2507,7 +2517,10 @@ async function renderWarpedPreview(
         compW,
         compH,
         baseFW,
-        { ghostBlockSize: blockSize * 2 },
+        {
+          ghostBlockSize: blockSize * 2,
+          sameCameraSettings: !!settings?.sameCameraSettings,
+        },
       ).mask;
       enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
       const maskTex = createMaskTexture(gl, feathered, compW, compH);
@@ -3156,6 +3169,7 @@ async function exportComposite(): Promise<void> {
       outW,
       outH,
       exportFeatherWidth,
+      !!settings.sameCameraSettings,
       currentCompTex.texture,
       blendTex,
       keyCoverageTex?.texture ?? null,
@@ -3188,7 +3202,10 @@ async function exportComposite(): Promise<void> {
       outW,
       outH,
       exportFeatherWidth,
-      { ghostBlockSize: exportGhostBlockSize },
+      {
+        ghostBlockSize: exportGhostBlockSize,
+        sameCameraSettings: !!settings.sameCameraSettings,
+      },
     ).mask;
     enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, currentImageId, comp, newPixels);
     blendWithMask(feathered);
@@ -3512,7 +3529,10 @@ async function exportComposite(): Promise<void> {
           outW,
           outH,
           exportFeatherWidth,
-          { ghostBlockSize: exportGhostBlockSize },
+          {
+            ghostBlockSize: exportGhostBlockSize,
+            sameCameraSettings: !!settings.sameCameraSettings,
+          },
         ).mask;
         enforceKeyForegroundMask(feathered, keyCoverageMask, keyImageId, imgId, compPixels, newPixels);
         blendWithMask(feathered);
