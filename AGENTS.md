@@ -25,7 +25,9 @@ Use these commands/workflows for this repository unless a task explicitly requir
 - Validation/test commands:
   - `npm run typecheck`
   - `npm run build`
+  - `npm test` (alias of `npm run test:e2e`)
   - `npm run test:e2e`
+    - `pretest:e2e` runs `npm run prepare:maxflow` first.
   - `npm run verify` (runs typecheck + build + e2e)
 - Test fixture generation:
   - `npm run generate:test-images` regenerates license-safe synthetic fixtures under `public/test_images/`.
