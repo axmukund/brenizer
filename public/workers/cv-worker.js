@@ -122,6 +122,13 @@ self.addEventListener('message', async (ev) => {
             model: exif.model || '',
             focalLengthMm: Number.isFinite(exif.focalLengthMm) ? exif.focalLengthMm : undefined,
             focalLength35mm: Number.isFinite(exif.focalLength35mm) ? exif.focalLength35mm : undefined,
+            apertureFNumber: Number.isFinite(exif.apertureFNumber) ? exif.apertureFNumber : undefined,
+            exposureTimeSec: Number.isFinite(exif.exposureTimeSec) ? exif.exposureTimeSec : undefined,
+            iso: Number.isFinite(exif.iso) ? exif.iso : undefined,
+            whiteBalanceMode: exif.whiteBalanceMode === 'auto' || exif.whiteBalanceMode === 'manual'
+              ? exif.whiteBalanceMode
+              : undefined,
+            exposureBiasEv: Number.isFinite(exif.exposureBiasEv) ? exif.exposureBiasEv : undefined,
             capturedAtMs: Number.isFinite(exif.capturedAtMs) ? exif.capturedAtMs : undefined,
           };
         }
@@ -139,6 +146,13 @@ self.addEventListener('message', async (ev) => {
             model: exif.model || '',
             focalLengthMm: Number.isFinite(exif.focalLengthMm) ? exif.focalLengthMm : undefined,
             focalLength35mm: Number.isFinite(exif.focalLength35mm) ? exif.focalLength35mm : undefined,
+            apertureFNumber: Number.isFinite(exif.apertureFNumber) ? exif.apertureFNumber : undefined,
+            exposureTimeSec: Number.isFinite(exif.exposureTimeSec) ? exif.exposureTimeSec : undefined,
+            iso: Number.isFinite(exif.iso) ? exif.iso : undefined,
+            whiteBalanceMode: exif.whiteBalanceMode === 'auto' || exif.whiteBalanceMode === 'manual'
+              ? exif.whiteBalanceMode
+              : undefined,
+            exposureBiasEv: Number.isFinite(exif.exposureBiasEv) ? exif.exposureBiasEv : undefined,
             capturedAtMs: Number.isFinite(exif.capturedAtMs) ? exif.capturedAtMs : undefined,
           } : null,
         };
@@ -2140,9 +2154,12 @@ self.addEventListener('message', async (ev) => {
       // systems for R, G, B channels. Otherwise, we use the grayscale channel
       // for a single gain and replicate it across channels.
       //
-      // When sameCameraSettings is true, we use much stronger regularization
-      // toward gain=1 (same aperture/ISO/shutter → expect near-equal exposure).
+      // When sameCameraSettings is true, we still allow residual overlap-driven
+      // exposure correction, but we regularize it toward unity and prevent the
+      // RGB channels from drifting independently unless the caller explicitly
+      // leaves color balance unlocked.
       const sameCam = msg.sameCameraSettings || false;
+      const lockColorBalance = (msg.lockColorBalance !== undefined) ? !!msg.lockColorBalance : sameCam;
       const ids = Object.keys(images);
       const n = ids.length;
 
@@ -2263,8 +2280,10 @@ self.addEventListener('message', async (ev) => {
 
           // Fix reference (strong prior)
           AtA[refIdx * n + refIdx] += 1000;
-          // Regularization toward gain=1  (much stronger when same camera settings)
-          const regWeight = sameCam ? 1.0 : 0.01;
+          // Regularization toward gain=1. Keep it conservative for locked
+          // sequences so we still correct residual vignetting/light loss in
+          // overlaps instead of flattening everything back to 1.0.
+          const regWeight = sameCam ? 0.12 : 0.01;
           for (let i = 0; i < n; i++) AtA[i * n + i] += regWeight;
 
           const logGains = solveLinearN(AtA, Atb, n);
@@ -2313,19 +2332,38 @@ self.addEventListener('message', async (ev) => {
         };
       });
 
-      // When same-camera, check if all gains are negligible (within ±5%)
-      // If so, snap them to exactly 1.0 to avoid unnecessary pixel work.
+      if (lockColorBalance) {
+        const channelFreedom = sameCam ? 0.18 : 0.35;
+        for (const g of gains) {
+          const base = Math.max(0.05, Math.min(20, Number.isFinite(g.gain) ? g.gain : 1.0));
+          const logBase = Math.log(base);
+          const blendTowardBase = (channelGain) => {
+            const ch = Math.max(0.05, Math.min(20, Number.isFinite(channelGain) ? channelGain : base));
+            const logMixed = logBase + (Math.log(ch) - logBase) * channelFreedom;
+            const mixed = Math.exp(logMixed);
+            return Math.max(0.05, Math.min(20, Number.isFinite(mixed) ? mixed : base));
+          };
+          g.gainR = blendTowardBase(g.gainR);
+          g.gainG = blendTowardBase(g.gainG);
+          g.gainB = blendTowardBase(g.gainB);
+        }
+      }
+
+      // When same-camera, only snap to 1.0 when the residual solution is tiny.
+      // A ±5% threshold erases real vignette residuals that are visible in the
+      // final mosaic, so keep this threshold tight.
       if (sameCam) {
         const allNear1 = gains.every(g =>
-          Math.abs(g.gainR - 1) < 0.05 &&
-          Math.abs(g.gainG - 1) < 0.05 &&
-          Math.abs(g.gainB - 1) < 0.05
+          Math.abs(g.gain - 1) < 0.015 &&
+          Math.abs(g.gainR - 1) < 0.015 &&
+          Math.abs(g.gainG - 1) < 0.015 &&
+          Math.abs(g.gainB - 1) < 0.015
         );
         if (allNear1) {
           for (const g of gains) {
             g.gain = 1.0; g.gainR = 1.0; g.gainG = 1.0; g.gainB = 1.0;
           }
-          postMessage({type:'progress', stage:'exposure', percent:100, info:'same-camera: gains negligible, snapped to 1.0'});
+          postMessage({type:'progress', stage:'exposure', percent:100, info:'same-camera: residual gains tiny, snapped to 1.0'});
         }
       }
 

@@ -4,6 +4,11 @@ export interface ExifMetadata {
   model?: string;
   focalLengthMm?: number;
   focalLength35mm?: number;
+  apertureFNumber?: number;
+  exposureTimeSec?: number;
+  iso?: number;
+  whiteBalanceMode?: 'auto' | 'manual';
+  exposureBiasEv?: number;
   capturedAtMs?: number;
 }
 
@@ -194,6 +199,22 @@ function parseExifFromJpegBuffer(buffer: ArrayBuffer): ExifMetadata {
             } else if (e.tag === 0xA405) {
               const v = readShort(e, tiffStart, littleEndian, view);
               if (v !== undefined && Number.isFinite(v)) meta.focalLength35mm = v;
+            } else if (e.tag === 0x829D) {
+              const v = readRational(e, tiffStart, littleEndian, view);
+              if (v !== undefined && Number.isFinite(v) && v > 0) meta.apertureFNumber = v;
+            } else if (e.tag === 0x829A) {
+              const v = readRational(e, tiffStart, littleEndian, view);
+              if (v !== undefined && Number.isFinite(v) && v > 0) meta.exposureTimeSec = v;
+            } else if (e.tag === 0x8827 || e.tag === 0x8833) {
+              const v = readShort(e, tiffStart, littleEndian, view);
+              if (v !== undefined && Number.isFinite(v) && v > 0) meta.iso = v;
+            } else if (e.tag === 0xA403) {
+              const v = readShort(e, tiffStart, littleEndian, view);
+              if (v === 0) meta.whiteBalanceMode = 'auto';
+              else if (v === 1) meta.whiteBalanceMode = 'manual';
+            } else if (e.tag === 0x9204) {
+              const v = readRational(e, tiffStart, littleEndian, view);
+              if (v !== undefined && Number.isFinite(v)) meta.exposureBiasEv = v;
             } else if (e.tag === 0x9003 || e.tag === 0x9004) {
               const v = readAsciiTag(e, tiffStart, littleEndian, view);
               const ts = v ? parseExifDateTime(v) : undefined;

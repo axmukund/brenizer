@@ -189,6 +189,148 @@ export function getWorkerManager(): WorkerManager | null {
   return workerManager;
 }
 
+interface PhotometricSettingsDecision {
+  sharedExposureSettings: boolean;
+  pooledVignetteModel: boolean;
+  lockColorBalance: boolean;
+  source: 'settings' | 'exif' | 'settings+exif' | 'exif-mismatch' | 'unknown';
+  summary: string;
+}
+
+function isFiniteNumber(value: number | undefined | null): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function nearlyEqualRelative(a: number, b: number, relTol: number, absTol = 0): boolean {
+  return Math.abs(a - b) <= Math.max(absTol, Math.max(Math.abs(a), Math.abs(b), 1) * relTol);
+}
+
+function readExifNumericValues(
+  active: ImageEntry[],
+  getter: (exif: NonNullable<ImageEntry['exif']>) => number | undefined,
+): number[] {
+  const out: number[] = [];
+  for (const img of active) {
+    const value = img.exif ? getter(img.exif) : undefined;
+    if (isFiniteNumber(value)) out.push(value);
+  }
+  return out;
+}
+
+function readExifStringValues(
+  active: ImageEntry[],
+  getter: (exif: NonNullable<ImageEntry['exif']>) => string | undefined,
+): string[] {
+  const out: string[] = [];
+  for (const img of active) {
+    const raw = img.exif ? getter(img.exif) : undefined;
+    const value = raw?.trim().toLowerCase();
+    if (value) out.push(value);
+  }
+  return out;
+}
+
+function summarizeObservedConsistency(
+  name: string,
+  observedCount: number,
+  consistent: boolean,
+): { name: string; observed: boolean; observedCount: number; consistent: boolean } {
+  return { name, observed: observedCount >= 2, observedCount, consistent };
+}
+
+function resolvePhotometricSettings(active: ImageEntry[], manualSameCameraSettings: boolean): PhotometricSettingsDecision {
+  const requiredExifCoverage = Math.max(2, Math.ceil(active.length * 0.75));
+  const apertureValues = readExifNumericValues(active, (exif) => exif.apertureFNumber);
+  const exposureValues = readExifNumericValues(active, (exif) => exif.exposureTimeSec);
+  const isoValues = readExifNumericValues(active, (exif) => exif.iso);
+  const exposureBiasValues = readExifNumericValues(active, (exif) => exif.exposureBiasEv);
+  const focalValues = readExifNumericValues(
+    active,
+    (exif) => (isFiniteNumber(exif.focalLength35mm) ? exif.focalLength35mm : exif.focalLengthMm),
+  );
+  const whiteBalanceValues = readExifStringValues(active, (exif) => exif.whiteBalanceMode);
+
+  const aperture = summarizeObservedConsistency(
+    'aperture',
+    apertureValues.length,
+    apertureValues.length < 2 || apertureValues.every((value) => nearlyEqualRelative(value, apertureValues[0], 0.02, 0.05)),
+  );
+  const exposure = summarizeObservedConsistency(
+    'exposure time',
+    exposureValues.length,
+    exposureValues.length < 2 || exposureValues.every((value) => nearlyEqualRelative(value, exposureValues[0], 0.03, 1 / 8000)),
+  );
+  const iso = summarizeObservedConsistency(
+    'ISO',
+    isoValues.length,
+    isoValues.length < 2 || isoValues.every((value) => nearlyEqualRelative(value, isoValues[0], 0.05, 4)),
+  );
+  const exposureBias = summarizeObservedConsistency(
+    'exposure bias',
+    exposureBiasValues.length,
+    exposureBiasValues.length < 2 || exposureBiasValues.every((value) => Math.abs(value - exposureBiasValues[0]) <= 0.1),
+  );
+  const whiteBalance = summarizeObservedConsistency(
+    'white balance',
+    whiteBalanceValues.length,
+    whiteBalanceValues.length < 2 || whiteBalanceValues.every((value) => value === whiteBalanceValues[0]),
+  );
+  const focal = summarizeObservedConsistency(
+    'focal length',
+    focalValues.length,
+    focalValues.length < 2 || focalValues.every((value) => nearlyEqualRelative(value, focalValues[0], 0.02, 0.5)),
+  );
+
+  const captureChecks = [aperture, exposure, iso, exposureBias, whiteBalance];
+  const captureMismatch = captureChecks.filter((check) => check.observed && !check.consistent).map((check) => check.name);
+  const consistentCaptureCount = captureChecks.filter(
+    (check) => check.observed && check.consistent && check.observedCount >= requiredExifCoverage,
+  ).length;
+  const captureExifSupportsShared = consistentCaptureCount >= 2 && captureMismatch.length === 0;
+
+  const sharedExposureSettings = captureMismatch.length > 0
+    ? false
+    : (manualSameCameraSettings || captureExifSupportsShared);
+  const pooledVignetteModel = sharedExposureSettings && (!focal.observed || focal.consistent);
+  const lockColorBalance = sharedExposureSettings
+    && (
+      manualSameCameraSettings
+      || (whiteBalance.observed && whiteBalance.consistent)
+      || [aperture, exposure, iso].filter(
+        (check) => check.observed && check.consistent && check.observedCount >= requiredExifCoverage,
+      ).length >= 2
+    );
+
+  let source: PhotometricSettingsDecision['source'] = 'unknown';
+  if (captureMismatch.length > 0) source = 'exif-mismatch';
+  else if (manualSameCameraSettings && captureExifSupportsShared) source = 'settings+exif';
+  else if (manualSameCameraSettings) source = 'settings';
+  else if (captureExifSupportsShared) source = 'exif';
+
+  const summaryParts: string[] = [];
+  summaryParts.push(sharedExposureSettings ? 'shared exposure settings' : 'per-image exposure settings');
+  summaryParts.push(pooledVignetteModel ? 'pooled vignette model' : 'per-image vignette model');
+  summaryParts.push(lockColorBalance ? 'locked color balance' : 'free RGB balance');
+  if (captureMismatch.length > 0) {
+    summaryParts.push(`EXIF mismatch: ${captureMismatch.join(', ')}`);
+  } else if (!captureExifSupportsShared) {
+    summaryParts.push(`EXIF incomplete for photometric lock (need ${requiredExifCoverage}+ images per field)`);
+  } else {
+    summaryParts.push(`EXIF confirmed ${consistentCaptureCount} capture fields`);
+  }
+  if (focal.observed && !focal.consistent) {
+    summaryParts.push('focal length differs, vignette pooling disabled');
+  }
+
+  return {
+    sharedExposureSettings,
+    pooledVignetteModel,
+    lockColorBalance,
+    source,
+    summary: summaryParts.join(' | '),
+  };
+}
+
 function applyWorkerInitCapabilities(result: WorkerInitResults, opts: { enableSeam?: boolean }): void {
   const caps = getState().capabilities;
   if (!caps || opts.enableSeam === false) return;
@@ -501,14 +643,19 @@ async function prepareImagesForCV(
           height,
           exif: img.exif
             ? {
-                orientation: img.exif.orientation,
-                make: img.exif.make,
-                model: img.exif.model,
-                focalLengthMm: img.exif.focalLengthMm,
-                focalLength35mm: img.exif.focalLength35mm,
-                capturedAtMs: img.exif.capturedAtMs,
-              }
-            : undefined,
+              orientation: img.exif.orientation,
+              make: img.exif.make,
+              model: img.exif.model,
+              focalLengthMm: img.exif.focalLengthMm,
+              focalLength35mm: img.exif.focalLength35mm,
+              apertureFNumber: img.exif.apertureFNumber,
+              exposureTimeSec: img.exif.exposureTimeSec,
+              iso: img.exif.iso,
+              whiteBalanceMode: img.exif.whiteBalanceMode,
+              exposureBiasEv: img.exif.exposureBiasEv,
+              capturedAtMs: img.exif.capturedAtMs,
+            }
+          : undefined,
         },
         [buf, rgbBuf],
       );
@@ -1302,6 +1449,8 @@ export async function runStitchPreview(): Promise<void> {
     return;
   }
   let effectiveSettings: PipelineSettings = { ...settings };
+  let photometricSettings = resolvePhotometricSettings(active, effectiveSettings.sameCameraSettings);
+  console.info('[photometric]', photometricSettings.summary, { source: photometricSettings.source });
 
   // Prevent re-entry while pipeline is already running
   if (getState().pipelineStatus === 'running') {
@@ -1455,7 +1604,7 @@ export async function runStitchPreview(): Promise<void> {
   // Step 3b-pre: Vignetting estimation (PTGui-style polynomial radial model)
   lastVignette = new Map();
   if (effectiveSettings.vignetteCorrection) {
-    setStatus('Estimating vignetting…');
+    setStatus(`Estimating vignetting (${photometricSettings.pooledVignetteModel ? 'pooled' : 'per-image'})…`);
     updateProgress('vignetting', 0);
 
     const vignetteUnsub = workerManager!.onCV((msg) => {
@@ -1470,7 +1619,7 @@ export async function runStitchPreview(): Promise<void> {
       }
     });
 
-    workerManager!.sendCV({ type: 'computeVignetting', pooled: effectiveSettings.sameCameraSettings });
+    workerManager!.sendCV({ type: 'computeVignetting', pooled: photometricSettings.pooledVignetteModel });
 
     // Wait for vignetting progress complete
     await new Promise<void>((resolve, reject) => {
@@ -1759,6 +1908,8 @@ export async function runStitchPreview(): Promise<void> {
 
     // Filter active list
     active = active.filter(img => !excludeSet.has(img.id));
+    photometricSettings = resolvePhotometricSettings(active, effectiveSettings.sameCameraSettings);
+    console.info('[photometric] after exclusions', photometricSettings.summary, { source: photometricSettings.source });
 
     // Re-run BA without excluded images
     setStatus('Re-running bundle adjustment without excluded images…');
@@ -1829,7 +1980,7 @@ export async function runStitchPreview(): Promise<void> {
   // Step 6b: Exposure compensation (per-image scalar gain)
   lastGains = new Map();
   if (effectiveSettings.exposureComp) {
-    setStatus('Computing exposure gains…');
+    setStatus(`Computing exposure gains${photometricSettings.lockColorBalance ? ' (locked color balance)' : ''}…`);
     updateProgress('exposure', 0);
 
     const exposurePromise = new Promise<CVExposureMsg>((resolve, reject) => {
@@ -1849,7 +2000,11 @@ export async function runStitchPreview(): Promise<void> {
       unsub = workerManager!.onCV(handler);
     });
 
-    workerManager!.sendCV({ type: 'computeExposure', sameCameraSettings: effectiveSettings.sameCameraSettings });
+    workerManager!.sendCV({
+      type: 'computeExposure',
+      sameCameraSettings: photometricSettings.sharedExposureSettings,
+      lockColorBalance: photometricSettings.lockColorBalance,
+    });
 
     const exposureMsg = await exposurePromise;
     for (const g of exposureMsg.gains) {

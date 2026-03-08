@@ -1,15 +1,9 @@
+import type { ExifMetadata } from './exif';
 import type { Capabilities } from './capabilities';
 import type { PipelineSettings, ModeName } from './presets';
 
 /** Represents a single loaded image. */
-export interface ImageExifMeta {
-  orientation: number;
-  make?: string;
-  model?: string;
-  focalLengthMm?: number;
-  focalLength35mm?: number;
-  capturedAtMs?: number;
-}
+export type ImageExifMeta = ExifMetadata;
 
 export interface ImageEntry {
   id: string;
