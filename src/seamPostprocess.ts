@@ -146,7 +146,9 @@ function estimateEdgeMagnitude(
   const rightY = computeY(data[rightIdx], data[rightIdx + 1], data[rightIdx + 2]);
   const upY = computeY(data[upIdx], data[upIdx + 1], data[upIdx + 2]);
   const downY = computeY(data[downIdx], data[downIdx + 1], data[downIdx + 2]);
-  return Math.abs(rightY - leftY) + 0.5 * Math.abs(downY - upY);
+  const dx = Math.abs(rightY - leftY);
+  const dy = Math.abs(downY - upY);
+  return Math.max(dx, dy) + 0.5 * Math.min(dx, dy);
 }
 
 function writeWorkingColor(
@@ -298,6 +300,76 @@ function clusterCandidates(candidates: InternalCandidate[], tolerance: number): 
   return clusters;
 }
 
+function getCandidateBiasThreshold(candidate: InternalCandidate): number {
+  if (candidate.source === 'metadata') return 0.35;
+  if (candidate.source === 'hybrid') return 0.5;
+  return 0.75;
+}
+
+function getCandidateStrengthFloor(candidate: InternalCandidate): number {
+  if (candidate.source === 'metadata') return 0.3;
+  if (candidate.source === 'hybrid') return 0.24;
+  return 0.2;
+}
+
+function getCandidateShoulderFloor(candidate: InternalCandidate): number {
+  if (candidate.source === 'metadata') return 0.06;
+  if (candidate.source === 'hybrid') return 0.04;
+  return 0.02;
+}
+
+function resolveRadiusLimit(mode: SeamPostprocessMode, width: number, height: number): number {
+  const shortEdge = Math.max(1, Math.min(width, height));
+  const modeLimit = mode === 'highQuality' ? 224 : mode === 'standard' ? 192 : 144;
+  return clampNumber(Math.round(shortEdge * 0.16), 96, modeLimit);
+}
+
+function computeCoreRadius(
+  candidate: InternalCandidate,
+  options: SeamPostprocessOptions,
+  width: number,
+  height: number,
+): number {
+  const sourceBoost = candidate.source === 'metadata' ? 1.25 : candidate.source === 'hybrid' ? 1.12 : 1;
+  const scaleBoost = 1 + options.bandScale * (0.75 + candidate.confidence * 0.5);
+  const rawRadius = Math.max(candidate.nominalWidth, options.bandBaseWidth) * scaleBoost * sourceBoost;
+  return clampNumber(Math.round(rawRadius), 8, resolveRadiusLimit(options.mode, width, height));
+}
+
+function computeBandRadius(
+  coreRadius: number,
+  candidate: InternalCandidate,
+  options: SeamPostprocessOptions,
+  width: number,
+  height: number,
+): number {
+  const shoulderBoost = candidate.source === 'metadata' ? 1.35 : candidate.source === 'hybrid' ? 1.22 : 1.12;
+  return clampNumber(
+    Math.round(coreRadius * shoulderBoost),
+    coreRadius,
+    resolveRadiusLimit(options.mode, width, height),
+  );
+}
+
+function computeCorrectionStrength(candidate: InternalCandidate, consistency: number): number {
+  return clampNumber(
+    Math.max(getCandidateStrengthFloor(candidate), candidate.confidence * consistency),
+    0.2,
+    1,
+  );
+}
+
+function computeEdgeGateTau(candidate: InternalCandidate, options: SeamPostprocessOptions): number {
+  const sourceBoost = candidate.source === 'metadata' ? 1.08 : candidate.source === 'hybrid' ? 1.04 : 1;
+  return clampNumber(options.edgeGateStrength * sourceBoost, 4, 128);
+}
+
+function computeSeamBlend(distance: number, coreRadius: number, bandRadius: number, candidate: InternalCandidate): number {
+  const local = 1 - smoothstep01(distance / Math.max(1, coreRadius));
+  const shoulder = getCandidateShoulderFloor(candidate) * (1 - smoothstep01(distance / Math.max(coreRadius + 1, bandRadius)));
+  return clampNumber(Math.max(local, shoulder), 0, 1);
+}
+
 export function buildSeamMetadataFromBounds(
   bounds: SeamFootprintBounds[],
   width: number,
@@ -335,7 +407,7 @@ export function buildSeamMetadataFromBounds(
         rawCandidates.push({
           orientation: 'vertical',
           position: Math.max(a.left, b.left) + overlapX * 0.5,
-          nominalWidth: clampNumber(Math.max(nominalWidth, overlapX * 0.5), nominalWidth * 0.75, 64),
+          nominalWidth: clampNumber(Math.max(nominalWidth, overlapX * 0.7), nominalWidth * 0.9, 192),
           confidence: clampNumber(pairConfidence * (0.35 + overlapYRatio * 0.65), 0.15, 1),
           source: 'metadata',
           score: clampNumber(0.3 + overlapYRatio * 0.7, 0.3, 1),
@@ -346,7 +418,7 @@ export function buildSeamMetadataFromBounds(
         rawCandidates.push({
           orientation: 'horizontal',
           position: Math.max(a.top, b.top) + overlapY * 0.5,
-          nominalWidth: clampNumber(Math.max(nominalWidth, overlapY * 0.5), nominalWidth * 0.75, 64),
+          nominalWidth: clampNumber(Math.max(nominalWidth, overlapY * 0.7), nominalWidth * 0.9, 192),
           confidence: clampNumber(pairConfidence * (0.35 + overlapXRatio * 0.65), 0.15, 1),
           source: 'metadata',
           score: clampNumber(0.3 + overlapXRatio * 0.7, 0.3, 1),
@@ -791,7 +863,7 @@ function buildVerticalBiasField(
   const rawCb = new Float32Array(sampleCount);
   const rawCr = new Float32Array(sampleCount);
   const weights = new Float32Array(sampleCount);
-  const innerMargin = clampNumber(Math.round(radius * 0.25), 1, Math.max(2, radius - 2));
+  const innerMargin = clampNumber(Math.round(radius * 0.18), 1, Math.max(2, radius - 2));
 
   for (let i = 0; i < sampleCount; i++) {
     const y = Math.min(height - 1, i * config.sampleStride);
@@ -816,7 +888,7 @@ function buildVerticalBiasField(
   const smoothCb = smoothWeighted(rawCb, weights, config.smoothingRadius);
   const smoothCr = smoothWeighted(rawCr, weights, config.smoothingRadius);
   const stats = summariseConsistency(smoothY, weights);
-  if (stats.meanAbs < 0.75) return null;
+  if (stats.meanAbs < getCandidateBiasThreshold(candidate)) return null;
   const consistency = clampNumber(1 - stats.std / Math.max(2, stats.meanAbs * 2), 0.25, 1);
   const denseY = resampleToDense(height, config.sampleStride, smoothY);
   const denseCb = resampleToDense(height, config.sampleStride, smoothCb);
@@ -845,7 +917,7 @@ function buildHorizontalBiasField(
   const rawCb = new Float32Array(sampleCount);
   const rawCr = new Float32Array(sampleCount);
   const weights = new Float32Array(sampleCount);
-  const innerMargin = clampNumber(Math.round(radius * 0.25), 1, Math.max(2, radius - 2));
+  const innerMargin = clampNumber(Math.round(radius * 0.18), 1, Math.max(2, radius - 2));
 
   for (let i = 0; i < sampleCount; i++) {
     const x = Math.min(width - 1, i * config.sampleStride);
@@ -870,7 +942,7 @@ function buildHorizontalBiasField(
   const smoothCb = smoothWeighted(rawCb, weights, config.smoothingRadius);
   const smoothCr = smoothWeighted(rawCr, weights, config.smoothingRadius);
   const stats = summariseConsistency(smoothY, weights);
-  if (stats.meanAbs < 0.75) return null;
+  if (stats.meanAbs < getCandidateBiasThreshold(candidate)) return null;
   const consistency = clampNumber(1 - stats.std / Math.max(2, stats.meanAbs * 2), 0.25, 1);
   const denseY = resampleToDense(width, config.sampleStride, smoothY);
   const denseCb = resampleToDense(width, config.sampleStride, smoothCb);
@@ -894,19 +966,16 @@ function applyVerticalCorrection(
   options: SeamPostprocessOptions,
   config: ProfileConfig,
 ): AppliedSeamCorrection | null {
-  const radius = clampNumber(
-    Math.round(Math.max(candidate.nominalWidth, options.bandBaseWidth) * (1 + options.bandScale * candidate.confidence)),
-    8,
-    128,
-  );
-  const bias = buildVerticalBiasField(data, width, height, candidate, radius, config);
+  const coreRadius = computeCoreRadius(candidate, options, width, height);
+  const bandRadius = computeBandRadius(coreRadius, candidate, options, width, height);
+  const bias = buildVerticalBiasField(data, width, height, candidate, coreRadius, config);
   if (!bias) return null;
-  const strength = clampNumber(candidate.confidence * bias.consistency, 0.2, 1);
+  const strength = computeCorrectionStrength(candidate, bias.consistency);
   const maxClamp = clampNumber(options.maxCorrectionClamp, 1, 48);
-  const edgeTau = clampNumber(options.edgeGateStrength, 4, 96);
+  const edgeTau = computeEdgeGateTau(candidate, options);
   const chromaWeight = clampNumber(options.chromaCorrectionWeight, 0, 1);
-  const startX = Math.max(0, Math.floor(candidate.position - radius));
-  const endX = Math.min(width - 1, Math.ceil(candidate.position + radius));
+  const startX = Math.max(0, Math.floor(candidate.position - bandRadius));
+  const endX = Math.min(width - 1, Math.ceil(candidate.position + bandRadius));
 
   for (let y = 0; y < height; y++) {
     const rowDeltaY = clampNumber(bias.denseY[y], -maxClamp * 2, maxClamp * 2);
@@ -917,11 +986,11 @@ function applyVerticalCorrection(
       const idx = (y * width + x) * 4;
       if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
       const dist = Math.abs((x + 0.5) - candidate.position);
-      if (dist > radius) continue;
-      const proximity = 1 - smoothstep01(dist / radius);
+      if (dist > bandRadius) continue;
+      const proximity = computeSeamBlend(dist, coreRadius, bandRadius, candidate);
       const side = (x + 0.5) < candidate.position ? 1 : -1;
       const edge = estimateEdgeMagnitude(data, width, height, x, y);
-      const gate = 1 / (1 + (edge / edgeTau) * (edge / edgeTau));
+      const gate = 1 / (1 + Math.pow(edge / edgeTau, 4));
       const blend = strength * proximity * gate;
       if (blend <= 0.02) continue;
       const r = data[idx];
@@ -930,9 +999,9 @@ function applyVerticalCorrection(
       const lum = computeY(r, g, b);
       const cb = computeCb(lum, b);
       const cr = computeCr(lum, r);
-      const nextY = lum + clampNumber(side * 0.5 * rowDeltaY * blend, -maxClamp, maxClamp);
-      const nextCb = cb + clampNumber(side * 0.5 * rowDeltaCb * blend, -maxClamp, maxClamp);
-      const nextCr = cr + clampNumber(side * 0.5 * rowDeltaCr * blend, -maxClamp, maxClamp);
+      const nextY = lum + clampNumber(side * 0.56 * rowDeltaY * blend, -maxClamp, maxClamp);
+      const nextCb = cb + clampNumber(side * 0.56 * rowDeltaCb * blend, -maxClamp, maxClamp);
+      const nextCr = cr + clampNumber(side * 0.56 * rowDeltaCr * blend, -maxClamp, maxClamp);
       writeWorkingColor(data, idx, nextY, nextCb, nextCr);
     }
   }
@@ -941,7 +1010,7 @@ function applyVerticalCorrection(
     orientation: 'vertical',
     position: candidate.position,
     nominalWidth: candidate.nominalWidth,
-    radius,
+    radius: bandRadius,
     confidence: candidate.confidence,
     source: candidate.source,
     meanDeltaY: bias.meanDeltaY,
@@ -959,19 +1028,16 @@ function applyHorizontalCorrection(
   options: SeamPostprocessOptions,
   config: ProfileConfig,
 ): AppliedSeamCorrection | null {
-  const radius = clampNumber(
-    Math.round(Math.max(candidate.nominalWidth, options.bandBaseWidth) * (1 + options.bandScale * candidate.confidence)),
-    8,
-    128,
-  );
-  const bias = buildHorizontalBiasField(data, width, height, candidate, radius, config);
+  const coreRadius = computeCoreRadius(candidate, options, width, height);
+  const bandRadius = computeBandRadius(coreRadius, candidate, options, width, height);
+  const bias = buildHorizontalBiasField(data, width, height, candidate, coreRadius, config);
   if (!bias) return null;
-  const strength = clampNumber(candidate.confidence * bias.consistency, 0.2, 1);
+  const strength = computeCorrectionStrength(candidate, bias.consistency);
   const maxClamp = clampNumber(options.maxCorrectionClamp, 1, 48);
-  const edgeTau = clampNumber(options.edgeGateStrength, 4, 96);
+  const edgeTau = computeEdgeGateTau(candidate, options);
   const chromaWeight = clampNumber(options.chromaCorrectionWeight, 0, 1);
-  const startY = Math.max(0, Math.floor(candidate.position - radius));
-  const endY = Math.min(height - 1, Math.ceil(candidate.position + radius));
+  const startY = Math.max(0, Math.floor(candidate.position - bandRadius));
+  const endY = Math.min(height - 1, Math.ceil(candidate.position + bandRadius));
 
   for (let x = 0; x < width; x++) {
     const colDeltaY = clampNumber(bias.denseY[x], -maxClamp * 2, maxClamp * 2);
@@ -982,11 +1048,11 @@ function applyHorizontalCorrection(
       const idx = (y * width + x) * 4;
       if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
       const dist = Math.abs((y + 0.5) - candidate.position);
-      if (dist > radius) continue;
-      const proximity = 1 - smoothstep01(dist / radius);
+      if (dist > bandRadius) continue;
+      const proximity = computeSeamBlend(dist, coreRadius, bandRadius, candidate);
       const side = (y + 0.5) < candidate.position ? 1 : -1;
       const edge = estimateEdgeMagnitude(data, width, height, x, y);
-      const gate = 1 / (1 + (edge / edgeTau) * (edge / edgeTau));
+      const gate = 1 / (1 + Math.pow(edge / edgeTau, 4));
       const blend = strength * proximity * gate;
       if (blend <= 0.02) continue;
       const r = data[idx];
@@ -995,9 +1061,9 @@ function applyHorizontalCorrection(
       const lum = computeY(r, g, b);
       const cb = computeCb(lum, b);
       const cr = computeCr(lum, r);
-      const nextY = lum + clampNumber(side * 0.5 * colDeltaY * blend, -maxClamp, maxClamp);
-      const nextCb = cb + clampNumber(side * 0.5 * colDeltaCb * blend, -maxClamp, maxClamp);
-      const nextCr = cr + clampNumber(side * 0.5 * colDeltaCr * blend, -maxClamp, maxClamp);
+      const nextY = lum + clampNumber(side * 0.56 * colDeltaY * blend, -maxClamp, maxClamp);
+      const nextCb = cb + clampNumber(side * 0.56 * colDeltaCb * blend, -maxClamp, maxClamp);
+      const nextCr = cr + clampNumber(side * 0.56 * colDeltaCr * blend, -maxClamp, maxClamp);
       writeWorkingColor(data, idx, nextY, nextCb, nextCr);
     }
   }
@@ -1006,7 +1072,7 @@ function applyHorizontalCorrection(
     orientation: 'horizontal',
     position: candidate.position,
     nominalWidth: candidate.nominalWidth,
-    radius,
+    radius: bandRadius,
     confidence: candidate.confidence,
     source: candidate.source,
     meanDeltaY: bias.meanDeltaY,
@@ -1063,17 +1129,27 @@ export function applySeamPostprocess(
     : { image: out, seams };
 }
 
-function measureSeamContrast(data: Uint8ClampedArray, width: number, height: number, seamX: number): number {
-  const leftStart = Math.max(0, seamX - 8);
-  const leftEnd = Math.max(leftStart + 1, seamX - 2);
-  const rightStart = Math.min(width - 1, seamX + 2);
-  const rightEnd = Math.min(width, seamX + 9);
+function measureSeamContrastWindow(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  seamX: number,
+  innerOffset: number,
+  outerOffset: number,
+  excludeYMin = -1,
+  excludeYMax = -1,
+): number {
+  const leftStart = Math.max(0, seamX - outerOffset);
+  const leftEnd = Math.max(leftStart + 1, seamX - innerOffset);
+  const rightStart = Math.min(width - 1, seamX + innerOffset);
+  const rightEnd = Math.min(width, seamX + outerOffset + 1);
   let leftSum = 0;
   let leftCount = 0;
   let rightSum = 0;
   let rightCount = 0;
 
   for (let y = 0; y < height; y++) {
+    if (excludeYMin >= 0 && excludeYMax >= excludeYMin && y >= excludeYMin && y <= excludeYMax) continue;
     for (let x = leftStart; x < leftEnd; x++) {
       const idx = (y * width + x) * 4;
       if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
@@ -1092,38 +1168,37 @@ function measureSeamContrast(data: Uint8ClampedArray, width: number, height: num
   return Math.abs(rightSum / rightCount - leftSum / leftCount);
 }
 
+function measureSeamContrast(data: Uint8ClampedArray, width: number, height: number, seamX: number): number {
+  return measureSeamContrastWindow(data, width, height, seamX, 2, 8);
+}
+
 function measureCrossingEdge(data: Uint8ClampedArray, width: number, height: number, sampleX: number, edgeY: number): number {
-  const y0 = clampNumber(edgeY - 2, 0, height - 1);
-  const y1 = clampNumber(edgeY + 2, 0, height - 1);
-  const x0 = clampNumber(sampleX - 2, 0, width - 1);
-  const x1 = clampNumber(sampleX + 2, 0, width - 1);
-  let topSum = 0;
-  let topCount = 0;
-  let bottomSum = 0;
-  let bottomCount = 0;
+  const x0 = clampNumber(sampleX - 3, 0, width - 1);
+  const x1 = clampNumber(sampleX + 3, 0, width - 1);
+  let totalPeakGradient = 0;
+  let samples = 0;
 
   for (let x = x0; x <= x1; x++) {
-    for (let y = y0 - 2; y <= y0; y++) {
-      const yy = clampNumber(y, 0, height - 1);
-      const idx = (yy * width + x) * 4;
-      topSum += computeY(data[idx], data[idx + 1], data[idx + 2]);
-      topCount++;
+    let peakGradient = 0;
+    for (let y = Math.max(1, edgeY - 5); y <= Math.min(height - 2, edgeY + 5); y++) {
+      const upIdx = ((y - 1) * width + x) * 4;
+      const downIdx = ((y + 1) * width + x) * 4;
+      const upY = computeY(data[upIdx], data[upIdx + 1], data[upIdx + 2]);
+      const downY = computeY(data[downIdx], data[downIdx + 1], data[downIdx + 2]);
+      peakGradient = Math.max(peakGradient, Math.abs(downY - upY));
     }
-    for (let y = y1; y <= y1 + 2; y++) {
-      const yy = clampNumber(y, 0, height - 1);
-      const idx = (yy * width + x) * 4;
-      bottomSum += computeY(data[idx], data[idx + 1], data[idx + 2]);
-      bottomCount++;
-    }
+    totalPeakGradient += peakGradient;
+    samples++;
   }
 
-  if (topCount === 0 || bottomCount === 0) return 0;
-  return Math.abs(bottomSum / bottomCount - topSum / topCount);
+  return samples > 0 ? totalPeakGradient / samples : 0;
 }
 
 export function runSeamPostprocessSyntheticSelfTest(): {
   beforeStep: number;
   afterStep: number;
+  wideBefore: number;
+  wideAfter: number;
   edgeBefore: number;
   edgeAfter: number;
   edgeRetention: number;
@@ -1152,32 +1227,36 @@ export function runSeamPostprocessSyntheticSelfTest(): {
   }
 
   const beforeStep = measureSeamContrast(image, width, height, seamX);
+  const wideBefore = measureSeamContrastWindow(image, width, height, seamX, 24, 56, edgeY - 8, edgeY + 8);
   const edgeBefore = measureCrossingEdge(image, width, height, seamX, edgeY);
   const result = applySeamPostprocess(image, width, height, {
     enabled: true,
     mode: 'standard',
-    bandBaseWidth: 14,
-    bandScale: 1.2,
-    chromaCorrectionWeight: 0.45,
-    edgeGateStrength: 18,
-    maxCorrectionClamp: 18,
+    bandBaseWidth: 18,
+    bandScale: 1.45,
+    chromaCorrectionWeight: 0.55,
+    edgeGateStrength: 22,
+    maxCorrectionClamp: 24,
     autoDetect: true,
     metadata: {
       seams: [{
         orientation: 'vertical',
         position: seamX,
-        nominalWidth: 14,
+        nominalWidth: 24,
         confidence: 1,
         source: 'metadata',
       }],
     },
   });
   const afterStep = measureSeamContrast(result.image, width, height, seamX);
+  const wideAfter = measureSeamContrastWindow(result.image, width, height, seamX, 24, 56, edgeY - 8, edgeY + 8);
   const edgeAfter = measureCrossingEdge(result.image, width, height, seamX, edgeY);
 
   return {
     beforeStep,
     afterStep,
+    wideBefore,
+    wideAfter,
     edgeBefore,
     edgeAfter,
     edgeRetention: edgeBefore > 0 ? edgeAfter / edgeBefore : 1,

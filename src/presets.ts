@@ -87,11 +87,11 @@ const DESKTOP_HQ: PipelineSettings = {
   sameCameraSettings: true,
   seamFinalPassEnabled: true,
   seamFinalPassMode: 'highQuality',
-  seamFinalPassBaseWidth: 14,
-  seamFinalPassScale: 1.2,
-  seamFinalPassChromaWeight: 0.45,
-  seamFinalPassEdgeGate: 18,
-  seamFinalPassMaxCorrection: 18,
+  seamFinalPassBaseWidth: 18,
+  seamFinalPassScale: 1.45,
+  seamFinalPassChromaWeight: 0.55,
+  seamFinalPassEdgeGate: 24,
+  seamFinalPassMaxCorrection: 24,
 };
 
 const MOBILE_QUALITY: PipelineSettings = {
@@ -127,11 +127,11 @@ const MOBILE_QUALITY: PipelineSettings = {
   sameCameraSettings: true,
   seamFinalPassEnabled: true,
   seamFinalPassMode: 'standard',
-  seamFinalPassBaseWidth: 12,
-  seamFinalPassScale: 1.15,
-  seamFinalPassChromaWeight: 0.40,
-  seamFinalPassEdgeGate: 18,
-  seamFinalPassMaxCorrection: 16,
+  seamFinalPassBaseWidth: 16,
+  seamFinalPassScale: 1.35,
+  seamFinalPassChromaWeight: 0.5,
+  seamFinalPassEdgeGate: 22,
+  seamFinalPassMaxCorrection: 22,
 };
 
 const MOBILE_SAFE: PipelineSettings = {
@@ -167,11 +167,11 @@ const MOBILE_SAFE: PipelineSettings = {
   sameCameraSettings: true,
   seamFinalPassEnabled: true,
   seamFinalPassMode: 'fast',
-  seamFinalPassBaseWidth: 10,
-  seamFinalPassScale: 1.0,
-  seamFinalPassChromaWeight: 0.35,
-  seamFinalPassEdgeGate: 20,
-  seamFinalPassMaxCorrection: 12,
+  seamFinalPassBaseWidth: 12,
+  seamFinalPassScale: 1.15,
+  seamFinalPassChromaWeight: 0.42,
+  seamFinalPassEdgeGate: 22,
+  seamFinalPassMaxCorrection: 14,
 };
 
 const MOBILE_LITE: PipelineSettings = {
@@ -207,11 +207,11 @@ const MOBILE_LITE: PipelineSettings = {
   sameCameraSettings: true,
   seamFinalPassEnabled: true,
   seamFinalPassMode: 'fast',
-  seamFinalPassBaseWidth: 10,
-  seamFinalPassScale: 0.9,
-  seamFinalPassChromaWeight: 0.30,
-  seamFinalPassEdgeGate: 22,
-  seamFinalPassMaxCorrection: 10,
+  seamFinalPassBaseWidth: 12,
+  seamFinalPassScale: 1.0,
+  seamFinalPassChromaWeight: 0.36,
+  seamFinalPassEdgeGate: 24,
+  seamFinalPassMaxCorrection: 12,
 };
 
 const ALIGNMENT_ONLY: PipelineSettings = {
@@ -247,11 +247,11 @@ const ALIGNMENT_ONLY: PipelineSettings = {
   sameCameraSettings: true,
   seamFinalPassEnabled: true,
   seamFinalPassMode: 'standard',
-  seamFinalPassBaseWidth: 14,
-  seamFinalPassScale: 1.15,
-  seamFinalPassChromaWeight: 0.40,
-  seamFinalPassEdgeGate: 18,
-  seamFinalPassMaxCorrection: 18,
+  seamFinalPassBaseWidth: 16,
+  seamFinalPassScale: 1.35,
+  seamFinalPassChromaWeight: 0.5,
+  seamFinalPassEdgeGate: 22,
+  seamFinalPassMaxCorrection: 22,
 };
 
 export const PRESETS: Record<string, PipelineSettings> = {

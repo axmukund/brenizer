@@ -471,6 +471,7 @@ async function runSeamPostprocessSelfTest(page, scenarioLabel) {
 
   console.log(
     `[${scenarioLabel}] seam-post self-test before=${probe.beforeStep.toFixed(2)} after=${probe.afterStep.toFixed(2)} ` +
+    `wideBefore=${probe.wideBefore.toFixed(2)} wideAfter=${probe.wideAfter.toFixed(2)} ` +
     `edgeBefore=${probe.edgeBefore.toFixed(2)} edgeAfter=${probe.edgeAfter.toFixed(2)} retention=${probe.edgeRetention.toFixed(3)} ` +
     `seams=${probe.seamCount}`,
   );
@@ -478,6 +479,11 @@ async function runSeamPostprocessSelfTest(page, scenarioLabel) {
   if (!(probe.afterStep < probe.beforeStep * 0.55)) {
     throw new Error(
       `Seam post-process self-test failed to reduce seam step enough: before=${probe.beforeStep}, after=${probe.afterStep}`,
+    );
+  }
+  if (!(probe.wideAfter < probe.wideBefore * 0.72)) {
+    throw new Error(
+      `Seam post-process self-test failed to reduce wide seam band enough: before=${probe.wideBefore}, after=${probe.wideAfter}`,
     );
   }
   if (!(probe.edgeRetention > 0.72)) {
