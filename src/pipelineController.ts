@@ -193,6 +193,7 @@ interface PhotometricSettingsDecision {
   sharedExposureSettings: boolean;
   pooledVignetteModel: boolean;
   lockColorBalance: boolean;
+  minimalAdjustment: boolean;
   source: 'settings' | 'exif' | 'settings+exif' | 'exif-mismatch' | 'unknown';
   summary: string;
 }
@@ -288,35 +289,32 @@ function resolvePhotometricSettings(active: ImageEntry[], manualSameCameraSettin
   ).length;
   const captureExifSupportsShared = consistentCaptureCount >= 2 && captureMismatch.length === 0;
 
-  const sharedExposureSettings = captureMismatch.length > 0
-    ? false
-    : (manualSameCameraSettings || captureExifSupportsShared);
-  const pooledVignetteModel = sharedExposureSettings && (!focal.observed || focal.consistent);
-  const lockColorBalance = sharedExposureSettings
-    && (
-      manualSameCameraSettings
-      || (whiteBalance.observed && whiteBalance.consistent)
-      || [aperture, exposure, iso].filter(
-        (check) => check.observed && check.consistent && check.observedCount >= requiredExifCoverage,
-      ).length >= 2
-    );
+  const sharedExposureSettings = manualSameCameraSettings;
+  const pooledVignetteModel = manualSameCameraSettings && (!focal.observed || focal.consistent);
+  const lockColorBalance = manualSameCameraSettings;
+  const minimalAdjustment = manualSameCameraSettings;
 
   let source: PhotometricSettingsDecision['source'] = 'unknown';
-  if (captureMismatch.length > 0) source = 'exif-mismatch';
+  if (manualSameCameraSettings && captureMismatch.length > 0) source = 'exif-mismatch';
   else if (manualSameCameraSettings && captureExifSupportsShared) source = 'settings+exif';
   else if (manualSameCameraSettings) source = 'settings';
-  else if (captureExifSupportsShared) source = 'exif';
+  else source = 'settings';
 
   const summaryParts: string[] = [];
   summaryParts.push(sharedExposureSettings ? 'shared exposure settings' : 'per-image exposure settings');
   summaryParts.push(pooledVignetteModel ? 'pooled vignette model' : 'per-image vignette model');
   summaryParts.push(lockColorBalance ? 'locked color balance' : 'free RGB balance');
-  if (captureMismatch.length > 0) {
-    summaryParts.push(`EXIF mismatch: ${captureMismatch.join(', ')}`);
-  } else if (!captureExifSupportsShared) {
-    summaryParts.push(`EXIF incomplete for photometric lock (need ${requiredExifCoverage}+ images per field)`);
-  } else {
-    summaryParts.push(`EXIF confirmed ${consistentCaptureCount} capture fields`);
+  if (minimalAdjustment) summaryParts.push('minimal photometric adjustments');
+  if (manualSameCameraSettings) {
+    if (captureMismatch.length > 0) {
+      summaryParts.push(`EXIF mismatch: ${captureMismatch.join(', ')}`);
+    } else if (!captureExifSupportsShared) {
+      summaryParts.push(`EXIF incomplete for photometric lock (need ${requiredExifCoverage}+ images per field)`);
+    } else {
+      summaryParts.push(`EXIF confirmed ${consistentCaptureCount} capture fields`);
+    }
+  } else if (captureExifSupportsShared) {
+    summaryParts.push('EXIF suggests shared capture settings, but mixed-mode workflow was selected');
   }
   if (focal.observed && !focal.consistent) {
     summaryParts.push('focal length differs, vignette pooling disabled');
@@ -326,6 +324,7 @@ function resolvePhotometricSettings(active: ImageEntry[], manualSameCameraSettin
     sharedExposureSettings,
     pooledVignetteModel,
     lockColorBalance,
+    minimalAdjustment,
     source,
     summary: summaryParts.join(' | '),
   };
@@ -1619,7 +1618,11 @@ export async function runStitchPreview(): Promise<void> {
       }
     });
 
-    workerManager!.sendCV({ type: 'computeVignetting', pooled: photometricSettings.pooledVignetteModel });
+    workerManager!.sendCV({
+      type: 'computeVignetting',
+      pooled: photometricSettings.pooledVignetteModel,
+      minimalAdjustment: photometricSettings.minimalAdjustment,
+    });
 
     // Wait for vignetting progress complete
     await new Promise<void>((resolve, reject) => {
@@ -2004,6 +2007,7 @@ export async function runStitchPreview(): Promise<void> {
       type: 'computeExposure',
       sameCameraSettings: photometricSettings.sharedExposureSettings,
       lockColorBalance: photometricSettings.lockColorBalance,
+      minimalAdjustment: photometricSettings.minimalAdjustment,
     });
 
     const exposureMsg = await exposurePromise;

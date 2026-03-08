@@ -38,16 +38,15 @@ void main() {
   vec4 c = texture(u_texture, v_uv);
 
   // ── Vignetting correction ──────────────────────
-  // Undo radial darkening: divide by V(r) where r = distance from center.
-  // V(r) = 1 + a*r² + b*r⁴ + c*r⁶ estimated per-image.
+  // Undo radial darkening by lifting corners toward the centre brightness.
+  // The fitted coefficients represent a positive corner-lift model.
   vec2 centered = v_uv - 0.5;
   float r2 = dot(centered, centered) * 4.0; // normalised r² ∈ [0, ~1]
   float r4 = r2 * r2;
   float r6 = r4 * r2;
   float vignette = 1.0 + u_vigA * r2 + u_vigB * r4 + u_vigC * r6;
-  // Prevent division by near-zero
   vignette = max(vignette, 0.1);
-  c.rgb /= vignette;
+  c.rgb *= vignette;
 
   // ── Per-channel exposure gain ──────────────────
   c.rgb *= u_gainRGB;

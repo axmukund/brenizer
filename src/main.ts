@@ -23,7 +23,7 @@
 import { detectCapabilities, type Capabilities } from './capabilities';
 import { resolveMode, getPreset } from './presets';
 import { setState, getState, subscribe } from './appState';
-import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel } from './ui';
+import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel, promptOptimizeCameraSettingsChoice } from './ui';
 import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
   createPyramidBlender,
@@ -357,6 +357,62 @@ async function waitForSeamSolveAdaptive(
 /** Sanitize a gain value: replace NaN/Infinity/non-positive with 1.0. */
 function safeGainVal(v: number): number {
   return Number.isFinite(v) && v > 0 ? v : 1.0;
+}
+
+function clampGainTowardUnity(value: number, mix = 1, minGain = 0.05, maxGain = 20): number {
+  const safe = Math.max(minGain, Math.min(maxGain, safeGainVal(value)));
+  const mixed = Math.exp(Math.log(safe) * mix);
+  return Math.max(minGain, Math.min(maxGain, mixed));
+}
+
+function resolveAppliedPhotometricAdjustment(
+  sameCameraSettings: boolean,
+  gainObj: { gain?: number; gainR?: number; gainG?: number; gainB?: number } | undefined,
+  vignetteParams: { a?: number; b?: number; c?: number } | undefined,
+): {
+  gain: [number, number, number];
+  vignette: { a: number; b: number; c: number };
+  toneMap: boolean;
+} {
+  const rawGain: [number, number, number] = gainObj
+    ? [safeGainVal(gainObj.gainR ?? gainObj.gain ?? 1), safeGainVal(gainObj.gainG ?? gainObj.gain ?? 1), safeGainVal(gainObj.gainB ?? gainObj.gain ?? 1)]
+    : [1, 1, 1];
+  const rawVignette = {
+    a: Number.isFinite(vignetteParams?.a) ? vignetteParams!.a! : 0,
+    b: Number.isFinite(vignetteParams?.b) ? vignetteParams!.b! : 0,
+    c: Number.isFinite(vignetteParams?.c) ? vignetteParams!.c! : 0,
+  };
+
+  if (!sameCameraSettings) {
+    return {
+      gain: rawGain,
+      vignette: rawVignette,
+      toneMap: rawGain.some((g) => g > 2.0 || g < 0.5),
+    };
+  }
+
+  const avgLogGain = (Math.log(rawGain[0]) + Math.log(rawGain[1]) + Math.log(rawGain[2])) / 3;
+  const scalarGain = clampGainTowardUnity(Math.exp(avgLogGain), 0.35, 0.97, 1.03);
+  let scaledVignette = {
+    a: rawVignette.a * 0.35,
+    b: rawVignette.b * 0.35,
+    c: rawVignette.c * 0.35,
+  };
+  const cornerBoost = 1 + scaledVignette.a * 2 + scaledVignette.b * 4 + scaledVignette.c * 8;
+  const maxCornerBoost = 1.05;
+  if (cornerBoost > maxCornerBoost) {
+    const scale = (maxCornerBoost - 1) / Math.max(1e-6, cornerBoost - 1);
+    scaledVignette = {
+      a: scaledVignette.a * scale,
+      b: scaledVignette.b * scale,
+      c: scaledVignette.c * scale,
+    };
+  }
+  return {
+    gain: [scalarGain, scalarGain, scalarGain],
+    vignette: scaledVignette,
+    toneMap: false,
+  };
 }
 
 function getResolvedSeamTier(): SeamAccelerationTier {
@@ -970,7 +1026,7 @@ async function buildAndSolveSeam(opts: BuildAndSolveSeamOptions): Promise<Resolv
   let totalGraphMs = graph.buildMs;
   let totalReadbackBytes = graph.readbackBytes;
 
-  if (graph.colorTransferStats.apply) {
+  if (!opts.sameCameraSettings && graph.colorTransferStats.apply) {
     correctedTex = seamAccelerator.applyColorTransfer(opts.newImageTex, opts.width, opts.height, graph.colorTransferStats);
     blendTex = correctedTex.texture;
     const correctedGraph = await tryBuildWebGPUCompactGraph(opts, tier, graph.colorTransferStats)
@@ -1284,7 +1340,18 @@ export async function boot(): Promise<void> {
   });
 
   // Wire first-pass optimization button
-  document.getElementById('btn-optimize')!.addEventListener('click', () => {
+  document.getElementById('btn-optimize')!.addEventListener('click', async () => {
+    const { settings } = getState();
+    if (!settings) return;
+    const sameCameraSettings = await promptOptimizeCameraSettingsChoice(!!settings.sameCameraSettings);
+    const nextSettings = { ...settings, sameCameraSettings };
+    setState({ settings: nextSettings });
+    buildSettingsPanel();
+    setStatus(
+      sameCameraSettings
+        ? 'Optimization configured for locked aperture / ISO / white balance.'
+        : 'Optimization configured for mixed or varying camera settings.',
+    );
     runFirstPassOptimization()
       .then(() => buildSettingsPanel())
       .catch(err => {
@@ -1975,10 +2042,9 @@ async function renderWarpedPreview(
     const alignW = Math.round(img.width * sf);
     const alignH = Math.round(img.height * sf);
     const T = t.T;
-    const gainObj = gains.get(imgId);
-    const gain: [number, number, number] = gainObj
-      ? [safeGainVal(gainObj.gainR), safeGainVal(gainObj.gainG), safeGainVal(gainObj.gainB)]
-      : [1.0, 1.0, 1.0];
+    const vigParams = vignettes.get(imgId);
+    const photometric = resolveAppliedPhotometricAdjustment(!!settings?.sameCameraSettings, gains.get(imgId), vigParams);
+    const gain = photometric.gain;
 
     // Build warped mesh with sanity fallback to avoid extreme geometric distortion.
     let mesh: import('./gl').MeshData;
@@ -2060,12 +2126,10 @@ async function renderWarpedPreview(
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.disable(gl.BLEND);
     // Pass vignetting correction coefficients and HDR tone mapping flag
-    const vigParams = vignettes.get(imgId);
-    const vigA = vigParams?.a ?? 0;
-    const vigB = vigParams?.b ?? 0;
-    const vigC = vigParams?.c ?? 0;
-    // Enable Reinhard tone mapping when gain exceeds 2× to handle extreme exposure
-    const needsToneMap = gain.some((g: number) => g > 2.0 || g < 0.5);
+    const vigA = photometric.vignette.a;
+    const vigB = photometric.vignette.b;
+    const vigC = photometric.vignette.c;
+    const needsToneMap = photometric.toneMap;
     warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, vigA, vigB, vigC, needsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();
@@ -2151,10 +2215,10 @@ async function renderWarpedPreview(
             sourceHeight: alignH,
             mesh,
             viewMatrix: compViewMat,
-            gain,
-            vignette: { a: vigA, b: vigB, c: vigC },
-            toneMap: needsToneMap,
-          }
+              gain,
+              vignette: { a: vigA, b: vigB, c: vigC },
+              toneMap: needsToneMap,
+            }
           : null,
         onStatus: ({ percent, remainingMs, info }) => {
           setStatus(`Compositing ${imgIdx + 1}/${mstOrder.length} — seam ${formatSeamEstimate(percent, remainingMs)} (${info})`);
@@ -2250,7 +2314,7 @@ async function renderWarpedPreview(
       }
 
       // Only apply if we have meaningful overlap (>100 sampled pixels)
-      if (nOverlap > 100) {
+      if (!settings?.sameCameraSettings && nOverlap > 100) {
         const gains = [0, 0, 0];
         const offsets = [0, 0, 0];
         let needsTransfer = false;
@@ -3177,10 +3241,9 @@ async function exportComposite(): Promise<void> {
     const alignW = Math.round(img.width * sf);
     const alignH = Math.round(img.height * sf);
     const T = t.T;
-    const gainObj = gains.get(imgId);
-    const gain: [number, number, number] = gainObj
-      ? [safeGainVal(gainObj.gainR), safeGainVal(gainObj.gainG), safeGainVal(gainObj.gainB)]
-      : [1.0, 1.0, 1.0];
+    const expVigParams = getLastVignette().get(imgId);
+    const exportPhotometric = resolveAppliedPhotometricAdjustment(!!settings.sameCameraSettings, gains.get(imgId), expVigParams);
+    const gain = exportPhotometric.gain;
 
     // Build warped mesh with sanity fallback to avoid severe export distortion.
     let mesh: import('./gl').MeshData;
@@ -3249,11 +3312,10 @@ async function exportComposite(): Promise<void> {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.disable(gl.BLEND);
     // Vignetting correction + HDR tone mapping for export
-    const expVigParams = getLastVignette().get(imgId);
-    const expVigA = expVigParams?.a ?? 0;
-    const expVigB = expVigParams?.b ?? 0;
-    const expVigC = expVigParams?.c ?? 0;
-    const expNeedsToneMap = gain.some((g: number) => g > 2.0 || g < 0.5);
+    const expVigA = exportPhotometric.vignette.a;
+    const expVigB = exportPhotometric.vignette.b;
+    const expVigC = exportPhotometric.vignette.c;
+    const expNeedsToneMap = exportPhotometric.toneMap;
     warpRenderer.drawMesh(imgTex.texture, mesh, compViewMat, gain, 1.0, expVigA, expVigB, expVigC, expNeedsToneMap);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     imgTex.dispose();

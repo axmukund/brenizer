@@ -444,6 +444,7 @@ self.addEventListener('message', async (ev) => {
     if (msg.type === 'computeVignetting') {
       const ids = Object.keys(images);
       const pooled = msg.pooled || false; // If true, estimate single model for all images
+      const minimalAdjustment = !!msg.minimalAdjustment;
       const nBins = 10;
       const step = 8;
 
@@ -539,6 +540,27 @@ self.addEventListener('message', async (ev) => {
         };
       }
 
+      function clampVignetteForLockedCapture(params) {
+        if (!minimalAdjustment) return params;
+        const MAX_CORNER_BOOST = 1.06;
+        const cornerBoost = 1 + params.a * 2 + params.b * 4 + params.c * 8;
+        const scaled = {
+          a: params.a * 0.25,
+          b: params.b * 0.25,
+          c: params.c * 0.25,
+        };
+        const scaledCornerBoost = 1 + scaled.a * 2 + scaled.b * 4 + scaled.c * 8;
+        if (scaledCornerBoost <= MAX_CORNER_BOOST) return scaled;
+        const extra = Math.max(1e-6, scaledCornerBoost - 1);
+        const maxExtra = MAX_CORNER_BOOST - 1;
+        const s = clampScalar(maxExtra / extra, 0, 1);
+        return {
+          a: scaled.a * s,
+          b: scaled.b * s,
+          c: scaled.c * s,
+        };
+      }
+
       if (pooled && ids.length >= 2) {
         // ── Pooled vignetting estimation ─────────────────────────
         // Estimate per-image normalized radial falloff first, then pool those
@@ -566,7 +588,7 @@ self.addEventListener('message', async (ev) => {
           prev = robustTargets[i];
         }
 
-        const { a, b, c } = solveVignetteFromTargets(robustTargets);
+        const { a, b, c } = clampVignetteForLockedCapture(solveVignetteFromTargets(robustTargets));
 
         for (const id of ids) {
           images[id].vignetteParams = { a, b, c };
@@ -586,7 +608,7 @@ self.addEventListener('message', async (ev) => {
         const img = images[id];
         const { binMean, binCount } = sampleRadialBinProfile(img.gray, img.width, img.height);
         const targets = radialTargetsFromProfile(binMean, binCount);
-        const { a, b, c } = solveVignetteFromTargets(targets);
+        const { a, b, c } = clampVignetteForLockedCapture(solveVignetteFromTargets(targets));
         img.vignetteParams = { a, b, c };
         postMessage({ type: 'vignetting', imageId: id, vignetteParams: { a, b, c } });
       }
@@ -2160,6 +2182,7 @@ self.addEventListener('message', async (ev) => {
       // leaves color balance unlocked.
       const sameCam = msg.sameCameraSettings || false;
       const lockColorBalance = (msg.lockColorBalance !== undefined) ? !!msg.lockColorBalance : sameCam;
+      const minimalAdjustment = !!msg.minimalAdjustment;
       const ids = Object.keys(images);
       const n = ids.length;
 
@@ -2283,7 +2306,7 @@ self.addEventListener('message', async (ev) => {
           // Regularization toward gain=1. Keep it conservative for locked
           // sequences so we still correct residual vignetting/light loss in
           // overlaps instead of flattening everything back to 1.0.
-          const regWeight = sameCam ? 0.12 : 0.01;
+          const regWeight = sameCam ? (minimalAdjustment ? 0.45 : 0.12) : 0.01;
           for (let i = 0; i < n; i++) AtA[i * n + i] += regWeight;
 
           const logGains = solveLinearN(AtA, Atb, n);
@@ -2349,15 +2372,25 @@ self.addEventListener('message', async (ev) => {
         }
       }
 
+      if (sameCam && minimalAdjustment) {
+        for (const g of gains) {
+          const base = Math.max(0.96, Math.min(1.04, Math.exp(Math.log(Math.max(1e-6, g.gain)) * 0.18)));
+          g.gain = base;
+          g.gainR = base;
+          g.gainG = base;
+          g.gainB = base;
+        }
+      }
+
       // When same-camera, only snap to 1.0 when the residual solution is tiny.
       // A ±5% threshold erases real vignette residuals that are visible in the
       // final mosaic, so keep this threshold tight.
       if (sameCam) {
         const allNear1 = gains.every(g =>
-          Math.abs(g.gain - 1) < 0.015 &&
-          Math.abs(g.gainR - 1) < 0.015 &&
-          Math.abs(g.gainG - 1) < 0.015 &&
-          Math.abs(g.gainB - 1) < 0.015
+          Math.abs(g.gain - 1) < (minimalAdjustment ? 0.008 : 0.015) &&
+          Math.abs(g.gainR - 1) < (minimalAdjustment ? 0.008 : 0.015) &&
+          Math.abs(g.gainG - 1) < (minimalAdjustment ? 0.008 : 0.015) &&
+          Math.abs(g.gainB - 1) < (minimalAdjustment ? 0.008 : 0.015)
         );
         if (allNear1) {
           for (const g of gains) {

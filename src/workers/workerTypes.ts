@@ -97,6 +97,7 @@ export interface CVComputeSaliencyMsg {
 export interface CVComputeVignettingMsg {
   type: 'computeVignetting';
   pooled?: boolean;
+  minimalAdjustment?: boolean;
 }
 
 export interface CVMatchGraphMsg {
@@ -130,6 +131,7 @@ export interface CVComputeExposureMsg {
   type: 'computeExposure';
   sameCameraSettings?: boolean;
   lockColorBalance?: boolean;
+  minimalAdjustment?: boolean;
 }
 
 export interface CVBuildMSTMsg {

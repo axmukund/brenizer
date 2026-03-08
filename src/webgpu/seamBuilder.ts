@@ -55,7 +55,7 @@ fn main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
   let r4 = r2 * r2;
   let r6 = r4 * r2;
   let vig = max(1.0 + u_params.vignette.x * r2 + u_params.vignette.y * r4 + u_params.vignette.z * r6, 0.1);
-  c.rgb = c.rgb / vig;
+  c.rgb = c.rgb * vig;
   c.rgb = c.rgb * u_params.gainTone.xyz;
   if (u_params.gainTone.w > 0.5) {
     let white2 = 4.0;

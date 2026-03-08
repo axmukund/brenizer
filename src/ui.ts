@@ -453,6 +453,18 @@ function setStatus(msg: string): void {
   $('status-chip').textContent = msg.slice(0, 40);
 }
 
+async function promptOptimizeCameraSettingsChoice(currentValue: boolean): Promise<boolean> {
+  if ((navigator as Navigator & { webdriver?: boolean }).webdriver) {
+    return currentValue;
+  }
+  const currentLabel = currentValue ? 'same-camera' : 'mixed-settings';
+  const message =
+    `Choose optimization workflow (${currentLabel} currently selected).\n\n` +
+    'OK = Same aperture / ISO / white balance across all images.\n' +
+    'Cancel = Mixed or varying settings.';
+  return window.confirm(message);
+}
+
 // ── canvas placeholder ──────────────────────────────────
 function updateCanvasPlaceholder(): void {
   const { images } = getState();
@@ -733,4 +745,4 @@ export function initUI(): void {
   buildSettingsPanel();
 }
 
-export { renderCapabilities, setStatus, startProgress, endProgress, updateProgress };
+export { renderCapabilities, setStatus, startProgress, endProgress, updateProgress, promptOptimizeCameraSettingsChoice };
