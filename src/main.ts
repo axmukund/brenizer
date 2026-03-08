@@ -21,7 +21,7 @@
  * a separate exportScale (or full-resolution when maxResExport is enabled).
  */
 import { detectCapabilities, type Capabilities } from './capabilities';
-import { resolveMode, getPreset } from './presets';
+import { resolveMode, getPreset, type PipelineSettings } from './presets';
 import { setState, getState, subscribe } from './appState';
 import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel, promptOptimizeCameraSettingsChoice } from './ui';
 import {
@@ -47,6 +47,12 @@ import {
   type WebGPUSeamBuilder,
   type WebGPUSeamCompositeState,
 } from './webgpu/seamBuilder';
+import {
+  applySeamPostprocess,
+  type AppliedSeamCorrection,
+  type SeamFootprintBounds,
+  type SeamPostprocessMetadata,
+} from './seamPostprocess';
 
 let glCtx: GLContext | null = null;
 let warpRenderer: WarpRenderer | null = null;
@@ -99,6 +105,10 @@ declare global {
   interface Window {
     __brenizerPerf?: {
       seamJobs: SeamJobMetrics[];
+      seamPost?: {
+        preview?: AppliedSeamCorrection[];
+        export?: AppliedSeamCorrection[];
+      };
     };
     __brenizerRuntime?: {
       caps: Capabilities | null;
@@ -439,7 +449,7 @@ function getResolvedSeamTier(): SeamAccelerationTier {
 
 function ensurePerfStore(): NonNullable<Window['__brenizerPerf']> {
   if (!window.__brenizerPerf) {
-    window.__brenizerPerf = { seamJobs: [] };
+    window.__brenizerPerf = { seamJobs: [], seamPost: {} };
   }
   return window.__brenizerPerf;
 }
@@ -735,6 +745,70 @@ function rotateRgbaImage(src: Uint8ClampedArray, width: number, height: number, 
     }
   }
   return out;
+}
+
+function flipBoundsForBottomUpReadback(bounds: SeamFootprintBounds[], height: number): SeamFootprintBounds[] {
+  return bounds.map((bound) => ({
+    left: bound.left,
+    right: bound.right,
+    top: height - bound.bottom,
+    bottom: height - bound.top,
+    confidence: bound.confidence,
+  }));
+}
+
+function buildSeamPostprocessMetadata(
+  bounds: SeamFootprintBounds[],
+  bottomUpReadback: boolean,
+  height: number,
+): SeamPostprocessMetadata | null {
+  if (bounds.length === 0) return null;
+  return {
+    bounds: bottomUpReadback ? flipBoundsForBottomUpReadback(bounds, height) : bounds,
+  };
+}
+
+function applyConfiguredSeamPostprocess(
+  stage: 'preview' | 'export',
+  pixels: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number,
+  settings: PipelineSettings,
+  metadata: SeamPostprocessMetadata | null,
+): Uint8ClampedArray {
+  if (!settings.seamFinalPassEnabled) {
+    return pixels instanceof Uint8ClampedArray ? pixels : new Uint8ClampedArray(pixels);
+  }
+  const result = applySeamPostprocess(pixels, width, height, {
+    enabled: settings.seamFinalPassEnabled,
+    mode: settings.seamFinalPassMode,
+    bandBaseWidth: settings.seamFinalPassBaseWidth,
+    bandScale: settings.seamFinalPassScale,
+    chromaCorrectionWeight: settings.seamFinalPassChromaWeight,
+    edgeGateStrength: settings.seamFinalPassEdgeGate,
+    maxCorrectionClamp: settings.seamFinalPassMaxCorrection,
+    autoDetect: true,
+    debug: import.meta.env.DEV,
+    metadata,
+  });
+  if (result.seams.length > 0) {
+    ensurePerfStore().seamPost = {
+      ...(ensurePerfStore().seamPost || {}),
+      [stage]: result.seams,
+    };
+    console.log(
+      `[seam-post] ${stage}: applied ${result.seams.length} seam correction(s) ` +
+      result.seams
+        .map((seam) => `${seam.orientation}@${Math.round(seam.position)} ΔY=${seam.meanDeltaY.toFixed(1)} c=${seam.confidence.toFixed(2)}`)
+        .join(', '),
+    );
+  } else if (import.meta.env.DEV) {
+    ensurePerfStore().seamPost = {
+      ...(ensurePerfStore().seamPost || {}),
+      [stage]: [],
+    };
+  }
+  return result.image;
 }
 
 /**
@@ -1244,6 +1318,7 @@ export async function boot(): Promise<void> {
   setState({ capabilities: caps, turboModeEnabled });
   renderCapabilities(caps);
   ensurePerfStore().seamJobs.length = 0;
+  ensurePerfStore().seamPost = {};
   window.__brenizerRuntime = { caps, turboModeEnabled };
 
   // Resolve mode and apply preset
@@ -1997,6 +2072,7 @@ async function renderWarpedPreview(
   const gridN = 8;
   let imgIdx = 0;
   const rawImageOutlines = new Map<string, Array<[number, number]>>();
+  const seamPostBounds: SeamFootprintBounds[] = [];
 
   // ── Project faces into composite coordinates for face-aware seam placement ──
   const allFaces = getLastFaces();
@@ -2138,6 +2214,13 @@ async function renderWarpedPreview(
         [pMaxX, pMaxY],
         [pMinX, pMaxY],
       ]);
+      seamPostBounds.push({
+        left: pMinX,
+        top: pMinY,
+        right: pMaxX,
+        bottom: pMaxY,
+        confidence: 0.85,
+      });
     }
 
     // Decode image and create texture
@@ -2572,6 +2655,15 @@ async function renderWarpedPreview(
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, cropPixels);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  ensurePerfStore().seamPost = { ...(ensurePerfStore().seamPost || {}), preview: undefined };
+
+  let previewPixelsDirty = false;
+  if (settings?.seamFinalPassEnabled) {
+    const seamMetadata = buildSeamPostprocessMetadata(seamPostBounds, true, compH);
+    const correctedPreview = applyConfiguredSeamPostprocess('preview', cropPixels, compW, compH, settings, seamMetadata);
+    cropPixels.set(correctedPreview);
+    previewPixelsDirty = true;
+  }
 
   // ── Auto-leveling: correct panorama horizon tilt ─────────────
   // Estimate the composite's dominant tilt by computing the principal axis
@@ -2683,8 +2775,10 @@ async function renderWarpedPreview(
     }
     // Replace cropPixels with rotated version
     cropPixels.set(rotated);
+    previewPixelsDirty = true;
+  }
 
-    // Re-upload to composite texture for display
+  if (previewPixelsDirty) {
     gl.bindTexture(gl.TEXTURE_2D, currentCompTex.texture);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, cropPixels);
     gl.bindTexture(gl.TEXTURE_2D, null);
@@ -3101,6 +3195,7 @@ async function exportComposite(): Promise<void> {
 
   let imgIdx = 0;
   const gridN = 8;
+  const seamPostBounds: SeamFootprintBounds[] = [];
 
   // ── Project faces into export composite coordinates ──
   const allFacesExport = getLastFaces();
@@ -3327,6 +3422,29 @@ async function exportComposite(): Promise<void> {
           `extreme=${(clampedSanity.extremeTriangleFraction * 100).toFixed(1)}%`,
         );
       }
+    }
+
+    let pMinX = Infinity;
+    let pMinY = Infinity;
+    let pMaxX = -Infinity;
+    let pMaxY = -Infinity;
+    for (let i = 0; i < mesh.positions.length; i += 2) {
+      const px = mesh.positions[i];
+      const py = mesh.positions[i + 1];
+      if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+      pMinX = Math.min(pMinX, px);
+      pMinY = Math.min(pMinY, py);
+      pMaxX = Math.max(pMaxX, px);
+      pMaxY = Math.max(pMaxY, py);
+    }
+    if (Number.isFinite(pMinX) && pMaxX > pMinX && pMaxY > pMinY) {
+      seamPostBounds.push({
+        left: pMinX,
+        top: pMinY,
+        right: pMaxX,
+        bottom: pMaxY,
+        confidence: 0.85,
+      });
     }
 
     let texW: number, texH: number;
@@ -3595,6 +3713,13 @@ async function exportComposite(): Promise<void> {
     const srcRow = (outH - 1 - y) * outW * 4;
     const dstRow = y * outW * 4;
     flipped.set(pixels.subarray(srcRow, srcRow + outW * 4), dstRow);
+  }
+  ensurePerfStore().seamPost = { ...(ensurePerfStore().seamPost || {}), export: undefined };
+
+  if (settings.seamFinalPassEnabled) {
+    const seamMetadata = buildSeamPostprocessMetadata(seamPostBounds, false, outH);
+    const correctedExport = applyConfiguredSeamPostprocess('export', flipped, outW, outH, settings, seamMetadata);
+    flipped.set(correctedExport);
   }
 
   // Apply manual rotation from the panorama editor before export crop.

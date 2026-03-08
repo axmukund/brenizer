@@ -243,6 +243,7 @@ function isTransientNavigationError(err) {
 }
 
 let maxflowProbeDone = false;
+let seamPostProbeDone = false;
 
 async function waitForRuntimeBootstrap(page, scenarioLabel) {
   const maxAttempts = 4;
@@ -454,6 +455,33 @@ async function runMaxflowSelfTest(page, scenarioLabel) {
   }
 }
 
+async function runSeamPostprocessSelfTest(page, scenarioLabel) {
+  const probe = await page.evaluate(async () => {
+    const mod = await import(new URL('/src/seamPostprocess.ts', window.location.href).toString());
+    return mod.runSeamPostprocessSyntheticSelfTest();
+  });
+
+  console.log(
+    `[${scenarioLabel}] seam-post self-test before=${probe.beforeStep.toFixed(2)} after=${probe.afterStep.toFixed(2)} ` +
+    `edgeBefore=${probe.edgeBefore.toFixed(2)} edgeAfter=${probe.edgeAfter.toFixed(2)} retention=${probe.edgeRetention.toFixed(3)} ` +
+    `seams=${probe.seamCount}`,
+  );
+
+  if (!(probe.afterStep < probe.beforeStep * 0.55)) {
+    throw new Error(
+      `Seam post-process self-test failed to reduce seam step enough: before=${probe.beforeStep}, after=${probe.afterStep}`,
+    );
+  }
+  if (!(probe.edgeRetention > 0.72)) {
+    throw new Error(
+      `Seam post-process self-test over-smoothed crossing edge: retention=${probe.edgeRetention}`,
+    );
+  }
+  if (!(probe.seamCount >= 1)) {
+    throw new Error('Seam post-process self-test found no seam candidates');
+  }
+}
+
 async function runScenario(browser, scenario, options = {}) {
   const seamTier = options.seamTier ?? SEAM_TIER_OVERRIDE;
   const turboMode = typeof options.turboMode === 'boolean' ? options.turboMode : TURBO_MODE_OVERRIDE;
@@ -479,6 +507,10 @@ async function runScenario(browser, scenario, options = {}) {
       }).catch(() => undefined);
     }
     await waitForRuntimeBootstrap(page, scenarioLabel);
+    if (!seamPostProbeDone) {
+      await runSeamPostprocessSelfTest(page, scenarioLabel);
+      seamPostProbeDone = true;
+    }
     if (MAXFLOW_SELF_TEST && !maxflowProbeDone) {
       await runMaxflowSelfTest(page, scenarioLabel);
       maxflowProbeDone = true;

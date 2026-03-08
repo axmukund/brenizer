@@ -651,6 +651,17 @@ export function buildSettingsPanel(): void {
   toggle('Multi-band Blend', 'multibandEnabled');
   slider('Pyramid Levels (0=auto)', 'multibandLevels', 0, 7, 1);
   toggle('Exposure Compensation', 'exposureComp');
+  toggle('Final Seam Pass', 'seamFinalPassEnabled');
+  select('Final Pass Mode', 'seamFinalPassMode', [
+    { value: 'fast', label: 'Fast' },
+    { value: 'standard', label: 'Standard' },
+    { value: 'highQuality', label: 'High Quality' },
+  ]);
+  slider('Final Base Width', 'seamFinalPassBaseWidth', 4, 48, 1, 'px');
+  slider('Final Band Scale', 'seamFinalPassScale', 0.5, 2.5, 0.1);
+  slider('Final Chroma Weight', 'seamFinalPassChromaWeight', 0.0, 1.0, 0.05);
+  slider('Final Edge Gate', 'seamFinalPassEdgeGate', 4, 48, 1);
+  slider('Final Max Shift', 'seamFinalPassMaxCorrection', 2, 32, 1);
 
   // ── Runtime ──
   section('Runtime');

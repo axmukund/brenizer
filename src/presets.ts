@@ -43,6 +43,13 @@ export interface PipelineSettings {
    *  Enables: pooled/shared photometric correction, shared-intrinsics BA,
    *  conservative color-balance locking, tighter APAP regularization. */
   sameCameraSettings: boolean;
+  seamFinalPassEnabled: boolean;
+  seamFinalPassMode: 'fast' | 'standard' | 'highQuality';
+  seamFinalPassBaseWidth: number;
+  seamFinalPassScale: number;
+  seamFinalPassChromaWeight: number;
+  seamFinalPassEdgeGate: number;
+  seamFinalPassMaxCorrection: number;
 }
 
 export type ModeName = 'auto' | 'desktopHQ' | 'mobileQuality' | 'mobileSafe' | 'alignmentOnly';
@@ -78,6 +85,13 @@ const DESKTOP_HQ: PipelineSettings = {
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
+  seamFinalPassEnabled: true,
+  seamFinalPassMode: 'highQuality',
+  seamFinalPassBaseWidth: 14,
+  seamFinalPassScale: 1.2,
+  seamFinalPassChromaWeight: 0.45,
+  seamFinalPassEdgeGate: 18,
+  seamFinalPassMaxCorrection: 18,
 };
 
 const MOBILE_QUALITY: PipelineSettings = {
@@ -111,6 +125,13 @@ const MOBILE_QUALITY: PipelineSettings = {
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
+  seamFinalPassEnabled: true,
+  seamFinalPassMode: 'standard',
+  seamFinalPassBaseWidth: 12,
+  seamFinalPassScale: 1.15,
+  seamFinalPassChromaWeight: 0.40,
+  seamFinalPassEdgeGate: 18,
+  seamFinalPassMaxCorrection: 16,
 };
 
 const MOBILE_SAFE: PipelineSettings = {
@@ -144,6 +165,13 @@ const MOBILE_SAFE: PipelineSettings = {
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
+  seamFinalPassEnabled: true,
+  seamFinalPassMode: 'fast',
+  seamFinalPassBaseWidth: 10,
+  seamFinalPassScale: 1.0,
+  seamFinalPassChromaWeight: 0.35,
+  seamFinalPassEdgeGate: 20,
+  seamFinalPassMaxCorrection: 12,
 };
 
 const MOBILE_LITE: PipelineSettings = {
@@ -177,6 +205,13 @@ const MOBILE_LITE: PipelineSettings = {
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
+  seamFinalPassEnabled: true,
+  seamFinalPassMode: 'fast',
+  seamFinalPassBaseWidth: 10,
+  seamFinalPassScale: 0.9,
+  seamFinalPassChromaWeight: 0.30,
+  seamFinalPassEdgeGate: 22,
+  seamFinalPassMaxCorrection: 10,
 };
 
 const ALIGNMENT_ONLY: PipelineSettings = {
@@ -210,6 +245,13 @@ const ALIGNMENT_ONLY: PipelineSettings = {
   cylindricalProjection: false,
   lensDistortionCorrection: false,
   sameCameraSettings: true,
+  seamFinalPassEnabled: true,
+  seamFinalPassMode: 'standard',
+  seamFinalPassBaseWidth: 14,
+  seamFinalPassScale: 1.15,
+  seamFinalPassChromaWeight: 0.40,
+  seamFinalPassEdgeGate: 18,
+  seamFinalPassMaxCorrection: 18,
 };
 
 export const PRESETS: Record<string, PipelineSettings> = {
