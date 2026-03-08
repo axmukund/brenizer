@@ -1436,11 +1436,8 @@ export async function boot(): Promise<void> {
   refreshEditorControlLabels();
   applyPreviewEditorTransform();
 
-  // Wire workflow dropdown actions
-  document.getElementById('workflow-step-preview')!.addEventListener('change', (event) => {
-    const select = event.currentTarget as HTMLSelectElement;
-    if (select.value !== 'run') return;
-    select.value = '';
+  // Wire workflow actions
+  document.getElementById('btn-stitch')!.addEventListener('click', () => {
     setState({ workflowPreviewReady: false });
     runStitchPreview().catch(err => {
       console.error('Pipeline error:', err);
@@ -1448,14 +1445,11 @@ export async function boot(): Promise<void> {
     });
   });
 
-  document.getElementById('workflow-step-optimize')!.addEventListener('change', (event) => {
-    const select = event.currentTarget as HTMLSelectElement;
-    if (select.value !== 'run') return;
-    select.value = '';
-    const { settings, workflowAlignmentChoiceMade, workflowSameCameraChoiceMade } = getState();
+  document.getElementById('btn-optimize')!.addEventListener('click', () => {
+    const { settings, workflowAlignmentMode, workflowAlignmentChoiceMade, workflowSameCameraChoiceMade } = getState();
     if (!settings) return;
     if (!workflowAlignmentChoiceMade) {
-      setStatus('Step 1: choose Alignment Only before optimizing.');
+      setStatus('Step 1: choose Alignment Only or Align and Adjust before optimizing.');
       return;
     }
     if (!workflowSameCameraChoiceMade) {
@@ -1464,9 +1458,13 @@ export async function boot(): Promise<void> {
     }
     setState({ workflowOptimized: false, workflowPreviewReady: false });
     setStatus(
-      settings.sameCameraSettings
-        ? 'Running step 3: optimizing for alignment-only + same-camera workflow…'
-        : 'Running step 3: optimizing for alignment-only + mixed-settings workflow…',
+      workflowAlignmentMode === 'alignAndAdjust'
+        ? settings.sameCameraSettings
+          ? 'Running step 3: optimizing for align-and-adjust + same-camera workflow…'
+          : 'Running step 3: optimizing for align-and-adjust + mixed-settings workflow…'
+        : settings.sameCameraSettings
+          ? 'Running step 3: optimizing for alignment-only + same-camera workflow…'
+          : 'Running step 3: optimizing for alignment-only + mixed-settings workflow…',
     );
     runFirstPassOptimization()
       .then((optimized) => {

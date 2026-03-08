@@ -1367,6 +1367,7 @@ export async function runFirstPassOptimization(): Promise<boolean> {
     images,
     settings,
     capabilities,
+    workflowAlignmentMode,
     workflowAlignmentChoiceMade,
     workflowSameCameraChoiceMade,
   } = getState();
@@ -1385,7 +1386,7 @@ export async function runFirstPassOptimization(): Promise<boolean> {
     return false;
   }
   if (!workflowAlignmentChoiceMade) {
-    setStatus('Step 1: choose Alignment Only before optimizing.');
+    setStatus('Step 1: choose Alignment Only or Align and Adjust before optimizing.');
     return false;
   }
   if (!workflowSameCameraChoiceMade) {
@@ -1393,7 +1394,9 @@ export async function runFirstPassOptimization(): Promise<boolean> {
     return false;
   }
 
-  const optimizationSettings = buildAlignmentFirstPassSettings(settings);
+  const optimizationSettings = workflowAlignmentMode === 'alignAndAdjust'
+    ? settings
+    : buildAlignmentFirstPassSettings(settings);
   const wantDepthProbe = optimizationSettings.depthEnabled && optimizationSettings.meshGrid > 0;
 
   setState({ pipelineStatus: 'running' });
@@ -1456,9 +1459,12 @@ export async function runFirstPassOptimization(): Promise<boolean> {
     setState({ settings: tuned });
     buildSettingsPanel();
     updateProgress('prepass', 1);
+    const workflowPrefix = workflowAlignmentMode === 'alignAndAdjust'
+      ? 'Workflow: align-and-adjust'
+      : 'Workflow: alignment-only';
     const workflowSummary = tuned.sameCameraSettings
-      ? 'Workflow: alignment-only + same-camera.'
-      : 'Workflow: alignment-only + mixed settings.';
+      ? `${workflowPrefix} + same-camera.`
+      : `${workflowPrefix} + mixed settings.`;
     setStatus(`Optimization complete. ${workflowSummary} ${probe.summary} ${depthSummary}`);
     console.info('[prepass]', probe.summary, probe.metrics, depthSummary, depthProbeMetrics);
     return true;

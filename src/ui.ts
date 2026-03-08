@@ -19,7 +19,7 @@ let nextId = 1;
 function genId(): string { return `img-${nextId++}`; }
 
 function isAlignmentWorkflowSelected(): boolean {
-  return getState().workflowAlignmentChoiceMade;
+  return getState().workflowAlignmentMode !== null;
 }
 
 function setSelectPlaceholder(select: HTMLSelectElement | null, label: string): void {
@@ -33,6 +33,7 @@ function syncModeControls(): void {
   const {
     userMode,
     mobileSafeFlag,
+    workflowAlignmentMode,
     workflowAlignmentChoiceMade,
     settings,
     workflowSameCameraChoiceMade,
@@ -51,7 +52,7 @@ function syncModeControls(): void {
 
   const alignSelect = document.getElementById('workflow-step-align') as HTMLSelectElement | null;
   if (alignSelect) {
-    const selectedValue = workflowAlignmentChoiceMade ? 'alignmentOnly' : '';
+    const selectedValue = workflowAlignmentMode ?? '';
     if (alignSelect.value !== selectedValue) alignSelect.value = selectedValue;
     alignSelect.classList.toggle('active', workflowAlignmentChoiceMade);
   }
@@ -67,18 +68,14 @@ function syncModeControls(): void {
     cameraSelect.classList.toggle('active', workflowSameCameraChoiceMade);
   }
 
-  const optimizeSelect = document.getElementById('workflow-step-optimize') as HTMLSelectElement | null;
-  if (optimizeSelect) {
-    setSelectPlaceholder(optimizeSelect, workflowOptimized ? '3. Optimize ✓' : '3. Optimize');
-    optimizeSelect.value = '';
-    optimizeSelect.classList.toggle('active', workflowOptimized);
+  const optimizeBtn = document.getElementById('btn-optimize') as HTMLButtonElement | null;
+  if (optimizeBtn) {
+    optimizeBtn.classList.toggle('active', workflowOptimized);
   }
 
-  const previewSelect = document.getElementById('workflow-step-preview') as HTMLSelectElement | null;
-  if (previewSelect) {
-    setSelectPlaceholder(previewSelect, workflowPreviewReady ? '4. Stitch Preview ✓' : '4. Stitch Preview');
-    previewSelect.value = '';
-    previewSelect.classList.toggle('active', workflowPreviewReady);
+  const previewBtn = document.getElementById('btn-stitch') as HTMLButtonElement | null;
+  if (previewBtn) {
+    previewBtn.classList.toggle('active', workflowPreviewReady);
   }
 
   const exportSelect = document.getElementById('workflow-step-export') as HTMLSelectElement | null;
@@ -540,13 +537,13 @@ function updateCanvasPlaceholder(): void {
   } else {
     const alignmentSelected = isAlignmentWorkflowSelected();
     if (!alignmentSelected) {
-      ph.textContent = `${active.length} image(s) ready — Step 1: pick Alignment Only from the dropdown.`;
+      ph.textContent = `${active.length} image(s) ready — Step 1: pick Alignment Only or Align and Adjust.`;
     } else if (!workflowSameCameraChoiceMade) {
       ph.textContent = `${active.length} image(s) ready — Step 2: pick Same Camera or Mixed Settings.`;
     } else if (!workflowOptimized) {
-      ph.textContent = `${active.length} image(s) ready — Step 3: run Optimize from the dropdown.`;
+      ph.textContent = `${active.length} image(s) ready — Step 3: click Optimize.`;
     } else {
-      ph.textContent = `${active.length} image(s) ready — Step 4: run Stitch Preview from the dropdown.`;
+      ph.textContent = `${active.length} image(s) ready — Step 4: click Stitch Preview.`;
     }
   }
 }
@@ -569,7 +566,7 @@ function updateActionButtons(): void {
       ? 'Need at least 2 active images.'
       : running
         ? 'Pipeline is running.'
-        : 'Step 1: choose Alignment Only.';
+        : 'Step 1: choose Alignment Only or Align and Adjust.';
   }
 
   const modeSelect = document.getElementById('mode-select') as HTMLSelectElement | null;
@@ -581,19 +578,19 @@ function updateActionButtons(): void {
     cameraSelect.title = !hasEnoughImages
       ? 'Need at least 2 active images.'
       : !alignmentSelected
-        ? 'Step 1: choose Alignment Only first.'
+        ? 'Step 1: choose Alignment Only or Align and Adjust first.'
         : running
           ? 'Pipeline is running.'
           : 'Step 2: choose Same Camera or Mixed Settings.';
   }
 
-  const optimizeSelect = document.getElementById('workflow-step-optimize') as HTMLSelectElement | null;
-  if (optimizeSelect) {
-    optimizeSelect.disabled = !optimizationReady;
-    optimizeSelect.title = !hasEnoughImages
+  const optimizeBtn = document.getElementById('btn-optimize') as HTMLButtonElement | null;
+  if (optimizeBtn) {
+    optimizeBtn.disabled = !optimizationReady;
+    optimizeBtn.title = !hasEnoughImages
       ? 'Need at least 2 active images.'
       : !alignmentSelected
-        ? 'Step 1: choose Alignment Only.'
+        ? 'Step 1: choose Alignment Only or Align and Adjust.'
         : !cameraChoiceMade
           ? 'Step 2: choose Same Camera or Mixed Settings.'
           : running
@@ -601,13 +598,13 @@ function updateActionButtons(): void {
             : 'Step 3: run optimization.';
   }
 
-  const previewSelect = document.getElementById('workflow-step-preview') as HTMLSelectElement | null;
-  if (previewSelect) {
-    previewSelect.disabled = !previewReady;
-    previewSelect.title = !hasEnoughImages
+  const previewBtn = document.getElementById('btn-stitch') as HTMLButtonElement | null;
+  if (previewBtn) {
+    previewBtn.disabled = !previewReady;
+    previewBtn.title = !hasEnoughImages
       ? 'Need at least 2 active images.'
       : !alignmentSelected
-        ? 'Step 1: choose Alignment Only.'
+        ? 'Step 1: choose Alignment Only or Align and Adjust.'
         : !cameraChoiceMade
           ? 'Step 2: choose Same Camera or Mixed Settings.'
           : !st.workflowOptimized
@@ -623,7 +620,7 @@ function updateActionButtons(): void {
     exportSelect.title = !hasEnoughImages
       ? 'Need at least 2 active images.'
       : !alignmentSelected
-        ? 'Step 1: choose Alignment Only.'
+        ? 'Step 1: choose Alignment Only or Align and Adjust.'
         : !cameraChoiceMade
           ? 'Step 2: choose Same Camera or Mixed Settings.'
           : !st.workflowOptimized
@@ -884,6 +881,7 @@ export function initUI(): void {
     setState({
       images: [],
       keyImageId: null,
+      workflowAlignmentMode: null,
       workflowAlignmentChoiceMade: false,
       workflowSameCameraChoiceMade: false,
       workflowOptimized: false,
@@ -905,14 +903,19 @@ export function initUI(): void {
 
   const alignSelect = $('workflow-step-align') as HTMLSelectElement;
   alignSelect.addEventListener('change', () => {
-    if (alignSelect.value !== 'alignmentOnly') return;
+    if (alignSelect.value !== 'alignmentOnly' && alignSelect.value !== 'alignAndAdjust') return;
     setState({
+      workflowAlignmentMode: alignSelect.value as 'alignmentOnly' | 'alignAndAdjust',
       workflowAlignmentChoiceMade: true,
       workflowSameCameraChoiceMade: false,
       workflowOptimized: false,
       workflowPreviewReady: false,
     });
-    setStatus('Step 1 complete. Now choose Same Camera or Mixed Settings.');
+    setStatus(
+      alignSelect.value === 'alignmentOnly'
+        ? 'Step 1 complete. Alignment-only workflow selected. Now choose Same Camera or Mixed Settings.'
+        : 'Step 1 complete. Align-and-adjust workflow selected. Now choose Same Camera or Mixed Settings.',
+    );
   });
 
   const cameraSelect = $('workflow-step-camera') as HTMLSelectElement;

@@ -256,8 +256,9 @@
       class="workflow-step"
       title="Maximum geometric alignment with EXIF-aware orientation and no exposure or vignette correction"
     >
-      <option value="">1. Alignment</option>
+      <option value="">1. Alignment Strategy</option>
       <option value="alignmentOnly">Alignment Only</option>
+      <option value="alignAndAdjust">Align and Adjust</option>
     </select>
     <select
       id="workflow-step-camera"
@@ -269,14 +270,8 @@
       <option value="same">Same Camera</option>
       <option value="mixed">Mixed Settings</option>
     </select>
-    <select id="workflow-step-optimize" class="workflow-step" disabled>
-      <option value="">3. Optimize</option>
-      <option value="run">Run Optimization</option>
-    </select>
-    <select id="workflow-step-preview" class="workflow-step" disabled>
-      <option value="">4. Stitch Preview</option>
-      <option value="run">Render Preview</option>
-    </select>
+    <button id="btn-optimize" disabled>3. Optimize</button>
+    <button id="btn-stitch" disabled>4. Stitch Preview</button>
     <select id="workflow-step-export" class="workflow-step" disabled title="Export the current composite at preview size or maximum resolution">
       <option value="">5. Export</option>
       <option value="standard">Export Preview Size</option>
