@@ -147,6 +147,12 @@ interface ExportSeamPlan {
   forceFeather: boolean;
 }
 
+interface SeamPostprocessStageOutcome {
+  image: Uint8ClampedArray;
+  seams: AppliedSeamCorrection[];
+  summary: string;
+}
+
 function chooseExportSeamPlan(outW: number, outH: number, requestedBlockSize: number): ExportSeamPlan {
   const quantize = (v: number): number => Math.max(4, Math.round(v / 4) * 4);
   const evaluate = (blockSize: number) => {
@@ -768,6 +774,13 @@ function buildSeamPostprocessMetadata(
   };
 }
 
+function summarizeSeamPostprocessOutcome(seams: AppliedSeamCorrection[]): string {
+  if (seams.length === 0) {
+    return 'Final seam smoothing ran; no seam bands needed correction.';
+  }
+  return `Final seam smoothing corrected ${seams.length} seam band${seams.length === 1 ? '' : 's'}.`;
+}
+
 function applyConfiguredSeamPostprocess(
   stage: 'preview' | 'export',
   pixels: Uint8Array | Uint8ClampedArray,
@@ -775,9 +788,19 @@ function applyConfiguredSeamPostprocess(
   height: number,
   settings: PipelineSettings,
   metadata: SeamPostprocessMetadata | null,
-): Uint8ClampedArray {
+): SeamPostprocessStageOutcome {
+  const perfStore = ensurePerfStore();
   if (!settings.seamFinalPassEnabled) {
-    return pixels instanceof Uint8ClampedArray ? pixels : new Uint8ClampedArray(pixels);
+    perfStore.seamPost = {
+      ...(perfStore.seamPost || {}),
+      [stage]: undefined,
+    };
+    console.log(`[seam-post] ${stage}: skipped (disabled)`);
+    return {
+      image: pixels instanceof Uint8ClampedArray ? pixels : new Uint8ClampedArray(pixels),
+      seams: [],
+      summary: 'Final seam smoothing disabled.',
+    };
   }
   const result = applySeamPostprocess(pixels, width, height, {
     enabled: settings.seamFinalPassEnabled,
@@ -791,24 +814,25 @@ function applyConfiguredSeamPostprocess(
     debug: import.meta.env.DEV,
     metadata,
   });
+  perfStore.seamPost = {
+    ...(perfStore.seamPost || {}),
+    [stage]: result.seams,
+  };
   if (result.seams.length > 0) {
-    ensurePerfStore().seamPost = {
-      ...(ensurePerfStore().seamPost || {}),
-      [stage]: result.seams,
-    };
     console.log(
       `[seam-post] ${stage}: applied ${result.seams.length} seam correction(s) ` +
       result.seams
         .map((seam) => `${seam.orientation}@${Math.round(seam.position)} ΔY=${seam.meanDeltaY.toFixed(1)} c=${seam.confidence.toFixed(2)}`)
         .join(', '),
     );
-  } else if (import.meta.env.DEV) {
-    ensurePerfStore().seamPost = {
-      ...(ensurePerfStore().seamPost || {}),
-      [stage]: [],
-    };
+  } else {
+    console.log(`[seam-post] ${stage}: ran, no seam corrections applied`);
   }
-  return result.image;
+  return {
+    image: result.image,
+    seams: result.seams,
+    summary: summarizeSeamPostprocessOutcome(result.seams),
+  };
 }
 
 /**
@@ -1794,6 +1818,7 @@ async function renderWarpedPreview(
   const meshes = getLastMeshes();
   const vignettes = getLastVignette();
   const { settings } = getState();
+  if (!settings) return;
   const refId = getLastRefId();
   const selectedKeyImageId = getState().keyImageId;
   const keyImageId = selectedKeyImageId && images.some((img) => img.id === selectedKeyImageId)
@@ -1928,6 +1953,7 @@ async function renderWarpedPreview(
   let newImageFBO: import('./gl').ManagedFBO | null = null;
   /** Track how many images were actually composited (for the status message). */
   let compositedImageCount = 0;
+  let previewSeamPostSummary = 'Final seam smoothing disabled.';
 
   try {
   compositeTexA = createEmptyTexture(gl, compW, compH);
@@ -2678,14 +2704,22 @@ async function renderWarpedPreview(
   gl.bindFramebuffer(gl.FRAMEBUFFER, currentCompFBO.fbo);
   gl.readPixels(0, 0, compW, compH, gl.RGBA, gl.UNSIGNED_BYTE, cropPixels);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  ensurePerfStore().seamPost = { ...(ensurePerfStore().seamPost || {}), preview: undefined };
 
   let previewPixelsDirty = false;
-  if (settings?.seamFinalPassEnabled) {
+  if (settings.seamFinalPassEnabled) {
+    setStatus('Compositing complete — applying final seam smoothing…');
+  }
+  // Keep seam smoothing in pre-rotation composite space.
+  // The pass only targets vertical and horizontal seam bands, so it needs
+  // compositor-aligned pixels before auto-leveling rotates the image.
+  {
     const seamMetadata = buildSeamPostprocessMetadata(seamPostBounds, true, compH);
     const correctedPreview = applyConfiguredSeamPostprocess('preview', cropPixels, compW, compH, settings, seamMetadata);
-    cropPixels.set(correctedPreview);
-    previewPixelsDirty = true;
+    previewSeamPostSummary = correctedPreview.summary;
+    if (correctedPreview.seams.length > 0) {
+      cropPixels.set(correctedPreview.image);
+      previewPixelsDirty = true;
+    }
   }
 
   // ── Auto-leveling: correct panorama horizon tilt ─────────────
@@ -2991,7 +3025,7 @@ async function renderWarpedPreview(
   // images are not included in mstOrder and are skipped during compositing
   const skippedCount = images.length - compositedImageCount;
   const skipNote = skippedCount > 0 ? ` (${skippedCount} disconnected, skipped)` : '';
-  setStatus(`Composite complete — ${compositedImageCount} images blended.${skipNote}`);
+  setStatus(`Composite complete — ${compositedImageCount} images blended.${skipNote} ${previewSeamPostSummary}`);
 }
 
 /**
@@ -3734,12 +3768,19 @@ async function exportComposite(): Promise<void> {
     const dstRow = y * outW * 4;
     flipped.set(pixels.subarray(srcRow, srcRow + outW * 4), dstRow);
   }
-  ensurePerfStore().seamPost = { ...(ensurePerfStore().seamPost || {}), export: undefined };
-
+  let exportSeamPostSummary = 'Final seam smoothing disabled.';
   if (settings.seamFinalPassEnabled) {
+    setStatus(`Applying final seam smoothing to ${settings.maxResExport ? 'full-resolution export' : 'export'}…`);
+  }
+  // Keep seam smoothing before export rotation so detected seam bands remain
+  // axis-aligned in the compositor's coordinate system.
+  {
     const seamMetadata = buildSeamPostprocessMetadata(seamPostBounds, false, outH);
     const correctedExport = applyConfiguredSeamPostprocess('export', flipped, outW, outH, settings, seamMetadata);
-    flipped.set(correctedExport);
+    exportSeamPostSummary = correctedExport.summary;
+    if (correctedExport.seams.length > 0) {
+      flipped.set(correctedExport.image);
+    }
   }
 
   // Apply manual rotation from the panorama editor before export crop.
@@ -3846,7 +3887,7 @@ async function exportComposite(): Promise<void> {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 
-  setStatus(`Exported ${finalCanvas.width}×${finalCanvas.height} ${exportFormat.toUpperCase()}.`);
+  setStatus(`Exported ${finalCanvas.width}×${finalCanvas.height} ${exportFormat.toUpperCase()}. ${exportSeamPostSummary}`);
 
   // Cleanup
   } finally {

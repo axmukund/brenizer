@@ -138,6 +138,7 @@ const TIMEOUTS = {
   buttonWaitSec: 150,
   optimizeSec: 360,
   pipelineSec: 720,
+  exportSec: 360,
   protocolMs: 1_800_000,
 };
 
@@ -154,6 +155,7 @@ const EXPECT_COI = /^(1|true|yes)$/i.test(process.env.EXPECT_COI || '');
 const MAXFLOW_SELF_TEST = parseBooleanish(process.env.MAXFLOW_SELF_TEST) ?? true;
 const RUN_SEAM_BENCHMARKS = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK || '');
 const BENCHMARK_ASSERT = /^(1|true|yes)$/i.test(process.env.SEAM_BENCHMARK_ASSERT || '');
+const EXPORT_SMOKE = /^(1|true|yes)$/i.test(process.env.EXPORT_SMOKE || '');
 const SCENARIO_ID_FILTER = (process.env.SCENARIO_ID || '').trim();
 const BENCHMARK_TIER_MATRIX = (process.env.SEAM_BENCHMARK_TIERS || 'legacyCpu,webglGrid')
   .split(',')
@@ -852,6 +854,88 @@ async function runScenario(browser, scenario, options = {}) {
         return { ok: false, phase: 'quality', reason: quality.reason, status: finalStatus };
       }
 
+      const previewSeamPost = Array.isArray(window.__brenizerPerf?.seamPost?.preview)
+        ? window.__brenizerPerf.seamPost.preview
+        : null;
+      if (!previewSeamPost) {
+        return {
+          ok: false,
+          phase: 'seam-post-preview',
+          reason: 'preview seam smoothing did not record a stage result',
+          status: finalStatus,
+        };
+      }
+
+      let exportStatus = '';
+      let exportSeamPost = null;
+      if (timeouts.exportSmoke) {
+        const exportStep = document.getElementById('workflow-step-export');
+        if (!exportStep) {
+          return {
+            ok: false,
+            phase: 'export',
+            reason: 'missing #workflow-step-export',
+            status: finalStatus,
+          };
+        }
+
+        const exportReady = await waitForEnabledControl('workflow-step-export', timeouts.buttonWaitSec);
+        if (!exportReady) {
+          return {
+            ok: false,
+            phase: 'export',
+            reason: 'export dropdown stayed disabled after preview',
+            status: finalStatus,
+          };
+        }
+
+        exportStep.value = 'fullres';
+        exportStep.dispatchEvent(new Event('change', { bubbles: true }));
+
+        let lastExportStatus = finalStatus;
+        for (let i = 0; i < timeouts.exportSec; i++) {
+          await sleep(1000);
+          const status = readStatus();
+          if (status !== lastExportStatus) {
+            console.log(`Export Status: ${status}`);
+            lastExportStatus = status;
+          }
+          const s = status.toLowerCase();
+          if (s.includes('exported ')) {
+            exportStatus = status;
+            break;
+          }
+          if (s.includes('export error') || s.includes('pipeline error') || s.includes('failed')) {
+            return {
+              ok: false,
+              phase: 'export',
+              reason: status,
+              status,
+            };
+          }
+          if (i === timeouts.exportSec - 1) {
+            return {
+              ok: false,
+              phase: 'export',
+              reason: `timeout: ${status}`,
+              status,
+            };
+          }
+        }
+
+        exportSeamPost = Array.isArray(window.__brenizerPerf?.seamPost?.export)
+          ? window.__brenizerPerf.seamPost.export
+          : null;
+        if (!exportSeamPost) {
+          return {
+            ok: false,
+            phase: 'seam-post-export',
+            reason: 'export seam smoothing did not record a stage result',
+            status: exportStatus || finalStatus,
+          };
+        }
+      }
+
       const t = sc.thresholds;
       const failures = [];
       if (blendedCount !== null && blendedCount < t.minBlended) {
@@ -889,6 +973,11 @@ async function runScenario(browser, scenario, options = {}) {
         seamJobs: Array.isArray(window.__brenizerPerf?.seamJobs)
           ? window.__brenizerPerf.seamJobs
           : [],
+        seamPost: {
+          previewCount: previewSeamPost.length,
+          exportCount: exportSeamPost?.length ?? null,
+          exportStatus: exportStatus || null,
+        },
         metrics: {
           blendedCount: blendedCount ?? -1,
           coverage: quality.coverage,
@@ -898,7 +987,7 @@ async function runScenario(browser, scenario, options = {}) {
           edgeEnergy: quality.edgeEnergy,
         },
       };
-    }, scenario, TIMEOUTS);
+    }, scenario, { ...TIMEOUTS, exportSmoke: EXPORT_SMOKE });
 
     return result;
   } finally {
@@ -915,6 +1004,7 @@ async function main() {
   console.log(`Server: ${APP_URL}`);
   if (SEAM_TIER_OVERRIDE) console.log(`Forced seam tier: ${SEAM_TIER_OVERRIDE}`);
   if (typeof TURBO_MODE_OVERRIDE === 'boolean') console.log(`Forced turbo mode: ${TURBO_MODE_OVERRIDE ? 'on' : 'off'}`);
+  if (EXPORT_SMOKE) console.log('Full-resolution export smoke: enabled');
   console.log(`Scenarios: ${selectedScenarios.map(s => s.id).join(', ')}`);
   console.log();
 
@@ -956,6 +1046,12 @@ async function main() {
           );
         }
         console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
+        if (result.seamPost) {
+          console.log(
+            `  seam-post: preview=${result.seamPost.previewCount}` +
+            (result.seamPost.exportCount === null ? '' : ` export=${result.seamPost.exportCount}`),
+          );
+        }
       } else {
         console.log(`  PASS ${formatMetrics(result.metrics)}`);
         console.log(`  status: ${result.status}`);
@@ -966,6 +1062,12 @@ async function main() {
           );
         }
         console.log(`  seam: ${summarizeSeamJobs(result.seamJobs || [])}`);
+        if (result.seamPost) {
+          console.log(
+            `  seam-post: preview=${result.seamPost.previewCount}` +
+            (result.seamPost.exportCount === null ? '' : ` export=${result.seamPost.exportCount}`),
+          );
+        }
       }
       console.log();
     }
