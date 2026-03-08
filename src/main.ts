@@ -23,7 +23,7 @@
 import { detectCapabilities, type Capabilities } from './capabilities';
 import { resolveMode, getPreset, type PipelineSettings } from './presets';
 import { setState, getState, subscribe } from './appState';
-import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel, promptOptimizeCameraSettingsChoice } from './ui';
+import { initUI, renderCapabilities, setStatus, setRenderImagePreview, startProgress, endProgress, updateProgress, buildSettingsPanel } from './ui';
 import {
   createGLContext, createWarpRenderer, createKeypointRenderer, createCompositor,
   createPyramidBlender,
@@ -1354,7 +1354,13 @@ export async function boot(): Promise<void> {
       const newMode = resolveMode(s.userMode, s.mobileSafeFlag, s.capabilities);
       if (newMode !== s.resolvedMode) {
         const newSettings = getPreset(newMode);
-        setState({ resolvedMode: newMode, settings: newSettings });
+        setState({
+          resolvedMode: newMode,
+          settings: newSettings,
+          workflowSameCameraChoiceMade: false,
+          workflowOptimized: false,
+          workflowPreviewReady: false,
+        });
         buildSettingsPanel(); // rebuild settings UI for new mode
         setStatus(`Mode changed to ${formatModeLabel(newMode)}`);
       }
@@ -1432,6 +1438,7 @@ export async function boot(): Promise<void> {
 
   // Wire Stitch Preview button
   document.getElementById('btn-stitch')!.addEventListener('click', () => {
+    setState({ workflowPreviewReady: false });
     runStitchPreview().catch(err => {
       console.error('Pipeline error:', err);
       setStatus(`Pipeline error: ${err.message}`);
@@ -1440,19 +1447,29 @@ export async function boot(): Promise<void> {
 
   // Wire first-pass optimization button
   document.getElementById('btn-optimize')!.addEventListener('click', async () => {
-    const { settings } = getState();
+    const { settings, workflowAlignmentChoiceMade, workflowSameCameraChoiceMade } = getState();
     if (!settings) return;
-    const sameCameraSettings = await promptOptimizeCameraSettingsChoice(!!settings.sameCameraSettings);
-    const nextSettings = { ...settings, sameCameraSettings };
-    setState({ settings: nextSettings });
-    buildSettingsPanel();
+    if (!workflowAlignmentChoiceMade) {
+      setStatus('Step 1: choose Alignment Only before optimizing.');
+      return;
+    }
+    if (!workflowSameCameraChoiceMade) {
+      setStatus('Step 2: choose Same Camera or Mixed Settings before optimizing.');
+      return;
+    }
+    setState({ workflowOptimized: false, workflowPreviewReady: false });
     setStatus(
-      sameCameraSettings
-        ? 'Optimization configured for locked aperture / ISO / white balance.'
-        : 'Optimization configured for mixed or varying camera settings.',
+      settings.sameCameraSettings
+        ? 'Running step 3: optimizing for alignment-only + same-camera workflow…'
+        : 'Running step 3: optimizing for alignment-only + mixed-settings workflow…',
     );
     runFirstPassOptimization()
-      .then(() => buildSettingsPanel())
+      .then((optimized) => {
+        if (optimized) {
+          setState({ workflowOptimized: true, workflowPreviewReady: false });
+        }
+        buildSettingsPanel();
+      })
       .catch(err => {
         console.error('Optimization error:', err);
         setStatus(`Optimization error: ${err.message}`);
@@ -2963,15 +2980,12 @@ async function renderWarpedPreview(
   }
 
   endProgress();
+  setState({ workflowPreviewReady: true });
   // Report the actual number of composited (connected) images — disconnected
   // images are not included in mstOrder and are skipped during compositing
   const skippedCount = images.length - compositedImageCount;
   const skipNote = skippedCount > 0 ? ` (${skippedCount} disconnected, skipped)` : '';
   setStatus(`Composite complete — ${compositedImageCount} images blended.${skipNote}`);
-
-  // Enable export button
-  document.getElementById('btn-export')!.removeAttribute('disabled');
-  document.getElementById('btn-export-fullres')!.removeAttribute('disabled');
 }
 
 /**

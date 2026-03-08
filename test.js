@@ -51,6 +51,7 @@ const SCENARIOS = [
     id: 'landscape-row-major',
     files: LANDSCAPE_TILES,
     runOptimizeFirst: true,
+    sameCameraSettings: true,
     thresholds: {
       minBlended: 8,
       coverageMin: 0.10,
@@ -64,6 +65,7 @@ const SCENARIOS = [
     id: 'landscape-snake-order',
     files: LANDSCAPE_SNAKE,
     runOptimizeFirst: false,
+    sameCameraSettings: false,
     thresholds: {
       minBlended: 8,
       coverageMin: 0.10,
@@ -77,6 +79,7 @@ const SCENARIOS = [
     id: 'axm-sequential',
     files: AXM_SEQUENCE,
     runOptimizeFirst: true,
+    sameCameraSettings: true,
     thresholds: {
       minBlended: 6,
       coverageMin: 0.07,
@@ -90,6 +93,7 @@ const SCENARIOS = [
     id: 'axm-center-out',
     files: AXM_CENTER_OUT,
     runOptimizeFirst: false,
+    sameCameraSettings: true,
     thresholds: {
       minBlended: 6,
       coverageMin: 0.07,
@@ -103,6 +107,7 @@ const SCENARIOS = [
     id: 'synth-orchard-row-major',
     files: SYNTH_ORCHARD_ROW_MAJOR,
     runOptimizeFirst: false,
+    sameCameraSettings: false,
     thresholds: {
       minBlended: 9,
       coverageMin: 0.75,
@@ -116,6 +121,7 @@ const SCENARIOS = [
     id: 'synth-market-snake',
     files: SYNTH_MARKET_SNAKE,
     runOptimizeFirst: false,
+    sameCameraSettings: false,
     thresholds: {
       minBlended: 12,
       coverageMin: 0.70,
@@ -762,33 +768,56 @@ async function runScenario(browser, scenario, options = {}) {
       input.files = dt.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
 
-      const stitchReady = await waitForEnabledButton('btn-stitch', timeouts.buttonWaitSec);
-      if (!stitchReady) {
-        return { ok: false, phase: 'ready', reason: 'stitch button stayed disabled' };
+      const alignBtn = document.getElementById('btn-mode-align-only');
+      const sameCameraBtn = document.getElementById('btn-camera-same');
+      const mixedCameraBtn = document.getElementById('btn-camera-mixed');
+      if (!alignBtn || !sameCameraBtn || !mixedCameraBtn) {
+        return { ok: false, phase: 'workflow', reason: 'missing workflow controls' };
       }
 
-      if (sc.runOptimizeFirst) {
-        const optimizeReady = await waitForEnabledButton('btn-optimize', timeouts.buttonWaitSec);
-        if (!optimizeReady) {
-          return { ok: false, phase: 'optimize-ready', reason: 'optimize button stayed disabled' };
-        }
+      alignBtn.click();
+      await sleep(100);
 
-        const optimizeBtn = document.getElementById('btn-optimize');
-        optimizeBtn.click();
-        let optimizeStatus = '';
-        for (let i = 0; i < timeouts.optimizeSec; i++) {
-          await sleep(1000);
-          optimizeStatus = readStatus();
-          if (optimizeStatus.toLowerCase().includes('optimization complete')) break;
-          if (optimizeStatus.toLowerCase().includes('optimization error') ||
-              optimizeStatus.toLowerCase().includes('first-pass optimization error') ||
-              optimizeStatus.toLowerCase().includes('pipeline error')) {
-            return { ok: false, phase: 'optimize', reason: optimizeStatus || 'optimization failed' };
-          }
-          if (i === timeouts.optimizeSec - 1) {
-            return { ok: false, phase: 'optimize', reason: `optimization timeout: ${optimizeStatus}` };
-          }
+      const cameraChoiceReady = await waitForEnabledButton(
+        sc.sameCameraSettings === false ? 'btn-camera-mixed' : 'btn-camera-same',
+        timeouts.buttonWaitSec,
+      );
+      if (!cameraChoiceReady) {
+        return { ok: false, phase: 'workflow', reason: 'camera choice button stayed disabled after alignment choice' };
+      }
+
+      if (sc.sameCameraSettings === false) {
+        mixedCameraBtn.click();
+      } else {
+        sameCameraBtn.click();
+      }
+      await sleep(100);
+
+      const optimizeReady = await waitForEnabledButton('btn-optimize', timeouts.buttonWaitSec);
+      if (!optimizeReady) {
+        return { ok: false, phase: 'optimize-ready', reason: 'optimize button stayed disabled after workflow setup' };
+      }
+
+      const optimizeBtn = document.getElementById('btn-optimize');
+      optimizeBtn.click();
+      let optimizeStatus = '';
+      for (let i = 0; i < timeouts.optimizeSec; i++) {
+        await sleep(1000);
+        optimizeStatus = readStatus();
+        if (optimizeStatus.toLowerCase().includes('optimization complete')) break;
+        if (optimizeStatus.toLowerCase().includes('optimization error') ||
+            optimizeStatus.toLowerCase().includes('first-pass optimization error') ||
+            optimizeStatus.toLowerCase().includes('pipeline error')) {
+          return { ok: false, phase: 'optimize', reason: optimizeStatus || 'optimization failed' };
         }
+        if (i === timeouts.optimizeSec - 1) {
+          return { ok: false, phase: 'optimize', reason: `optimization timeout: ${optimizeStatus}` };
+        }
+      }
+
+      const stitchReady = await waitForEnabledButton('btn-stitch', timeouts.buttonWaitSec);
+      if (!stitchReady) {
+        return { ok: false, phase: 'ready', reason: 'stitch button stayed disabled after optimization' };
       }
 
       const stitchBtn = document.getElementById('btn-stitch');

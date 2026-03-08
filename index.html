@@ -241,19 +241,30 @@
   <div id="topbar">
     <h1>Bokeh Mosaic Stitcher</h1>
     <button id="btn-upload-topbar">Upload</button>
-    <button id="btn-optimize" disabled>Optimize Settings</button>
-    <button id="btn-stitch" disabled>Stitch Preview</button>
-    <button id="btn-export" disabled>Export</button>
-    <button id="btn-export-fullres" disabled title="Export at maximum resolution with no pixel loss">Export Full Res</button>
     <button
       id="btn-mode-align-only"
       type="button"
       title="Maximum geometric alignment with EXIF-aware orientation and no exposure or vignette correction"
       aria-pressed="false"
-    >Alignment Only</button>
+    >1. Alignment Only</button>
+    <button
+      id="btn-camera-same"
+      type="button"
+      title="Choose this when aperture, ISO, shutter, white balance, and focal setup are effectively locked across the set"
+      aria-pressed="false"
+    >2. Same Camera</button>
+    <button
+      id="btn-camera-mixed"
+      type="button"
+      title="Choose this when exposure, white balance, lens settings, or capture conditions vary across the set"
+      aria-pressed="false"
+    >2. Mixed Settings</button>
+    <button id="btn-optimize" disabled>3. Optimize</button>
+    <button id="btn-stitch" disabled>4. Stitch Preview</button>
+    <button id="btn-export" disabled>5. Export</button>
+    <button id="btn-export-fullres" disabled title="Export at maximum resolution with no pixel loss">5. Export Full Res</button>
     <select id="mode-select">
       <option value="auto">Auto</option>
-      <option value="alignmentOnly">Alignment Only</option>
       <option value="desktopHQ">Desktop HQ</option>
       <option value="mobileQuality">Mobile Quality</option>
       <option value="mobileSafe">Mobile Safe</option>
@@ -301,7 +312,7 @@
           <canvas id="preview-canvas" width="800" height="600" style="display:none;"></canvas>
           <canvas id="preview-overlay" width="800" height="600" style="display:none;"></canvas>
           <div id="canvas-placeholder">
-            Upload images and click "Stitch Preview" to begin
+            Upload images to begin.
           </div>
           <div id="view-controls" aria-label="Panorama Editor View Controls">
             <div class="row">

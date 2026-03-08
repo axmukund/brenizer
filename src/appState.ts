@@ -26,6 +26,10 @@ export interface AppState {
   resolvedMode: string;
   settings: PipelineSettings | null;
   pipelineStatus: 'idle' | 'running' | 'error';
+  workflowAlignmentChoiceMade: boolean;
+  workflowSameCameraChoiceMade: boolean;
+  workflowOptimized: boolean;
+  workflowPreviewReady: boolean;
   degradations: string[];
 }
 
@@ -39,6 +43,10 @@ let _state: AppState = {
   resolvedMode: 'auto',
   settings: null,
   pipelineStatus: 'idle',
+  workflowAlignmentChoiceMade: false,
+  workflowSameCameraChoiceMade: false,
+  workflowOptimized: false,
+  workflowPreviewReady: false,
   degradations: [],
 };
 

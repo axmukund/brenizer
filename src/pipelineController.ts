@@ -23,7 +23,7 @@ import { createWorkerManager, type WorkerInitResults, type WorkerManager } from 
 import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg, CVSaliencyMsg, CVVignettingMsg, CVQualityAssessmentOutMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
-import type { PipelineSettings } from './presets';
+import { getPreset, type PipelineSettings } from './presets';
 import { setStatus, startProgress, endProgress, updateProgress, buildSettingsPanel, renderCapabilities } from './ui';
 
 let workerManager: WorkerManager | null = null;
@@ -865,6 +865,27 @@ interface MatchingProbeResult {
   metrics: MatchingProbeMetrics;
 }
 
+function buildAlignmentFirstPassSettings(baseSettings: PipelineSettings): PipelineSettings {
+  const alignmentPreset = getPreset('alignmentOnly');
+  return {
+    ...baseSettings,
+    alignScale: Math.max(baseSettings.alignScale, alignmentPreset.alignScale),
+    orbFeatures: Math.max(baseSettings.orbFeatures, alignmentPreset.orbFeatures),
+    pairWindowW: Math.max(baseSettings.pairWindowW, alignmentPreset.pairWindowW),
+    matchAllPairs: alignmentPreset.matchAllPairs,
+    minInliers: alignmentPreset.minInliers,
+    ratioTest: alignmentPreset.ratioTest,
+    ransacThreshPx: Math.min(baseSettings.ransacThreshPx, alignmentPreset.ransacThreshPx),
+    refineIters: Math.max(baseSettings.refineIters, alignmentPreset.refineIters),
+    meshGrid: Math.max(baseSettings.meshGrid, alignmentPreset.meshGrid),
+    depthEnabled: alignmentPreset.depthEnabled,
+    depthInputSize: Math.max(baseSettings.depthInputSize, alignmentPreset.depthInputSize),
+    blurAwareStitching: baseSettings.blurAwareStitching || alignmentPreset.blurAwareStitching,
+    objectAwareAlignment: baseSettings.objectAwareAlignment || alignmentPreset.objectAwareAlignment,
+    sameCameraSettings: baseSettings.sameCameraSettings,
+  };
+}
+
 interface DepthSampleMetrics {
   imageId: string;
   stdNorm: number;
@@ -1161,15 +1182,19 @@ function estimateMatchingSettings(
   let pairWindow = baseSettings.pairWindowW;
   if (metrics.componentCount > 1 && !baseSettings.matchAllPairs) {
     pairWindow = Math.max(pairWindow, Math.min(20, Math.ceil(activeCount / 2)));
+  } else if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.35 && metrics.medianInliers > 40) {
+    pairWindow = Math.max(3, Math.min(pairWindow, Math.ceil(activeCount / 3)));
   } else if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.25 && activeCount > 16) {
     pairWindow = Math.max(3, Math.min(pairWindow, Math.ceil(activeCount / 4)));
   }
   tuned.pairWindowW = clamp(Math.round(pairWindow), 2, 20);
 
   let matchAllPairs = baseSettings.matchAllPairs;
-  if (activeCount <= 12) {
+  if (metrics.componentCount > 1 && activeCount <= 25) {
     matchAllPairs = true;
-  } else if (metrics.componentCount > 1 && activeCount <= 25) {
+  } else if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.35 && metrics.medianInliers > 40) {
+    matchAllPairs = activeCount <= 6;
+  } else if (activeCount <= 10 && metrics.usableEdgeDensity < 0.18) {
     matchAllPairs = true;
   } else if (metrics.componentCount === 1 && metrics.usableEdgeDensity > 0.22 && activeCount > 18) {
     matchAllPairs = false;
@@ -1337,23 +1362,39 @@ async function runMatchingProbe(
 }
 
 /** Run only the first-pass analysis and apply optimized settings. */
-export async function runFirstPassOptimization(): Promise<void> {
-  const { images, settings, capabilities } = getState();
+export async function runFirstPassOptimization(): Promise<boolean> {
+  const {
+    images,
+    settings,
+    capabilities,
+    workflowAlignmentChoiceMade,
+    workflowSameCameraChoiceMade,
+  } = getState();
   const active = images.filter(i => !i.excluded);
-  const wantDepthProbe = settings?.meshGrid !== undefined && settings.meshGrid > 0;
 
   if (active.length < 2) {
     setStatus('Need at least 2 images to optimize settings.');
-    return;
+    return false;
   }
   if (!settings) {
     setStatus('Settings not loaded.');
-    return;
+    return false;
   }
   if (getState().pipelineStatus === 'running') {
     setStatus('Pipeline already running.');
-    return;
+    return false;
   }
+  if (!workflowAlignmentChoiceMade) {
+    setStatus('Step 1: choose Alignment Only before optimizing.');
+    return false;
+  }
+  if (!workflowSameCameraChoiceMade) {
+    setStatus('Step 2: choose Same Camera or Mixed Settings before optimizing.');
+    return false;
+  }
+
+  const optimizationSettings = buildAlignmentFirstPassSettings(settings);
+  const wantDepthProbe = optimizationSettings.depthEnabled && optimizationSettings.meshGrid > 0;
 
   setState({ pipelineStatus: 'running' });
   setStatus('Starting first-pass optimization…');
@@ -1382,12 +1423,12 @@ export async function runFirstPassOptimization(): Promise<void> {
 
     setStatus('Preparing images for first pass…');
     await clearWorkerImages(workerManager!);
-    const scaleFactors = await prepareImagesForCV(workerManager!, active, settings.alignScale, {
+    const scaleFactors = await prepareImagesForCV(workerManager!, active, optimizationSettings.alignScale, {
       stage: 'sendImages',
       statusPrefix: 'First pass: preparing image',
     });
 
-    const probe = await runMatchingProbe(workerManager!, active, settings, scaleFactors);
+    const probe = await runMatchingProbe(workerManager!, active, optimizationSettings, scaleFactors);
     let tuned = probe.tunedSettings;
     let depthSummary = 'Depth tuning skipped.';
     let depthProbeMetrics: DepthProbeResult | null = null;
@@ -1415,12 +1456,17 @@ export async function runFirstPassOptimization(): Promise<void> {
     setState({ settings: tuned });
     buildSettingsPanel();
     updateProgress('prepass', 1);
-    setStatus(`Optimization complete. ${probe.summary} ${depthSummary}`);
+    const workflowSummary = tuned.sameCameraSettings
+      ? 'Workflow: alignment-only + same-camera.'
+      : 'Workflow: alignment-only + mixed settings.';
+    setStatus(`Optimization complete. ${workflowSummary} ${probe.summary} ${depthSummary}`);
     console.info('[prepass]', probe.summary, probe.metrics, depthSummary, depthProbeMetrics);
+    return true;
   } catch (err) {
     console.error('First-pass optimization error:', err);
     setStatus(`First-pass optimization error: ${err instanceof Error ? err.message : String(err)}`);
     setState({ pipelineStatus: 'error' });
+    return false;
   } finally {
     endProgress();
     if (getState().pipelineStatus === 'running') {
