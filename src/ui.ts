@@ -22,6 +22,13 @@ function isAlignmentWorkflowSelected(): boolean {
   return getState().workflowAlignmentChoiceMade;
 }
 
+function setSelectPlaceholder(select: HTMLSelectElement | null, label: string): void {
+  if (!select || select.options.length === 0) return;
+  if (select.options[0].text !== label) {
+    select.options[0].text = label;
+  }
+}
+
 function syncModeControls(): void {
   const {
     userMode,
@@ -29,6 +36,8 @@ function syncModeControls(): void {
     workflowAlignmentChoiceMade,
     settings,
     workflowSameCameraChoiceMade,
+    workflowOptimized,
+    workflowPreviewReady,
   } = getState();
   const modeSelect = document.getElementById('mode-select') as HTMLSelectElement | null;
   if (modeSelect && modeSelect.value !== userMode) {
@@ -40,25 +49,42 @@ function syncModeControls(): void {
     msfFlag.checked = mobileSafeFlag;
   }
 
-  const alignBtn = document.getElementById('btn-mode-align-only') as HTMLButtonElement | null;
-  if (alignBtn) {
-    const active = workflowAlignmentChoiceMade;
-    alignBtn.classList.toggle('active', active);
-    alignBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  const alignSelect = document.getElementById('workflow-step-align') as HTMLSelectElement | null;
+  if (alignSelect) {
+    const selectedValue = workflowAlignmentChoiceMade ? 'alignmentOnly' : '';
+    if (alignSelect.value !== selectedValue) alignSelect.value = selectedValue;
+    alignSelect.classList.toggle('active', workflowAlignmentChoiceMade);
   }
 
-  const sameBtn = document.getElementById('btn-camera-same') as HTMLButtonElement | null;
-  if (sameBtn) {
-    const active = workflowSameCameraChoiceMade && !!settings?.sameCameraSettings;
-    sameBtn.classList.toggle('active', active);
-    sameBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  const cameraSelect = document.getElementById('workflow-step-camera') as HTMLSelectElement | null;
+  if (cameraSelect) {
+    const selectedValue = !workflowSameCameraChoiceMade
+      ? ''
+      : settings?.sameCameraSettings
+        ? 'same'
+        : 'mixed';
+    if (cameraSelect.value !== selectedValue) cameraSelect.value = selectedValue;
+    cameraSelect.classList.toggle('active', workflowSameCameraChoiceMade);
   }
 
-  const mixedBtn = document.getElementById('btn-camera-mixed') as HTMLButtonElement | null;
-  if (mixedBtn) {
-    const active = workflowSameCameraChoiceMade && settings !== null && !settings.sameCameraSettings;
-    mixedBtn.classList.toggle('active', active);
-    mixedBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  const optimizeSelect = document.getElementById('workflow-step-optimize') as HTMLSelectElement | null;
+  if (optimizeSelect) {
+    setSelectPlaceholder(optimizeSelect, workflowOptimized ? '3. Optimize ✓' : '3. Optimize');
+    optimizeSelect.value = '';
+    optimizeSelect.classList.toggle('active', workflowOptimized);
+  }
+
+  const previewSelect = document.getElementById('workflow-step-preview') as HTMLSelectElement | null;
+  if (previewSelect) {
+    setSelectPlaceholder(previewSelect, workflowPreviewReady ? '4. Stitch Preview ✓' : '4. Stitch Preview');
+    previewSelect.value = '';
+    previewSelect.classList.toggle('active', workflowPreviewReady);
+  }
+
+  const exportSelect = document.getElementById('workflow-step-export') as HTMLSelectElement | null;
+  if (exportSelect) {
+    setSelectPlaceholder(exportSelect, '5. Export');
+    exportSelect.value = '';
   }
 }
 
@@ -514,13 +540,13 @@ function updateCanvasPlaceholder(): void {
   } else {
     const alignmentSelected = isAlignmentWorkflowSelected();
     if (!alignmentSelected) {
-      ph.textContent = `${active.length} image(s) ready — Step 1: choose Alignment Only.`;
+      ph.textContent = `${active.length} image(s) ready — Step 1: pick Alignment Only from the dropdown.`;
     } else if (!workflowSameCameraChoiceMade) {
-      ph.textContent = `${active.length} image(s) ready — Step 2: choose Same Camera or Mixed Settings.`;
+      ph.textContent = `${active.length} image(s) ready — Step 2: pick Same Camera or Mixed Settings.`;
     } else if (!workflowOptimized) {
-      ph.textContent = `${active.length} image(s) ready — Step 3: click Optimize Settings.`;
+      ph.textContent = `${active.length} image(s) ready — Step 3: run Optimize from the dropdown.`;
     } else {
-      ph.textContent = `${active.length} image(s) ready — Step 4: click Stitch Preview.`;
+      ph.textContent = `${active.length} image(s) ready — Step 4: run Stitch Preview from the dropdown.`;
     }
   }
 }
@@ -536,24 +562,35 @@ function updateActionButtons(): void {
   const previewReady = optimizationReady && st.workflowOptimized;
   const exportReady = previewReady && st.workflowPreviewReady && !running;
 
-  const stitchBtn = $('btn-stitch') as HTMLButtonElement;
-  stitchBtn.disabled = !previewReady;
-  stitchBtn.title = !hasEnoughImages
-    ? 'Need at least 2 active images.'
-    : !alignmentSelected
-      ? 'Step 1: choose Alignment Only.'
-      : !cameraChoiceMade
-        ? 'Step 2: choose Same Camera or Mixed Settings.'
-        : !st.workflowOptimized
-          ? 'Step 3: optimize settings before preview.'
-          : running
-            ? 'Pipeline is running.'
-            : 'Step 4: stitch the preview.';
+  const alignSelect = document.getElementById('workflow-step-align') as HTMLSelectElement | null;
+  if (alignSelect) {
+    alignSelect.disabled = !hasEnoughImages || running;
+    alignSelect.title = !hasEnoughImages
+      ? 'Need at least 2 active images.'
+      : running
+        ? 'Pipeline is running.'
+        : 'Step 1: choose Alignment Only.';
+  }
 
-  const optimizeBtn = document.getElementById('btn-optimize') as HTMLButtonElement | null;
-  if (optimizeBtn) {
-    optimizeBtn.disabled = !optimizationReady;
-    optimizeBtn.title = !hasEnoughImages
+  const modeSelect = document.getElementById('mode-select') as HTMLSelectElement | null;
+  if (modeSelect) modeSelect.disabled = running;
+
+  const cameraSelect = document.getElementById('workflow-step-camera') as HTMLSelectElement | null;
+  if (cameraSelect) {
+    cameraSelect.disabled = !hasEnoughImages || !alignmentSelected || running;
+    cameraSelect.title = !hasEnoughImages
+      ? 'Need at least 2 active images.'
+      : !alignmentSelected
+        ? 'Step 1: choose Alignment Only first.'
+        : running
+          ? 'Pipeline is running.'
+          : 'Step 2: choose Same Camera or Mixed Settings.';
+  }
+
+  const optimizeSelect = document.getElementById('workflow-step-optimize') as HTMLSelectElement | null;
+  if (optimizeSelect) {
+    optimizeSelect.disabled = !optimizationReady;
+    optimizeSelect.title = !hasEnoughImages
       ? 'Need at least 2 active images.'
       : !alignmentSelected
         ? 'Step 1: choose Alignment Only.'
@@ -561,13 +598,29 @@ function updateActionButtons(): void {
           ? 'Step 2: choose Same Camera or Mixed Settings.'
           : running
             ? 'Pipeline is running.'
-            : 'Step 3: optimize settings.';
+            : 'Step 3: run optimization.';
   }
 
-  const exportBtn = document.getElementById('btn-export') as HTMLButtonElement | null;
-  if (exportBtn) {
-    exportBtn.disabled = !exportReady;
-    exportBtn.title = !hasEnoughImages
+  const previewSelect = document.getElementById('workflow-step-preview') as HTMLSelectElement | null;
+  if (previewSelect) {
+    previewSelect.disabled = !previewReady;
+    previewSelect.title = !hasEnoughImages
+      ? 'Need at least 2 active images.'
+      : !alignmentSelected
+        ? 'Step 1: choose Alignment Only.'
+        : !cameraChoiceMade
+          ? 'Step 2: choose Same Camera or Mixed Settings.'
+          : !st.workflowOptimized
+            ? 'Step 3: optimize settings before preview.'
+            : running
+              ? 'Pipeline is running.'
+              : 'Step 4: stitch the preview.';
+  }
+
+  const exportSelect = document.getElementById('workflow-step-export') as HTMLSelectElement | null;
+  if (exportSelect) {
+    exportSelect.disabled = !exportReady;
+    exportSelect.title = !hasEnoughImages
       ? 'Need at least 2 active images.'
       : !alignmentSelected
         ? 'Step 1: choose Alignment Only.'
@@ -579,43 +632,7 @@ function updateActionButtons(): void {
               ? 'Step 4: stitch a preview before export.'
               : running
                 ? 'Pipeline is running.'
-                : 'Step 5: export the panorama.';
-  }
-
-  const exportFullResBtn = document.getElementById('btn-export-fullres') as HTMLButtonElement | null;
-  if (exportFullResBtn) {
-    exportFullResBtn.disabled = !exportReady;
-    exportFullResBtn.title = exportBtn?.title || 'Step 5: export the panorama.';
-  }
-
-  const alignBtn = document.getElementById('btn-mode-align-only') as HTMLButtonElement | null;
-  if (alignBtn) alignBtn.disabled = running;
-
-  const modeSelect = document.getElementById('mode-select') as HTMLSelectElement | null;
-  if (modeSelect) modeSelect.disabled = running;
-
-  const sameBtn = document.getElementById('btn-camera-same') as HTMLButtonElement | null;
-  if (sameBtn) {
-    sameBtn.disabled = !hasEnoughImages || !alignmentSelected || running;
-    sameBtn.title = !hasEnoughImages
-      ? 'Need at least 2 active images.'
-      : !alignmentSelected
-        ? 'Step 1: choose Alignment Only first.'
-        : running
-          ? 'Pipeline is running.'
-          : 'Step 2: optimize for same aperture / ISO / white balance.';
-  }
-
-  const mixedBtn = document.getElementById('btn-camera-mixed') as HTMLButtonElement | null;
-  if (mixedBtn) {
-    mixedBtn.disabled = !hasEnoughImages || !alignmentSelected || running;
-    mixedBtn.title = !hasEnoughImages
-      ? 'Need at least 2 active images.'
-      : !alignmentSelected
-        ? 'Step 1: choose Alignment Only first.'
-        : running
-          ? 'Pipeline is running.'
-          : 'Step 2: optimize for mixed or varying camera settings.';
+                : 'Step 5: choose an export target.';
   }
 }
 
@@ -800,7 +817,7 @@ export function buildSettingsPanel(): void {
   section('Camera Model');
   const cameraNote = document.createElement('div');
   cameraNote.style.cssText = 'font-size:11px; color:var(--text-dim); margin-bottom:10px; line-height:1.4;';
-  cameraNote.textContent = 'Choose Same Camera or Mixed Settings from the top-bar workflow before running optimization.';
+  cameraNote.textContent = 'Choose Same Camera or Mixed Settings from the top-bar workflow dropdowns before running optimization.';
   panel.appendChild(cameraNote);
 
   // ── Lens Corrections ──
@@ -886,8 +903,9 @@ export function initUI(): void {
     });
   });
 
-  const alignOnlyBtn = $('btn-mode-align-only') as HTMLButtonElement;
-  alignOnlyBtn.addEventListener('click', () => {
+  const alignSelect = $('workflow-step-align') as HTMLSelectElement;
+  alignSelect.addEventListener('change', () => {
+    if (alignSelect.value !== 'alignmentOnly') return;
     setState({
       workflowAlignmentChoiceMade: true,
       workflowSameCameraChoiceMade: false,
@@ -897,32 +915,29 @@ export function initUI(): void {
     setStatus('Step 1 complete. Now choose Same Camera or Mixed Settings.');
   });
 
-  const cameraSameBtn = $('btn-camera-same') as HTMLButtonElement;
-  cameraSameBtn.addEventListener('click', () => {
+  const cameraSelect = $('workflow-step-camera') as HTMLSelectElement;
+  cameraSelect.addEventListener('change', () => {
     const { settings } = getState();
     if (!settings) return;
-    setState({
-      settings: { ...settings, sameCameraSettings: true },
-      workflowSameCameraChoiceMade: true,
-      workflowOptimized: false,
-      workflowPreviewReady: false,
-    });
-    buildSettingsPanel();
-    setStatus('Step 2 complete. Same-camera optimization selected. Click Optimize Settings next.');
-  });
-
-  const cameraMixedBtn = $('btn-camera-mixed') as HTMLButtonElement;
-  cameraMixedBtn.addEventListener('click', () => {
-    const { settings } = getState();
-    if (!settings) return;
-    setState({
-      settings: { ...settings, sameCameraSettings: false },
-      workflowSameCameraChoiceMade: true,
-      workflowOptimized: false,
-      workflowPreviewReady: false,
-    });
-    buildSettingsPanel();
-    setStatus('Step 2 complete. Mixed-settings optimization selected. Click Optimize Settings next.');
+    if (cameraSelect.value === 'same') {
+      setState({
+        settings: { ...settings, sameCameraSettings: true },
+        workflowSameCameraChoiceMade: true,
+        workflowOptimized: false,
+        workflowPreviewReady: false,
+      });
+      buildSettingsPanel();
+      setStatus('Step 2 complete. Same-camera optimization selected. Open Step 3 to optimize.');
+    } else if (cameraSelect.value === 'mixed') {
+      setState({
+        settings: { ...settings, sameCameraSettings: false },
+        workflowSameCameraChoiceMade: true,
+        workflowOptimized: false,
+        workflowPreviewReady: false,
+      });
+      buildSettingsPanel();
+      setStatus('Step 2 complete. Mixed-settings optimization selected. Open Step 3 to optimize.');
+    }
   });
 
   // Mobile safe flag

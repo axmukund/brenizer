@@ -258,9 +258,9 @@ async function waitForRuntimeBootstrap(page, scenarioLabel) {
       await page.waitForFunction(
         () => {
           const runtime = window.__brenizerRuntime;
-          const stitchBtn = document.getElementById('btn-stitch');
+          const previewStep = document.getElementById('workflow-step-preview');
           const status = document.getElementById('status-bar')?.textContent || '';
-          return !!runtime?.caps && !!stitchBtn && !/^Error:/i.test(status);
+          return !!runtime?.caps && !!previewStep && !/^Error:/i.test(status);
         },
         { timeout: TIMEOUTS.pageLoadMs },
       );
@@ -269,13 +269,13 @@ async function waitForRuntimeBootstrap(page, scenarioLabel) {
       if (!isTransientNavigationError(err) || attempt === maxAttempts) {
         try {
           const snapshot = await page.evaluate(() => ({
-            hasStitchButton: !!document.getElementById('btn-stitch'),
+            hasPreviewStep: !!document.getElementById('workflow-step-preview'),
             hasRuntimeCaps: !!window.__brenizerRuntime?.caps,
             status: document.getElementById('status-bar')?.textContent || '',
             readyState: document.readyState,
           }));
           console.log(`[${scenarioLabel}] Bootstrap snapshot: ${JSON.stringify(snapshot)}`);
-          if (snapshot.hasStitchButton && snapshot.hasRuntimeCaps && !/^Error:/i.test(snapshot.status)) {
+          if (snapshot.hasPreviewStep && snapshot.hasRuntimeCaps && !/^Error:/i.test(snapshot.status)) {
             return;
           }
         } catch {
@@ -534,10 +534,10 @@ async function runScenario(browser, scenario, options = {}) {
         return status.trim();
       }
 
-      async function waitForEnabledButton(id, timeoutSec) {
+      async function waitForEnabledControl(id, timeoutSec) {
         for (let i = 0; i < timeoutSec; i++) {
-          const btn = document.getElementById(id);
-          if (btn && !btn.disabled) return true;
+          const control = document.getElementById(id);
+          if (control && !control.disabled) return true;
           await sleep(1000);
         }
         return false;
@@ -768,38 +768,37 @@ async function runScenario(browser, scenario, options = {}) {
       input.files = dt.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
 
-      const alignBtn = document.getElementById('btn-mode-align-only');
-      const sameCameraBtn = document.getElementById('btn-camera-same');
-      const mixedCameraBtn = document.getElementById('btn-camera-mixed');
-      if (!alignBtn || !sameCameraBtn || !mixedCameraBtn) {
+      const alignStep = document.getElementById('workflow-step-align');
+      const cameraStep = document.getElementById('workflow-step-camera');
+      const optimizeStep = document.getElementById('workflow-step-optimize');
+      const previewStep = document.getElementById('workflow-step-preview');
+      if (!alignStep || !cameraStep || !optimizeStep || !previewStep) {
         return { ok: false, phase: 'workflow', reason: 'missing workflow controls' };
       }
 
-      alignBtn.click();
+      alignStep.value = 'alignmentOnly';
+      alignStep.dispatchEvent(new Event('change', { bubbles: true }));
       await sleep(100);
 
-      const cameraChoiceReady = await waitForEnabledButton(
-        sc.sameCameraSettings === false ? 'btn-camera-mixed' : 'btn-camera-same',
+      const cameraChoiceReady = await waitForEnabledControl(
+        'workflow-step-camera',
         timeouts.buttonWaitSec,
       );
       if (!cameraChoiceReady) {
-        return { ok: false, phase: 'workflow', reason: 'camera choice button stayed disabled after alignment choice' };
+        return { ok: false, phase: 'workflow', reason: 'camera settings dropdown stayed disabled after alignment choice' };
       }
 
-      if (sc.sameCameraSettings === false) {
-        mixedCameraBtn.click();
-      } else {
-        sameCameraBtn.click();
-      }
+      cameraStep.value = sc.sameCameraSettings === false ? 'mixed' : 'same';
+      cameraStep.dispatchEvent(new Event('change', { bubbles: true }));
       await sleep(100);
 
-      const optimizeReady = await waitForEnabledButton('btn-optimize', timeouts.buttonWaitSec);
+      const optimizeReady = await waitForEnabledControl('workflow-step-optimize', timeouts.buttonWaitSec);
       if (!optimizeReady) {
-        return { ok: false, phase: 'optimize-ready', reason: 'optimize button stayed disabled after workflow setup' };
+        return { ok: false, phase: 'optimize-ready', reason: 'optimize dropdown stayed disabled after workflow setup' };
       }
 
-      const optimizeBtn = document.getElementById('btn-optimize');
-      optimizeBtn.click();
+      optimizeStep.value = 'run';
+      optimizeStep.dispatchEvent(new Event('change', { bubbles: true }));
       let optimizeStatus = '';
       for (let i = 0; i < timeouts.optimizeSec; i++) {
         await sleep(1000);
@@ -815,13 +814,13 @@ async function runScenario(browser, scenario, options = {}) {
         }
       }
 
-      const stitchReady = await waitForEnabledButton('btn-stitch', timeouts.buttonWaitSec);
+      const stitchReady = await waitForEnabledControl('workflow-step-preview', timeouts.buttonWaitSec);
       if (!stitchReady) {
-        return { ok: false, phase: 'ready', reason: 'stitch button stayed disabled after optimization' };
+        return { ok: false, phase: 'ready', reason: 'preview dropdown stayed disabled after optimization' };
       }
 
-      const stitchBtn = document.getElementById('btn-stitch');
-      stitchBtn.click();
+      previewStep.value = 'run';
+      previewStep.dispatchEvent(new Event('change', { bubbles: true }));
 
       let finalStatus = '';
       let lastStatus = '';

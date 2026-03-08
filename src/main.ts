@@ -1436,8 +1436,11 @@ export async function boot(): Promise<void> {
   refreshEditorControlLabels();
   applyPreviewEditorTransform();
 
-  // Wire Stitch Preview button
-  document.getElementById('btn-stitch')!.addEventListener('click', () => {
+  // Wire workflow dropdown actions
+  document.getElementById('workflow-step-preview')!.addEventListener('change', (event) => {
+    const select = event.currentTarget as HTMLSelectElement;
+    if (select.value !== 'run') return;
+    select.value = '';
     setState({ workflowPreviewReady: false });
     runStitchPreview().catch(err => {
       console.error('Pipeline error:', err);
@@ -1445,8 +1448,10 @@ export async function boot(): Promise<void> {
     });
   });
 
-  // Wire first-pass optimization button
-  document.getElementById('btn-optimize')!.addEventListener('click', async () => {
+  document.getElementById('workflow-step-optimize')!.addEventListener('change', (event) => {
+    const select = event.currentTarget as HTMLSelectElement;
+    if (select.value !== 'run') return;
+    select.value = '';
     const { settings, workflowAlignmentChoiceMade, workflowSameCameraChoiceMade } = getState();
     if (!settings) return;
     if (!workflowAlignmentChoiceMade) {
@@ -1476,18 +1481,21 @@ export async function boot(): Promise<void> {
       });
   });
 
-  // Wire Export button
-  document.getElementById('btn-export')!.addEventListener('click', () => {
-    exportComposite().catch(err => {
-      console.error('Export error:', err);
-      setStatus(`Export error: ${err.message}`);
-    });
-  });
-
-  // Wire Full-Res Export button — uses a cloned settings object with maxResExport=true
-  document.getElementById('btn-export-fullres')!.addEventListener('click', () => {
+  document.getElementById('workflow-step-export')!.addEventListener('change', (event) => {
+    const select = event.currentTarget as HTMLSelectElement;
+    if (select.value !== 'standard' && select.value !== 'fullres') return;
     const { settings } = getState();
+    const exportMode = select.value;
+    select.value = '';
     if (!settings) return;
+    if (exportMode === 'standard') {
+      exportComposite().catch(err => {
+        console.error('Export error:', err);
+        setStatus(`Export error: ${err.message}`);
+      });
+      return;
+    }
+
     // Only override maxResExport for this export; restore afterwards
     const prevMaxRes = settings.maxResExport;
     setState({ settings: { ...settings, maxResExport: true } });

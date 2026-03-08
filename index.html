@@ -33,11 +33,21 @@
       background: var(--surface2); color: var(--text); border-radius: 4px; cursor: pointer;
     }
     #topbar button:hover { background: var(--accent); }
-    #topbar button.active {
+    #topbar select.workflow-step {
+      min-width: 150px;
+    }
+    #topbar select.workflow-step:hover:not(:disabled) {
+      background: var(--accent);
+    }
+    #topbar button.active, #topbar select.active {
       background: var(--accent);
       border-color: #ff7b92;
       color: #fff;
       box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+    }
+    #topbar select:disabled, #topbar button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
     #topbar .status-chip {
       font-size: 12px; padding: 3px 10px; background: var(--surface2);
@@ -241,28 +251,37 @@
   <div id="topbar">
     <h1>Bokeh Mosaic Stitcher</h1>
     <button id="btn-upload-topbar">Upload</button>
-    <button
-      id="btn-mode-align-only"
-      type="button"
+    <select
+      id="workflow-step-align"
+      class="workflow-step"
       title="Maximum geometric alignment with EXIF-aware orientation and no exposure or vignette correction"
-      aria-pressed="false"
-    >1. Alignment Only</button>
-    <button
-      id="btn-camera-same"
-      type="button"
+    >
+      <option value="">1. Alignment</option>
+      <option value="alignmentOnly">Alignment Only</option>
+    </select>
+    <select
+      id="workflow-step-camera"
+      class="workflow-step"
       title="Choose this when aperture, ISO, shutter, white balance, and focal setup are effectively locked across the set"
-      aria-pressed="false"
-    >2. Same Camera</button>
-    <button
-      id="btn-camera-mixed"
-      type="button"
-      title="Choose this when exposure, white balance, lens settings, or capture conditions vary across the set"
-      aria-pressed="false"
-    >2. Mixed Settings</button>
-    <button id="btn-optimize" disabled>3. Optimize</button>
-    <button id="btn-stitch" disabled>4. Stitch Preview</button>
-    <button id="btn-export" disabled>5. Export</button>
-    <button id="btn-export-fullres" disabled title="Export at maximum resolution with no pixel loss">5. Export Full Res</button>
+      disabled
+    >
+      <option value="">2. Camera Settings</option>
+      <option value="same">Same Camera</option>
+      <option value="mixed">Mixed Settings</option>
+    </select>
+    <select id="workflow-step-optimize" class="workflow-step" disabled>
+      <option value="">3. Optimize</option>
+      <option value="run">Run Optimization</option>
+    </select>
+    <select id="workflow-step-preview" class="workflow-step" disabled>
+      <option value="">4. Stitch Preview</option>
+      <option value="run">Render Preview</option>
+    </select>
+    <select id="workflow-step-export" class="workflow-step" disabled title="Export the current composite at preview size or maximum resolution">
+      <option value="">5. Export</option>
+      <option value="standard">Export Preview Size</option>
+      <option value="fullres">Export Full Resolution</option>
+    </select>
     <select id="mode-select">
       <option value="auto">Auto</option>
       <option value="desktopHQ">Desktop HQ</option>
