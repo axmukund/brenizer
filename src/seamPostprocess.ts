@@ -370,6 +370,60 @@ function computeSeamBlend(distance: number, coreRadius: number, bandRadius: numb
   return clampNumber(Math.max(local, shoulder), 0, 1);
 }
 
+function computePassSeamBlend(
+  distance: number,
+  coreRadius: number,
+  bandRadius: number,
+  candidate: InternalCandidate,
+  passIndex: number,
+): number {
+  if (passIndex <= 0) {
+    return computeSeamBlend(distance, coreRadius, bandRadius, candidate);
+  }
+  const local = 1 - smoothstep01(distance / Math.max(1, coreRadius));
+  const shoulderRamp =
+    smoothstep01(distance / Math.max(1, coreRadius * 0.7)) *
+    (1 - smoothstep01(distance / Math.max(coreRadius + 1, bandRadius)));
+  const coreScale = passIndex === 1 ? 0.18 : 0.08;
+  const shoulderScale = clampNumber(0.72 + passIndex * 0.16, 0.72, 1);
+  const shoulderFloor = getCandidateShoulderFloor(candidate) * (1.6 + passIndex * 0.32);
+  return clampNumber(Math.max(local * coreScale, shoulderRamp * shoulderScale, shoulderFloor * shoulderRamp), 0, 1);
+}
+
+function resolveCorrectionPassCount(mode: SeamPostprocessMode, candidate: InternalCandidate): number {
+  if (mode === 'highQuality') {
+    if (candidate.source === 'metadata') return 4;
+    if (candidate.source === 'hybrid') return 3;
+    return 2;
+  }
+  if (mode === 'standard') {
+    return 1;
+  }
+  return 1;
+}
+
+function resolvePassCoreRadius(
+  baseCoreRadius: number,
+  passIndex: number,
+  options: SeamPostprocessOptions,
+  width: number,
+  height: number,
+): number {
+  const radiusGrowth = 1 + passIndex * 0.26;
+  return clampNumber(
+    Math.round(baseCoreRadius * radiusGrowth),
+    8,
+    resolveRadiusLimit(options.mode, width, height),
+  );
+}
+
+function resolvePassStrengthScale(passIndex: number): number {
+  if (passIndex <= 0) return 1;
+  if (passIndex === 1) return 0.62;
+  if (passIndex === 2) return 0.46;
+  return 0.34;
+}
+
 export function buildSeamMetadataFromBounds(
   bounds: SeamFootprintBounds[],
   width: number,
@@ -966,57 +1020,88 @@ function applyVerticalCorrection(
   options: SeamPostprocessOptions,
   config: ProfileConfig,
 ): AppliedSeamCorrection | null {
-  const coreRadius = computeCoreRadius(candidate, options, width, height);
-  const bandRadius = computeBandRadius(coreRadius, candidate, options, width, height);
-  const bias = buildVerticalBiasField(data, width, height, candidate, coreRadius, config);
-  if (!bias) return null;
-  const strength = computeCorrectionStrength(candidate, bias.consistency);
-  const maxClamp = clampNumber(options.maxCorrectionClamp, 1, 48);
+  const baseCoreRadius = computeCoreRadius(candidate, options, width, height);
+  const passCount = resolveCorrectionPassCount(options.mode, candidate);
+  const baseMaxClamp = clampNumber(options.maxCorrectionClamp, 1, 48);
   const edgeTau = computeEdgeGateTau(candidate, options);
   const chromaWeight = clampNumber(options.chromaCorrectionWeight, 0, 1);
-  const startX = Math.max(0, Math.floor(candidate.position - bandRadius));
-  const endX = Math.min(width - 1, Math.ceil(candidate.position + bandRadius));
+  let appliedPasses = 0;
+  let strongestMeanDeltaY = 0;
+  let strongestMeanDeltaCb = 0;
+  let strongestMeanDeltaCr = 0;
+  let bestConsistency = 0;
+  let finalBandRadius = computeBandRadius(baseCoreRadius, candidate, options, width, height);
 
-  for (let y = 0; y < height; y++) {
-    const rowDeltaY = clampNumber(bias.denseY[y], -maxClamp * 2, maxClamp * 2);
-    const rowDeltaCb = clampNumber(bias.denseCb[y] * chromaWeight, -maxClamp * 2, maxClamp * 2);
-    const rowDeltaCr = clampNumber(bias.denseCr[y] * chromaWeight, -maxClamp * 2, maxClamp * 2);
-    if (Math.abs(rowDeltaY) < 0.25 && Math.abs(rowDeltaCb) < 0.25 && Math.abs(rowDeltaCr) < 0.25) continue;
-    for (let x = startX; x <= endX; x++) {
-      const idx = (y * width + x) * 4;
-      if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
-      const dist = Math.abs((x + 0.5) - candidate.position);
-      if (dist > bandRadius) continue;
-      const proximity = computeSeamBlend(dist, coreRadius, bandRadius, candidate);
-      const side = (x + 0.5) < candidate.position ? 1 : -1;
-      const edge = estimateEdgeMagnitude(data, width, height, x, y);
-      const gate = 1 / (1 + Math.pow(edge / edgeTau, 4));
-      const blend = strength * proximity * gate;
-      if (blend <= 0.02) continue;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-      const lum = computeY(r, g, b);
-      const cb = computeCb(lum, b);
-      const cr = computeCr(lum, r);
-      const nextY = lum + clampNumber(side * 0.56 * rowDeltaY * blend, -maxClamp, maxClamp);
-      const nextCb = cb + clampNumber(side * 0.56 * rowDeltaCb * blend, -maxClamp, maxClamp);
-      const nextCr = cr + clampNumber(side * 0.56 * rowDeltaCr * blend, -maxClamp, maxClamp);
-      writeWorkingColor(data, idx, nextY, nextCb, nextCr);
+  for (let passIndex = 0; passIndex < passCount; passIndex++) {
+    const passCoreRadius = resolvePassCoreRadius(baseCoreRadius, passIndex, options, width, height);
+    const passBandRadius = computeBandRadius(passCoreRadius, candidate, options, width, height);
+    const bias = buildVerticalBiasField(data, width, height, candidate, passCoreRadius, config);
+    if (!bias) {
+      if (passIndex === 0) return null;
+      break;
     }
+    const strength = computeCorrectionStrength(candidate, bias.consistency) * resolvePassStrengthScale(passIndex);
+    const passClamp = clampNumber(Math.round(baseMaxClamp * (1 + passIndex * 0.1)), 1, 52);
+    const passBlendScale = passIndex === 0 ? 0.56 : 0.4;
+    const startX = Math.max(0, Math.floor(candidate.position - passBandRadius));
+    const endX = Math.min(width - 1, Math.ceil(candidate.position + passBandRadius));
+    let touchedPixels = 0;
+
+    for (let y = 0; y < height; y++) {
+      const rowDeltaY = clampNumber(bias.denseY[y], -passClamp * 2, passClamp * 2);
+      const rowDeltaCb = clampNumber(bias.denseCb[y] * chromaWeight, -passClamp * 2, passClamp * 2);
+      const rowDeltaCr = clampNumber(bias.denseCr[y] * chromaWeight, -passClamp * 2, passClamp * 2);
+      if (Math.abs(rowDeltaY) < 0.12 && Math.abs(rowDeltaCb) < 0.12 && Math.abs(rowDeltaCr) < 0.12) continue;
+      for (let x = startX; x <= endX; x++) {
+        const idx = (y * width + x) * 4;
+        if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
+        const dist = Math.abs((x + 0.5) - candidate.position);
+        if (dist > passBandRadius) continue;
+        const proximity = computePassSeamBlend(dist, passCoreRadius, passBandRadius, candidate, passIndex);
+        const side = (x + 0.5) < candidate.position ? 1 : -1;
+        const edge = estimateEdgeMagnitude(data, width, height, x, y);
+        const gate = 1 / (1 + Math.pow(edge / edgeTau, 4));
+        const blend = strength * proximity * gate;
+        if (blend <= 0.0125) continue;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        const lum = computeY(r, g, b);
+        const cb = computeCb(lum, b);
+        const cr = computeCr(lum, r);
+        const nextY = lum + clampNumber(side * passBlendScale * rowDeltaY * blend, -passClamp, passClamp);
+        const nextCb = cb + clampNumber(side * passBlendScale * rowDeltaCb * blend, -passClamp, passClamp);
+        const nextCr = cr + clampNumber(side * passBlendScale * rowDeltaCr * blend, -passClamp, passClamp);
+        writeWorkingColor(data, idx, nextY, nextCb, nextCr);
+        touchedPixels++;
+      }
+    }
+
+    if (touchedPixels === 0) {
+      if (appliedPasses === 0) return null;
+      break;
+    }
+    appliedPasses++;
+    strongestMeanDeltaY = Math.max(strongestMeanDeltaY, bias.meanDeltaY);
+    strongestMeanDeltaCb = Math.max(strongestMeanDeltaCb, bias.meanDeltaCb);
+    strongestMeanDeltaCr = Math.max(strongestMeanDeltaCr, bias.meanDeltaCr);
+    bestConsistency = Math.max(bestConsistency, bias.consistency);
+    finalBandRadius = passBandRadius;
   }
+
+  if (appliedPasses === 0) return null;
 
   return {
     orientation: 'vertical',
     position: candidate.position,
     nominalWidth: candidate.nominalWidth,
-    radius: bandRadius,
+    radius: finalBandRadius,
     confidence: candidate.confidence,
     source: candidate.source,
-    meanDeltaY: bias.meanDeltaY,
-    meanDeltaCb: bias.meanDeltaCb,
-    meanDeltaCr: bias.meanDeltaCr,
-    consistency: bias.consistency,
+    meanDeltaY: strongestMeanDeltaY,
+    meanDeltaCb: strongestMeanDeltaCb,
+    meanDeltaCr: strongestMeanDeltaCr,
+    consistency: bestConsistency,
   };
 }
 
@@ -1028,57 +1113,88 @@ function applyHorizontalCorrection(
   options: SeamPostprocessOptions,
   config: ProfileConfig,
 ): AppliedSeamCorrection | null {
-  const coreRadius = computeCoreRadius(candidate, options, width, height);
-  const bandRadius = computeBandRadius(coreRadius, candidate, options, width, height);
-  const bias = buildHorizontalBiasField(data, width, height, candidate, coreRadius, config);
-  if (!bias) return null;
-  const strength = computeCorrectionStrength(candidate, bias.consistency);
-  const maxClamp = clampNumber(options.maxCorrectionClamp, 1, 48);
+  const baseCoreRadius = computeCoreRadius(candidate, options, width, height);
+  const passCount = resolveCorrectionPassCount(options.mode, candidate);
+  const baseMaxClamp = clampNumber(options.maxCorrectionClamp, 1, 48);
   const edgeTau = computeEdgeGateTau(candidate, options);
   const chromaWeight = clampNumber(options.chromaCorrectionWeight, 0, 1);
-  const startY = Math.max(0, Math.floor(candidate.position - bandRadius));
-  const endY = Math.min(height - 1, Math.ceil(candidate.position + bandRadius));
+  let appliedPasses = 0;
+  let strongestMeanDeltaY = 0;
+  let strongestMeanDeltaCb = 0;
+  let strongestMeanDeltaCr = 0;
+  let bestConsistency = 0;
+  let finalBandRadius = computeBandRadius(baseCoreRadius, candidate, options, width, height);
 
-  for (let x = 0; x < width; x++) {
-    const colDeltaY = clampNumber(bias.denseY[x], -maxClamp * 2, maxClamp * 2);
-    const colDeltaCb = clampNumber(bias.denseCb[x] * chromaWeight, -maxClamp * 2, maxClamp * 2);
-    const colDeltaCr = clampNumber(bias.denseCr[x] * chromaWeight, -maxClamp * 2, maxClamp * 2);
-    if (Math.abs(colDeltaY) < 0.25 && Math.abs(colDeltaCb) < 0.25 && Math.abs(colDeltaCr) < 0.25) continue;
-    for (let y = startY; y <= endY; y++) {
-      const idx = (y * width + x) * 4;
-      if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
-      const dist = Math.abs((y + 0.5) - candidate.position);
-      if (dist > bandRadius) continue;
-      const proximity = computeSeamBlend(dist, coreRadius, bandRadius, candidate);
-      const side = (y + 0.5) < candidate.position ? 1 : -1;
-      const edge = estimateEdgeMagnitude(data, width, height, x, y);
-      const gate = 1 / (1 + Math.pow(edge / edgeTau, 4));
-      const blend = strength * proximity * gate;
-      if (blend <= 0.02) continue;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-      const lum = computeY(r, g, b);
-      const cb = computeCb(lum, b);
-      const cr = computeCr(lum, r);
-      const nextY = lum + clampNumber(side * 0.56 * colDeltaY * blend, -maxClamp, maxClamp);
-      const nextCb = cb + clampNumber(side * 0.56 * colDeltaCb * blend, -maxClamp, maxClamp);
-      const nextCr = cr + clampNumber(side * 0.56 * colDeltaCr * blend, -maxClamp, maxClamp);
-      writeWorkingColor(data, idx, nextY, nextCb, nextCr);
+  for (let passIndex = 0; passIndex < passCount; passIndex++) {
+    const passCoreRadius = resolvePassCoreRadius(baseCoreRadius, passIndex, options, width, height);
+    const passBandRadius = computeBandRadius(passCoreRadius, candidate, options, width, height);
+    const bias = buildHorizontalBiasField(data, width, height, candidate, passCoreRadius, config);
+    if (!bias) {
+      if (passIndex === 0) return null;
+      break;
     }
+    const strength = computeCorrectionStrength(candidate, bias.consistency) * resolvePassStrengthScale(passIndex);
+    const passClamp = clampNumber(Math.round(baseMaxClamp * (1 + passIndex * 0.1)), 1, 52);
+    const passBlendScale = passIndex === 0 ? 0.56 : 0.4;
+    const startY = Math.max(0, Math.floor(candidate.position - passBandRadius));
+    const endY = Math.min(height - 1, Math.ceil(candidate.position + passBandRadius));
+    let touchedPixels = 0;
+
+    for (let x = 0; x < width; x++) {
+      const colDeltaY = clampNumber(bias.denseY[x], -passClamp * 2, passClamp * 2);
+      const colDeltaCb = clampNumber(bias.denseCb[x] * chromaWeight, -passClamp * 2, passClamp * 2);
+      const colDeltaCr = clampNumber(bias.denseCr[x] * chromaWeight, -passClamp * 2, passClamp * 2);
+      if (Math.abs(colDeltaY) < 0.12 && Math.abs(colDeltaCb) < 0.12 && Math.abs(colDeltaCr) < 0.12) continue;
+      for (let y = startY; y <= endY; y++) {
+        const idx = (y * width + x) * 4;
+        if (data[idx + 3] <= ALPHA_THRESHOLD) continue;
+        const dist = Math.abs((y + 0.5) - candidate.position);
+        if (dist > passBandRadius) continue;
+        const proximity = computePassSeamBlend(dist, passCoreRadius, passBandRadius, candidate, passIndex);
+        const side = (y + 0.5) < candidate.position ? 1 : -1;
+        const edge = estimateEdgeMagnitude(data, width, height, x, y);
+        const gate = 1 / (1 + Math.pow(edge / edgeTau, 4));
+        const blend = strength * proximity * gate;
+        if (blend <= 0.0125) continue;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        const lum = computeY(r, g, b);
+        const cb = computeCb(lum, b);
+        const cr = computeCr(lum, r);
+        const nextY = lum + clampNumber(side * passBlendScale * colDeltaY * blend, -passClamp, passClamp);
+        const nextCb = cb + clampNumber(side * passBlendScale * colDeltaCb * blend, -passClamp, passClamp);
+        const nextCr = cr + clampNumber(side * passBlendScale * colDeltaCr * blend, -passClamp, passClamp);
+        writeWorkingColor(data, idx, nextY, nextCb, nextCr);
+        touchedPixels++;
+      }
+    }
+
+    if (touchedPixels === 0) {
+      if (appliedPasses === 0) return null;
+      break;
+    }
+    appliedPasses++;
+    strongestMeanDeltaY = Math.max(strongestMeanDeltaY, bias.meanDeltaY);
+    strongestMeanDeltaCb = Math.max(strongestMeanDeltaCb, bias.meanDeltaCb);
+    strongestMeanDeltaCr = Math.max(strongestMeanDeltaCr, bias.meanDeltaCr);
+    bestConsistency = Math.max(bestConsistency, bias.consistency);
+    finalBandRadius = passBandRadius;
   }
+
+  if (appliedPasses === 0) return null;
 
   return {
     orientation: 'horizontal',
     position: candidate.position,
     nominalWidth: candidate.nominalWidth,
-    radius: bandRadius,
+    radius: finalBandRadius,
     confidence: candidate.confidence,
     source: candidate.source,
-    meanDeltaY: bias.meanDeltaY,
-    meanDeltaCb: bias.meanDeltaCb,
-    meanDeltaCr: bias.meanDeltaCr,
-    consistency: bias.consistency,
+    meanDeltaY: strongestMeanDeltaY,
+    meanDeltaCb: strongestMeanDeltaCb,
+    meanDeltaCr: strongestMeanDeltaCr,
+    consistency: bestConsistency,
   };
 }
 
