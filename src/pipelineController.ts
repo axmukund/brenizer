@@ -19,12 +19,12 @@
  * image size) to handle both full-frame photos and small grid tiles.
  */
 
-import { createWorkerManager, type WorkerManager } from './workers/workerManager';
+import { createWorkerManager, type WorkerInitResults, type WorkerManager } from './workers/workerManager';
 import type { CVFeaturesMsg, CVEdgesMsg, CVEdge, CVMSTMsg, CVTransformsMsg, CVMeshMsg, CVExposureMsg, CVSaliencyMsg, CVVignettingMsg, CVQualityAssessmentOutMsg } from './workers/workerTypes';
 import type { DepthResultMsg } from './workers/workerTypes';
 import { getState, setState, type ImageEntry } from './appState';
 import type { PipelineSettings } from './presets';
-import { setStatus, startProgress, endProgress, updateProgress, buildSettingsPanel } from './ui';
+import { setStatus, startProgress, endProgress, updateProgress, buildSettingsPanel, renderCapabilities } from './ui';
 
 let workerManager: WorkerManager | null = null;
 
@@ -189,8 +189,23 @@ export function getWorkerManager(): WorkerManager | null {
   return workerManager;
 }
 
+function applyWorkerInitCapabilities(result: WorkerInitResults, opts: { enableSeam?: boolean }): void {
+  const caps = getState().capabilities;
+  if (!caps || opts.enableSeam === false) return;
+
+  const nextSeamBackendId = result.seam ? (result.seamBackendId || caps.seamSolverBackendId) : null;
+  if (nextSeamBackendId === caps.seamSolverBackendId) return;
+
+  const nextCaps = { ...caps, seamSolverBackendId: nextSeamBackendId };
+  setState({ capabilities: nextCaps });
+  renderCapabilities(nextCaps);
+  if (window.__brenizerRuntime) {
+    window.__brenizerRuntime.caps = nextCaps;
+  }
+}
+
 /** Initialize all workers. Returns readiness status. */
-export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: boolean; depthInitTimeoutMs?: number } = {}): Promise<{ cv: boolean; depth: boolean; seam: boolean }> {
+export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: boolean; depthInitTimeoutMs?: number } = {}): Promise<WorkerInitResults> {
   if (workerManager) {
     workerManager.dispose();
   }
@@ -198,6 +213,7 @@ export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: bo
   setStatus('Initializing workers…');
 
   const result = await workerManager.initAll(opts);
+  applyWorkerInitCapabilities(result, opts);
 
   const parts: string[] = [];
   if (result.cv) parts.push('CV ✓');
@@ -206,7 +222,7 @@ export async function initWorkers(opts: { enableDepth?: boolean; enableSeam?: bo
   else if (result.depth) parts.push('Depth ✓');
   else parts.push('Depth ✗');
   if (opts.enableSeam === false) parts.push('Seam off');
-  else if (result.seam) parts.push('Seam ✓');
+  else if (result.seam) parts.push(`Seam ${result.seamBackendId || 'ready'} ✓`);
   else parts.push('Seam ✗');
 
   setStatus(`Workers: ${parts.join(' | ')}`);

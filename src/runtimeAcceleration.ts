@@ -5,7 +5,10 @@ const TURBO_MODE_STORAGE_KEY = 'brenizer.turboMode';
 const COI_ATTEMPT_KEY = 'brenizer.coi.attempted';
 const COI_FAILED_KEY = 'brenizer.coi.failed';
 const COI_SOURCE_KEY = 'brenizer.coi.source';
+const COI_RELOAD_COUNT_KEY = 'brenizer.coi.reloadCount';
 const COI_SW_FILENAME = 'coi-serviceworker.js';
+const COI_MAX_AUTO_RELOADS = 2;
+const COI_READY_WAIT_MS = 4000;
 
 function parseBooleanish(raw: string | null): boolean | null {
   if (raw === null) return null;
@@ -56,6 +59,7 @@ function clearCoiMarkers(): void {
     window.sessionStorage.removeItem(COI_ATTEMPT_KEY);
     window.sessionStorage.removeItem(COI_FAILED_KEY);
     window.sessionStorage.removeItem(COI_SOURCE_KEY);
+    window.sessionStorage.removeItem(COI_RELOAD_COUNT_KEY);
   } catch {
     // Ignore storage failures; runtime detection will still work.
   }
@@ -77,6 +81,67 @@ function markCoiFailed(): void {
   } catch {
     // Ignore storage failures; fallback path remains usable.
   }
+}
+
+function getCoiReloadCount(): number {
+  try {
+    const raw = Number(window.sessionStorage.getItem(COI_RELOAD_COUNT_KEY) || '0');
+    return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function setCoiReloadCount(value: number): void {
+  try {
+    window.sessionStorage.setItem(COI_RELOAD_COUNT_KEY, String(Math.max(0, Math.floor(value))));
+  } catch {
+    // Ignore storage failures and continue with best-effort behavior.
+  }
+}
+
+function getActiveCoiControllerScriptUrl(): string {
+  if (!('serviceWorker' in navigator)) return '';
+  return navigator.serviceWorker.controller?.scriptURL || '';
+}
+
+function hasMatchingCoiController(): boolean {
+  const controllerScript = getActiveCoiControllerScriptUrl();
+  return controllerScript.endsWith(`/${COI_SW_FILENAME}`) || controllerScript.endsWith(COI_SW_FILENAME);
+}
+
+async function waitForCoiServiceWorkerReady(timeoutMs = COI_READY_WAIT_MS): Promise<boolean> {
+  if (!('serviceWorker' in navigator)) return false;
+  if (hasMatchingCoiController()) return true;
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timeoutId = 0;
+
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+      if (timeoutId !== 0) window.clearTimeout(timeoutId);
+      resolve(value);
+    };
+
+    const onControllerChange = (): void => {
+      finish(hasMatchingCoiController());
+    };
+
+    navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+    navigator.serviceWorker.ready
+      .then(() => finish(true))
+      .catch(() => undefined);
+    timeoutId = window.setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
+function requestCoiReload(): { reloading: true; active: false } {
+  setCoiReloadCount(getCoiReloadCount() + 1);
+  window.location.reload();
+  return { reloading: true, active: false };
 }
 
 async function findCoiServiceWorkerRegistration(): Promise<ServiceWorkerRegistration | null> {
@@ -149,6 +214,8 @@ export async function prepareTurboModeRuntime(enabled: boolean): Promise<{ reloa
 
   if (self.crossOriginIsolated) {
     try {
+      window.sessionStorage.removeItem(COI_FAILED_KEY);
+      window.sessionStorage.removeItem(COI_RELOAD_COUNT_KEY);
       window.sessionStorage.setItem(COI_SOURCE_KEY, detectCrossOriginIsolationMode(true));
     } catch {
       // Ignore storage failures.
@@ -156,25 +223,22 @@ export async function prepareTurboModeRuntime(enabled: boolean): Promise<{ reloa
     return { reloading: false, active: true };
   }
 
-  try {
-    const alreadyAttempted = window.sessionStorage.getItem(COI_ATTEMPT_KEY) === '1';
-    const alreadyFailed = window.sessionStorage.getItem(COI_FAILED_KEY) === '1';
-    if (alreadyAttempted || alreadyFailed) {
-      markCoiFailed();
-      return { reloading: false, active: false, reason: 'coi-not-available' };
-    }
-  } catch {
-    // Ignore storage failures; continue and attempt registration.
+  const reloadCount = getCoiReloadCount();
+  if (reloadCount >= COI_MAX_AUTO_RELOADS) {
+    markCoiFailed();
+    return { reloading: false, active: false, reason: 'coi-retry-limit-exceeded' };
   }
 
   try {
     markCoiAttempted();
-    const registration = await navigator.serviceWorker.register(getCoiServiceWorkerUrl(), {
-      scope: getCoiServiceWorkerScope(),
-    });
+    const registration = await findCoiServiceWorkerRegistration()
+      ?? await navigator.serviceWorker.register(getCoiServiceWorkerUrl(), {
+        scope: getCoiServiceWorkerScope(),
+        updateViaCache: 'none',
+      });
     await registration.update().catch(() => undefined);
-    window.location.reload();
-    return { reloading: true, active: false };
+    await waitForCoiServiceWorkerReady();
+    return requestCoiReload();
   } catch (err) {
     markCoiFailed();
     return {
