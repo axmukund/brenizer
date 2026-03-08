@@ -40,8 +40,8 @@ export interface PipelineSettings {
   lensDistortionCorrection: boolean;
   /** Assume all photos share same camera settings (aperture, focal length,
    *  shutter speed, ISO) and were shot within ~2 min of each other.
-   *  Enables: pooled vignetting, shared-intrinsics BA, exposure skip,
-   *  color-transfer skip, tighter APAP regularization. */
+   *  Enables: pooled/shared photometric correction, shared-intrinsics BA,
+   *  conservative color-balance locking, tighter APAP regularization. */
   sameCameraSettings: boolean;
 }
 

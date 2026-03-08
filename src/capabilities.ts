@@ -20,6 +20,7 @@ export interface Capabilities {
   browserFamily: 'chromium' | 'firefox' | 'safari' | 'other';
   crossOriginIsolationMode: CrossOriginIsolationMode;
   seamAccelerationTier: 'desktopTurbo' | 'webgpu' | 'webglGrid' | 'legacyCpu';
+  seamSolverBackendId: string | null;
 }
 
 const VALID_SEAM_TIERS = new Set(['desktopTurbo', 'webgpu', 'webglGrid', 'legacyCpu']);
@@ -39,7 +40,12 @@ function detectWasmSimd(): boolean {
       0x01, 0x00, 0x00, 0x00,
       0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
       0x03, 0x02, 0x01, 0x00,
-      0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x0b,
+      0x0a, 0x16, 0x01, 0x14, 0x00, 0xfd, 0x0c,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x0b,
     ]));
   } catch {
     return false;
@@ -138,6 +144,7 @@ export async function detectCapabilities(): Promise<Capabilities> {
     wasmThreads: detectWasmThreads(crossOriginIsolated),
     browserFamily: detectBrowserFamily(),
     crossOriginIsolationMode: detectCrossOriginIsolationMode(crossOriginIsolated),
+    seamSolverBackendId: null,
   };
 
   const caps: Capabilities = {
@@ -151,6 +158,10 @@ export async function detectCapabilities(): Promise<Capabilities> {
 /** Human-readable summary for UI display. */
 export function capsSummary(c: Capabilities): { label: string; status: 'ok' | 'warn' | 'no' }[] {
   const items: { label: string; status: 'ok' | 'warn' | 'no' }[] = [];
+  const seamBackend = c.seamSolverBackendId || '';
+  const seamBackendLower = seamBackend.toLowerCase();
+  const runtimeSimdActive = seamBackendLower.includes('wasm-simd') || seamBackendLower.includes('wasm-threads');
+  const runtimeThreadsActive = seamBackendLower.includes('wasm-threads');
 
   items.push({ label: c.isMobile ? 'Mobile' : 'Desktop', status: c.isMobile ? 'warn' : 'ok' });
   items.push({ label: `WebGL2`, status: c.webgl2 ? 'ok' : 'no' });
@@ -168,8 +179,8 @@ export function capsSummary(c: Capabilities): { label: string; status: 'ok' | 'w
     label: `Cores ${c.hardwareConcurrency}`,
     status: c.hardwareConcurrency >= 4 ? 'ok' : 'warn',
   });
-  items.push({ label: `WASM SIMD`, status: c.wasmSimd ? 'ok' : 'warn' });
-  items.push({ label: `WASM Threads`, status: c.wasmThreads ? 'ok' : 'warn' });
+  items.push({ label: `WASM SIMD`, status: (c.wasmSimd || runtimeSimdActive) ? 'ok' : 'warn' });
+  items.push({ label: `WASM Threads`, status: (c.wasmThreads || runtimeThreadsActive) ? 'ok' : 'warn' });
   if (c.deviceMemory !== null) {
     items.push({
       label: `${c.deviceMemory} GB RAM`,
@@ -180,6 +191,12 @@ export function capsSummary(c: Capabilities): { label: string; status: 'ok' | 'w
     label: `Isolation ${c.crossOriginIsolationMode}`,
     status: c.crossOriginIsolated ? 'ok' : 'warn',
   });
+  if (seamBackend) {
+    items.push({
+      label: `Maxflow ${seamBackend}`,
+      status: seamBackendLower.startsWith('wasm-') ? 'ok' : 'warn',
+    });
+  }
 
   if (c.glRenderer) {
     items.push({ label: c.glRenderer.slice(0, 30), status: 'ok' });

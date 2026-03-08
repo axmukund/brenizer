@@ -76,6 +76,11 @@ export interface CVAddImageMsg {
     model?: string;
     focalLengthMm?: number;
     focalLength35mm?: number;
+    apertureFNumber?: number;
+    exposureTimeSec?: number;
+    iso?: number;
+    whiteBalanceMode?: 'auto' | 'manual';
+    exposureBiasEv?: number;
     capturedAtMs?: number;
   };
 }
@@ -124,6 +129,7 @@ export interface CVQualityAssessmentInMsg {
 export interface CVComputeExposureMsg {
   type: 'computeExposure';
   sameCameraSettings?: boolean;
+  lockColorBalance?: boolean;
 }
 
 export interface CVBuildMSTMsg {

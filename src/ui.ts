@@ -153,6 +153,11 @@ async function importFiles(files: FileList | File[]): Promise<void> {
           model: exif.model,
           focalLengthMm: exif.focalLengthMm,
           focalLength35mm: exif.focalLength35mm,
+          apertureFNumber: exif.apertureFNumber,
+          exposureTimeSec: exif.exposureTimeSec,
+          iso: exif.iso,
+          whiteBalanceMode: exif.whiteBalanceMode,
+          exposureBiasEv: exif.exposureBiasEv,
           capturedAtMs: exif.capturedAtMs,
         },
       });

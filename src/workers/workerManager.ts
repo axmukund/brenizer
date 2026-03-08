@@ -6,11 +6,18 @@
 import type {
   CVInMsg, CVOutMsg,
   DepthInMsg, DepthOutMsg,
-  SeamInMsg, SeamOutMsg,
+  SeamInMsg, SeamOutMsg, SeamProgressMsg,
 } from './workerTypes';
 
+export interface WorkerInitResults {
+  cv: boolean;
+  depth: boolean;
+  seam: boolean;
+  seamBackendId: string | null;
+}
+
 export interface WorkerManager {
-  initAll(opts?: { enableDepth?: boolean; enableSeam?: boolean; depthInitTimeoutMs?: number }): Promise<{ cv: boolean; depth: boolean; seam: boolean }>;
+  initAll(opts?: { enableDepth?: boolean; enableSeam?: boolean; depthInitTimeoutMs?: number }): Promise<WorkerInitResults>;
   sendCV(msg: CVInMsg, transfer?: Transferable[]): void;
   sendDepth(msg: DepthInMsg, transfer?: Transferable[]): void;
   sendSeam(msg: SeamInMsg, transfer?: Transferable[]): void;
@@ -124,7 +131,7 @@ export function createWorkerManager(): WorkerManager {
       const enableSeam = opts.enableSeam !== false;
       const depthInitTimeoutMs = Math.max(1000, opts.depthInitTimeoutMs ?? 60000);
       const baseUrl = getBaseUrl();
-      const results = { cv: false, depth: false, seam: false };
+      const results: WorkerInitResults = { cv: false, depth: false, seam: false, seamBackendId: null };
 
       // Init CV worker — generous timeout because opencv.js is ~11 MB WASM
       try {
@@ -168,8 +175,9 @@ export function createWorkerManager(): WorkerManager {
             wasmPathThreads: new URL('wasm/maxflow/maxflow-threads.js', baseUrl).toString(),
             wasmWorkerPathThreads: new URL('wasm/maxflow/maxflow-threads.worker.js', baseUrl).toString(),
           });
-          await waitForMsg(seamHandlers, 'progress', 60000);
+          const initMsg = await waitForMsg(seamHandlers, 'progress', 60000) as SeamProgressMsg;
           results.seam = true;
+          results.seamBackendId = initMsg.backendId || null;
           console.log('seam-worker ready');
         } catch (e) {
           console.warn('seam-worker init failed (seam disabled):', e);
