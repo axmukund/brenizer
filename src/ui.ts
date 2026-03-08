@@ -18,6 +18,26 @@ function $(id: string) { return document.getElementById(id)!; }
 let nextId = 1;
 function genId(): string { return `img-${nextId++}`; }
 
+function syncModeControls(): void {
+  const { userMode, mobileSafeFlag, resolvedMode } = getState();
+  const modeSelect = document.getElementById('mode-select') as HTMLSelectElement | null;
+  if (modeSelect && modeSelect.value !== userMode) {
+    modeSelect.value = userMode;
+  }
+
+  const msfFlag = document.getElementById('mobile-safe-flag') as HTMLInputElement | null;
+  if (msfFlag) {
+    msfFlag.checked = mobileSafeFlag;
+  }
+
+  const alignBtn = document.getElementById('btn-mode-align-only') as HTMLButtonElement | null;
+  if (alignBtn) {
+    const active = resolvedMode === 'alignmentOnly';
+    alignBtn.classList.toggle('active', active);
+    alignBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
+
 // ── file import ──────────────────────────────────────────
 const VALID_TYPES = new Set(['image/jpeg', 'image/png', 'image/heic', 'image/heif', 'image/x-adobe-dng', 'image/dng']);
 
@@ -725,6 +745,14 @@ export function initUI(): void {
     setState({ userMode: modeSelect.value as any });
   });
 
+  const alignOnlyBtn = $('btn-mode-align-only') as HTMLButtonElement;
+  alignOnlyBtn.addEventListener('click', () => {
+    setState({
+      userMode: 'alignmentOnly',
+      mobileSafeFlag: false,
+    });
+  });
+
   // Mobile safe flag
   const msfFlag = $('mobile-safe-flag') as HTMLInputElement;
   msfFlag.addEventListener('change', () => {
@@ -736,12 +764,14 @@ export function initUI(): void {
     renderImageList();
     updateCanvasPlaceholder();
     updateActionButtons();
+    syncModeControls();
   });
 
   // Initial render
   renderImageList();
   updateCanvasPlaceholder();
   updateActionButtons();
+  syncModeControls();
   buildSettingsPanel();
 }
 

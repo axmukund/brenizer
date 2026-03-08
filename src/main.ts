@@ -365,6 +365,24 @@ function clampGainTowardUnity(value: number, mix = 1, minGain = 0.05, maxGain = 
   return Math.max(minGain, Math.min(maxGain, mixed));
 }
 
+function formatModeLabel(mode: string): string {
+  switch (mode) {
+    case 'alignmentOnly':
+      return 'Alignment Only';
+    case 'desktopHQ':
+      return 'Desktop HQ';
+    case 'mobileQuality':
+      return 'Mobile Quality';
+    case 'mobileSafe':
+      return 'Mobile Safe';
+    case 'mobileLite':
+      return 'Mobile Lite';
+    case 'auto':
+    default:
+      return 'Auto';
+  }
+}
+
 function resolveAppliedPhotometricAdjustment(
   sameCameraSettings: boolean,
   gainObj: { gain?: number; gainR?: number; gainG?: number; gainB?: number } | undefined,
@@ -1234,7 +1252,7 @@ export async function boot(): Promise<void> {
   const settings = getPreset(resolved);
   setState({ resolvedMode: resolved, settings });
   buildSettingsPanel();
-  setStatus(`Ready — mode: ${resolved}`);
+  setStatus(`Ready — mode: ${formatModeLabel(resolved)}`);
 
   // Init WebGL2 context
   try {
@@ -1263,7 +1281,7 @@ export async function boot(): Promise<void> {
         const newSettings = getPreset(newMode);
         setState({ resolvedMode: newMode, settings: newSettings });
         buildSettingsPanel(); // rebuild settings UI for new mode
-        setStatus(`Mode changed to ${newMode}`);
+        setStatus(`Mode changed to ${formatModeLabel(newMode)}`);
       }
     }
   });

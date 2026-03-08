@@ -33,6 +33,12 @@
       background: var(--surface2); color: var(--text); border-radius: 4px; cursor: pointer;
     }
     #topbar button:hover { background: var(--accent); }
+    #topbar button.active {
+      background: var(--accent);
+      border-color: #ff7b92;
+      color: #fff;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+    }
     #topbar .status-chip {
       font-size: 12px; padding: 3px 10px; background: var(--surface2);
       border-radius: 12px; color: var(--text-dim);
@@ -239,8 +245,15 @@
     <button id="btn-stitch" disabled>Stitch Preview</button>
     <button id="btn-export" disabled>Export</button>
     <button id="btn-export-fullres" disabled title="Export at maximum resolution with no pixel loss">Export Full Res</button>
+    <button
+      id="btn-mode-align-only"
+      type="button"
+      title="Maximum geometric alignment with EXIF-aware orientation and no exposure or vignette correction"
+      aria-pressed="false"
+    >Alignment Only</button>
     <select id="mode-select">
       <option value="auto">Auto</option>
+      <option value="alignmentOnly">Alignment Only</option>
       <option value="desktopHQ">Desktop HQ</option>
       <option value="mobileQuality">Mobile Quality</option>
       <option value="mobileSafe">Mobile Safe</option>

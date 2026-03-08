@@ -45,7 +45,7 @@ export interface PipelineSettings {
   sameCameraSettings: boolean;
 }
 
-export type ModeName = 'auto' | 'desktopHQ' | 'mobileQuality' | 'mobileSafe';
+export type ModeName = 'auto' | 'desktopHQ' | 'mobileQuality' | 'mobileSafe' | 'alignmentOnly';
 
 const DESKTOP_HQ: PipelineSettings = {
   maxImages: 25,
@@ -179,7 +179,41 @@ const MOBILE_LITE: PipelineSettings = {
   sameCameraSettings: true,
 };
 
+const ALIGNMENT_ONLY: PipelineSettings = {
+  maxImages: 25,
+  alignScale: 2048,
+  orbFeatures: 8000,
+  pairWindowW: 8,
+  matchAllPairs: true,
+  minInliers: 0,
+  ratioTest: 0.75,
+  ransacThreshPx: 2.5,
+  refineIters: 45,
+  meshGrid: 16,
+  depthEnabled: true,
+  depthInputSize: 256,
+  seamMethod: 'graphcut',
+  seamBlockSize: 16,
+  depthSeamBias: 1.0,
+  featherWidth: 50,
+  multibandEnabled: true,
+  multibandLevels: 0,
+  exposureComp: false,
+  exportScale: 0.5,
+  exportFormat: 'png',
+  exportJpegQuality: 0.92,
+  saliencyEnabled: true,
+  vignetteCorrection: false,
+  maxResExport: false,
+  blurAwareStitching: true,
+  objectAwareAlignment: true,
+  cylindricalProjection: false,
+  lensDistortionCorrection: false,
+  sameCameraSettings: true,
+};
+
 export const PRESETS: Record<string, PipelineSettings> = {
+  alignmentOnly: ALIGNMENT_ONLY,
   desktopHQ: DESKTOP_HQ,
   mobileQuality: MOBILE_QUALITY,
   mobileSafe: MOBILE_SAFE,

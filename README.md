@@ -26,6 +26,9 @@ Upload overlapping photos shot with a wide-aperture lens and get a single large-
 - **Reinhard HDR tone mapping** — auto-activated for extreme gain ratios
 - **Polynomial vignetting correction** — PTGui-style radial model
 
+### Alignment-Only Workflow
+- **Alignment Only mode** — keeps EXIF orientation normalization, dense ORB matching, EXIF/line/object-aware pair scoring, APAP local warps, and depth-assisted mesh refinement enabled while skipping exposure compensation and vignette correction
+
 ### PTGui-Style Algorithms
 - **Adaptive feathering** based on overlap width
 - **Cylindrical / Brown–Conrady prototypes** exist in worker code (not enabled in default UI pipeline)
@@ -213,6 +216,13 @@ where $r = \sqrt{x^2 + y^2}$ and $(k_1, k_2)$ are fit via least-squares.
 5. **Overlap 30–50%** between adjacent frames
 6. Shoot a 3x3, 4x4, or 5x5 grid (9–25 frames)
 7. Shoot quickly to minimise subject movement
+
+## Stitch Modes
+
+- **Alignment Only**: best-fit geometric layout for sets shot with identical camera settings. Keeps the strongest alignment features enabled, assumes shared capture settings by default, and intentionally avoids exposure/vignette compensation.
+- **Desktop HQ**: balanced high-quality default for desktop browsers.
+- **Mobile Quality**: reduced but still quality-oriented preset for stronger phones/tablets.
+- **Mobile Safe**: conservative fallback for low-memory or thermally constrained devices.
 
 ## Local Development
 
