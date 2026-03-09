@@ -35,7 +35,7 @@ Use these commands/workflows for this repository unless a task explicitly requir
 E2E workflow details:
 
 - `scripts/test-e2e.sh` starts Vite on `127.0.0.1:${PORT:-5176}` and writes server logs to `${SERVER_LOG:-/tmp/brenizer-vite.log}`.
-- E2E behavior can be narrowed/tuned with `test.js` env vars such as `SCENARIO_ID`, `SEAM_TIER`, `TURBO_MODE`, `SEAM_BENCHMARK`, and `SEAM_BENCHMARK_ASSERT`.
+- E2E behavior can be narrowed/tuned with `test.js` env vars such as `APP_URL`, `SCENARIO_ID`, `SEAM_TIER`, `TURBO_MODE`, `EXPECT_COI`, `MAXFLOW_SELF_TEST`, `SEAM_BENCHMARK`, `SEAM_BENCHMARK_ASSERT`, `SEAM_BENCHMARK_TIERS`, `SEAM_BENCHMARK_SCENARIOS`, and `EXPORT_SMOKE`.
 
 CI (GitHub Pages) workflow notes:
 
