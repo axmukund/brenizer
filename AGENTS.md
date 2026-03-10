@@ -22,6 +22,7 @@ Use these commands/workflows for this repository unless a task explicitly requir
   - `npm run prepare:opencv` copies `opencv.js` into `public/opencv/`.
   - `npm run prepare:maxflow` builds/refreshes maxflow wasm artifacts in `public/wasm/maxflow/`.
   - `npm run dev` and `npm run build` already run both preparation steps via `predev`/`prebuild`.
+  - `npm run preview` serves the built `dist/` output for local verification.
 - Validation/test commands:
   - `npm run typecheck`
   - `npm run build`
@@ -39,5 +40,6 @@ E2E workflow details:
 
 CI (GitHub Pages) workflow notes:
 
+- `.github/workflows/deploy-pages.yml` triggers on pushes to `main` and via manual `workflow_dispatch`.
 - `.github/workflows/deploy-pages.yml` uses Node 20 + Python 3.12, then runs `npm ci`, `npm run typecheck`.
 - Before `npm run build`, CI bootstraps Emscripten (`emsdk install/activate 5.0.2`) and sources `emsdk_env.sh` so `prepare:maxflow` can compile via `em++`.
