@@ -283,7 +283,7 @@ void main() {
         m = label >= 0.5 ? 1.0 : 0.0;
       } else if (penalty > u_softStart) {
         float t = clamp((penalty - u_softStart) / max(1e-5, u_softEnd - u_softStart), 0.0, 1.0);
-        float blend = 0.08 + 0.26 * t;
+        float blend = 0.04 + 0.14 * t;
         m = mix(m, 0.5, blend);
       }
     }
@@ -516,9 +516,9 @@ export function buildCompactGraphFromSummaries(
   }
   means.sort((a, b) => a - b);
   const ghostMedianDiff = means.length > 0 ? means[(means.length - 1) >> 1] : 0;
-  const ghostThreshold = Math.max(ghostMedianDiff * 3, 30 / 255);
-  const lightingSoftStart = Math.max(6 / 255, ghostMedianDiff * 1.15);
-  const lightingSoftEnd = Math.max(lightingSoftStart + 12 / 255, ghostMedianDiff * 3.2);
+  const ghostThreshold = Math.max(ghostMedianDiff * 5, 45 / 255);
+  const lightingSoftStart = Math.max(10 / 255, ghostMedianDiff * 1.5);
+  const lightingSoftEnd = Math.max(lightingSoftStart + 16 / 255, ghostMedianDiff * 4.0);
 
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW; gx++) {

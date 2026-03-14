@@ -34,13 +34,23 @@ uniform sampler2D u_texture;
 uniform vec2 u_texelSize;  // 1/srcWidth, 1/srcHeight
 out vec4 fragColor;
 void main() {
-  // Sample 4 texels for 2x2 downsample
-  vec2 hs = u_texelSize * 0.5;
-  vec4 a = texture(u_texture, v_uv + vec2(-hs.x, -hs.y));
-  vec4 b = texture(u_texture, v_uv + vec2( hs.x, -hs.y));
-  vec4 c = texture(u_texture, v_uv + vec2(-hs.x,  hs.y));
-  vec4 d = texture(u_texture, v_uv + vec2( hs.x,  hs.y));
-  fragColor = (a + b + c + d) * 0.25;
+  // Gaussian-weighted 2x downsample using 9 bilinear taps.
+  // The simple 2x2 box filter causes aliasing that produces ringing /
+  // banding at blend boundaries during Laplacian pyramid reconstruction.
+  // This [1,2,1] x [1,2,1] weighting applied to bilinear taps effectively
+  // produces a smooth ~4x4 Gaussian-weighted kernel on the source texels,
+  // properly band-limiting the signal before subsampling.
+  vec2 tx = u_texelSize;
+  vec4 e  = texture(u_texture, v_uv);
+  vec4 n  = texture(u_texture, v_uv + vec2( 0.0, -tx.y));
+  vec4 s  = texture(u_texture, v_uv + vec2( 0.0,  tx.y));
+  vec4 w  = texture(u_texture, v_uv + vec2(-tx.x,  0.0));
+  vec4 ea = texture(u_texture, v_uv + vec2( tx.x,  0.0));
+  vec4 nw = texture(u_texture, v_uv + vec2(-tx.x, -tx.y));
+  vec4 ne = texture(u_texture, v_uv + vec2( tx.x, -tx.y));
+  vec4 sw = texture(u_texture, v_uv + vec2(-tx.x,  tx.y));
+  vec4 se = texture(u_texture, v_uv + vec2( tx.x,  tx.y));
+  fragColor = e * 0.25 + (n + s + w + ea) * 0.125 + (nw + ne + sw + se) * 0.0625;
 }
 `;
 

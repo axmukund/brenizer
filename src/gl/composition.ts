@@ -828,7 +828,7 @@ function hardenGhostRegions(
   }
 
   const ghostMedianDiff = quantile(means, 0.5);
-  const ghostThreshold = Math.max(ghostMedianDiff * 3 * thresholdScale, 30 * thresholdScale);
+  const ghostThreshold = Math.max(ghostMedianDiff * 5 * thresholdScale, 45 * thresholdScale);
   let ghostPixels = 0;
 
   for (let y = 0; y < height; y++) {
@@ -896,8 +896,8 @@ function refineSeamMaskForLighting(
   if (means.length < 4) return;
 
   const median = quantile(means, 0.5);
-  const softStart = Math.max(6, median * 1.15);
-  const softEnd = Math.max(softStart + 12, median * 3.2);
+  const softStart = Math.max(10, median * 1.5);
+  const softEnd = Math.max(softStart + 16, median * 4.0);
   const denom = Math.max(1, softEnd - softStart);
 
   let softened = 0;
@@ -912,7 +912,7 @@ function refineSeamMaskForLighting(
       const d = blockDiff[gy * gridW + gx];
       if (d <= softStart) continue;
       const t = clampUnit((d - softStart) / denom);
-      const blend = 0.08 + 0.26 * t;
+      const blend = 0.04 + 0.14 * t;
       mask[px] = Math.round(m * (1 - blend) + 128 * blend);
       softened++;
     }
