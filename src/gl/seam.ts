@@ -510,6 +510,35 @@ export function buildCompactGraphFromSummaries(
     if (newDist[i] > maxNewDist) maxNewDist = newDist[i];
   }
 
+  // Compute per-block contrast metric from the mean/sq summaries.
+  // Contrast is the luminance stddev normalized into [0,1].
+  const blockContrast = new Float32Array(nNodes);
+  for (let i = 0; i < nNodes; i++) {
+    if (!compHas[i] || !newHas[i]) {
+      blockContrast[i] = 0;
+      continue;
+    }
+    const off = i * 4;
+    const meanR = args.compMean[off];
+    const meanG = args.compMean[off + 1];
+    const meanB = args.compMean[off + 2];
+    const sqR = args.compSq[off];
+    const sqG = args.compSq[off + 1];
+    const sqB = args.compSq[off + 2];
+
+    const varR = Math.max(0, sqR - meanR * meanR);
+    const varG = Math.max(0, sqG - meanG * meanG);
+    const varB = Math.max(0, sqB - meanB * meanB);
+
+    // Approximate luminance variance assuming channel independence.
+    const varL =
+      0.2126 * 0.2126 * varR +
+      0.7152 * 0.7152 * varG +
+      0.0722 * 0.0722 * varB;
+    const stdL = Math.sqrt(Math.max(0, varL));
+    blockContrast[i] = Math.min(1, stdL / 30);
+  }
+
   const means: number[] = [];
   for (let i = 0; i < nNodes; i++) {
     if (compHas[i] && newHas[i]) means.push(ghostPenalty[i]);
@@ -541,8 +570,16 @@ export function buildCompactGraphFromSummaries(
       const cD = compDist[nodeIdx] / maxCompDist;
       const nD = newDist[nodeIdx] / maxNewDist;
       const colorDiff = ghostPenalty[nodeIdx];
-      dataCosts[nodeIdx * 2] = 0.8 * (1 - cD) + 0.2 * colorDiff;
-      dataCosts[nodeIdx * 2 + 1] = 0.8 * (1 - nD) + 0.2 * colorDiff;
+
+      // Use local contrast to adjust how much the seam is driven by color vs.
+      // distance-from-boundary. High-contrast areas favor color/uplow edges (avoid
+      // cutting through strong texture), while low-contrast areas favor centering.
+      const contrast = blockContrast[nodeIdx] || 0;
+      const distWeight = 0.75 + 0.15 * (1.0 - contrast);
+      const colWeight = 1.0 - distWeight;
+
+      dataCosts[nodeIdx * 2] = distWeight * (1 - cD) + colWeight * colorDiff;
+      dataCosts[nodeIdx * 2 + 1] = distWeight * (1 - nD) + colWeight * colorDiff;
       if (saliencyGrid) {
         const salPenalty = saliencyGrid[nodeIdx] * 5.0;
         dataCosts[nodeIdx * 2] += salPenalty;
@@ -596,8 +633,11 @@ export function buildCompactGraphFromSummaries(
           - colorMismatchNormalized(args.compMean, offB, args.newMean, offB) * 0.5,
       );
       const edgeStrength = Math.max(0.01, 1 - Math.max(compGrad, newGrad, crossGrad));
-      const blurDiscount = 0.2 + 0.8 * getSal(a, b);
-      edgeWeightsH[gy * (gridW - 1) + gx] = (0.4 * edgeStrength + 0.6 * gradientAgreement) * blurDiscount;
+      const contrast = 0.5 * (blockContrast[a] + blockContrast[b]);
+      const edgeGradWeight = 0.5 + 0.3 * contrast;
+      const edgeStrWeight = 1.0 - edgeGradWeight;
+      const blurDiscount = 0.35 + 0.65 * getSal(a, b);
+      edgeWeightsH[gy * (gridW - 1) + gx] = (edgeStrWeight * edgeStrength + edgeGradWeight * gradientAgreement) * blurDiscount;
     }
   }
   for (let gy = 0; gy < gridH - 1; gy++) {
@@ -622,8 +662,11 @@ export function buildCompactGraphFromSummaries(
           - colorMismatchNormalized(args.compMean, offB, args.newMean, offB) * 0.5,
       );
       const edgeStrength = Math.max(0.01, 1 - Math.max(compGrad, newGrad, crossGrad));
-      const blurDiscount = 0.2 + 0.8 * getSal(a, b);
-      edgeWeightsV[gy * gridW + gx] = (0.4 * edgeStrength + 0.6 * gradientAgreement) * blurDiscount;
+      const contrast = 0.5 * (blockContrast[a] + blockContrast[b]);
+      const edgeGradWeight = 0.5 + 0.3 * contrast;
+      const edgeStrWeight = 1.0 - edgeGradWeight;
+      const blurDiscount = 0.35 + 0.65 * getSal(a, b);
+      edgeWeightsV[gy * gridW + gx] = (edgeStrWeight * edgeStrength + edgeGradWeight * gradientAgreement) * blurDiscount;
     }
   }
 
@@ -856,7 +899,11 @@ export function createSeamAccelerator(gl: WebGL2RenderingContext, floatFBO: bool
       gl.RED,
       gl.UNSIGNED_BYTE,
       normalizedLabels,
-      { unpackAlignment: 1 },
+      {
+        unpackAlignment: 1,
+        minFilter: gl.LINEAR,
+        magFilter: gl.LINEAR,
+      },
     );
     const penaltyTex = createTextureFromData(
       gl,

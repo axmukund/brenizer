@@ -188,6 +188,7 @@ export function computeBlockCosts(
   // to robustly determine which images have data.
   const compHasBlock = new Uint8Array(nNodes);  // 1 = composite has data
   const newHasBlock = new Uint8Array(nNodes);   // 1 = new image has data
+  const blockContrast = new Float32Array(nNodes); // 0..1 contrast metric (luma stddev)
 
   for (let gy = 0; gy < gridH; gy++) {
     for (let gx = 0; gx < gridW; gx++) {
@@ -196,16 +197,32 @@ export function computeBlockCosts(
       const blockTop = gy * blockSize;
       const blockW = Math.max(1, Math.min(blockSize, compW - blockLeft));
       const blockH = Math.max(1, Math.min(blockSize, compH - blockTop));
-      // Sample a 3×3 grid within the block for robust alpha detection
+      // Sample a 3×3 grid within the block for robust alpha detection.
+      // While sampling, also estimate local contrast (luma stddev) so we can
+      // adapt seam cost weighting based on how textured / sharp the region is.
       let compCount = 0, newCount = 0;
       const samples = 3;
+      let lumSum = 0;
+      let lumSqSum = 0;
+      let lumCount = 0;
       for (let sy = 0; sy < samples; sy++) {
         for (let sx = 0; sx < samples; sx++) {
           const px = blockLeft + Math.min(blockW - 1, Math.floor(((sx + 0.5) * blockW) / samples));
           const py = blockTop + Math.min(blockH - 1, Math.floor(((sy + 0.5) * blockH) / samples));
-          const idx = (py * compW + px) * 4 + 3;
-          if (compositePixels[idx] > CONTENT_ALPHA_THRESHOLD) compCount++;
-          if (newImagePixels[idx] > CONTENT_ALPHA_THRESHOLD) newCount++;
+          const idx = (py * compW + px) * 4;
+          const aComp = compositePixels[idx + 3];
+          const aNew = newImagePixels[idx + 3];
+          if (aComp > CONTENT_ALPHA_THRESHOLD) compCount++;
+          if (aNew > CONTENT_ALPHA_THRESHOLD) newCount++;
+          if (aComp > CONTENT_ALPHA_THRESHOLD && aNew > CONTENT_ALPHA_THRESHOLD) {
+            const r = compositePixels[idx];
+            const g = compositePixels[idx + 1];
+            const b = compositePixels[idx + 2];
+            const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            lumSum += lum;
+            lumSqSum += lum * lum;
+            lumCount++;
+          }
         }
       }
       // Require majority (≥50%) pixel coverage to count as "has data".
@@ -213,6 +230,17 @@ export function computeBlockCosts(
       const thresh = Math.ceil(samples * samples * 0.5);
       compHasBlock[nodeIdx] = compCount >= thresh ? 1 : 0;
       newHasBlock[nodeIdx] = newCount >= thresh ? 1 : 0;
+
+      // Contrast metric (normalized): use luminance stddev over overlapping pixels.
+      if (lumCount > 1) {
+        const meanL = lumSum / lumCount;
+        const varL = Math.max(0, lumSqSum / lumCount - meanL * meanL);
+        const stdL = Math.sqrt(varL);
+        // Normalise into [0..1], clamping at ~12% luma stddev typical for textured regions.
+        blockContrast[nodeIdx] = Math.min(1, stdL / 30);
+      } else {
+        blockContrast[nodeIdx] = 0;
+      }
     }
   }
 
@@ -266,8 +294,12 @@ export function computeBlockCosts(
         // in its thin-coverage zone).
         // Result: seam goes through the zone where both distances are roughly equal —
         // the centre of the overlap.
-        const distWeight = 0.8;
-        const colWeight = 0.2;
+        const contrast = blockContrast[nodeIdx];
+        // Adaptive weighting: in highly-textured zones, allow color differences to
+        // drive the seam (seam should follow edges); in smooth areas, bias towards
+        // the overlap centre to avoid visible seams in flat regions.
+        const distWeight = 0.75 + 0.15 * (1.0 - contrast);
+        const colWeight = 1.0 - distWeight;
 
         dataCosts[nodeIdx * 2]     = distWeight * (1.0 - cD) + colWeight * colorDiff;
         dataCosts[nodeIdx * 2 + 1] = distWeight * (1.0 - nD) + colWeight * colorDiff;
@@ -407,22 +439,23 @@ export function computeBlockCosts(
         gradConsistencySum += gradDiffSum / (255 * 3);
         gradSamples++;
       }
-      // Combine: edge weight = blend of edge-avoidance and gradient consistency
-      // High weight = strong penalty for cutting here = seam avoids this edge
-      // We WANT the seam to cut where gradients agree (low gradConsistency)
+      // Combine: edge weight = blend of edge-avoidance and gradient consistency.
+      // In high-contrast regions, gradient agreement is a stronger cue.
+      // In low-contrast regions, prefer the seam to stay near overlap centre.
+      const a = gy * gridW + gx;
+      const b = a + 1;
       const avgGradConsistency = gradSamples > 0 ? gradConsistencySum / gradSamples : 0;
       const edgeStrength = Math.max(0.01, 1.0 - maxGrad);
-      // Invert gradient consistency: high agreement → high penalty (don't cut here)
-      // High disagreement → low penalty (okay to cut here... but actually no,
-      // we want to cut where gradients AGREE, so low disagreement → good seam)
       const gradientAgreement = Math.max(0.01, 1.0 - avgGradConsistency);
-      // Weighted combination: 60% gradient-domain, 40% edge avoidance
-      let w = 0.4 * edgeStrength + 0.6 * gradientAgreement;
+      const contrast = 0.5 * (blockContrast[a] + blockContrast[b]);
+      const edgeGradWeight = 0.5 + 0.3 * contrast; // 0.5..0.8
+      const edgeStrWeight = 1.0 - edgeGradWeight;  // 0.2..0.5
+      let w = edgeStrWeight * edgeStrength + edgeGradWeight * gradientAgreement;
       // ── Brenizer blur discount ──────────────────────────
       // In blurred (bokeh) regions, reduce edge weight to encourage the seam
       // to pass through. Low saliency ≈ blurred ≈ good seam location.
       const sal = sampleBoundarySaliency(bx, gy * blockSize, true);
-      const blurDiscount = 0.2 + 0.8 * sal; // 0.2 in pure blur → 1.0 in sharp
+      const blurDiscount = 0.35 + 0.65 * sal; // 0.35 in pure blur → 1.0 in sharp
       w *= blurDiscount;
       edgeWeights[eIdx] = w;
     }
@@ -457,13 +490,18 @@ export function computeBlockCosts(
         gradConsistencySum += gradDiffSum / (255 * 3);
         gradSamples++;
       }
+      const a = gy * gridW + gx;
+      const b = a + gridW;
       const avgGradConsistency = gradSamples > 0 ? gradConsistencySum / gradSamples : 0;
       const edgeStrength = Math.max(0.01, 1.0 - maxGrad);
       const gradientAgreement = Math.max(0.01, 1.0 - avgGradConsistency);
-      let vw = 0.4 * edgeStrength + 0.6 * gradientAgreement;
+      const contrast = 0.5 * (blockContrast[a] + blockContrast[b]);
+      const edgeGradWeight = 0.5 + 0.3 * contrast;
+      const edgeStrWeight = 1.0 - edgeGradWeight;
+      let vw = edgeStrWeight * edgeStrength + edgeGradWeight * gradientAgreement;
       // Brenizer blur discount for vertical edges
       const vSal = sampleBoundarySaliency(gx * blockSize, by, false);
-      const vBlurDiscount = 0.2 + 0.8 * vSal;
+      const vBlurDiscount = 0.35 + 0.65 * vSal;
       vw *= vBlurDiscount;
       edgeWeights[eIdx] = vw;
     }
@@ -547,8 +585,10 @@ export function estimateOverlapWidth(
   const colSpans = collectOverlapSpans(compositePixels, newImagePixels, width, height, false);
 
   const spanCandidates: number[] = [];
-  if (rowSpans.length > 0) spanCandidates.push(quantile(rowSpans, 0.35));
-  if (colSpans.length > 0) spanCandidates.push(quantile(colSpans, 0.35));
+  // Use median overlap width (50th percentile) instead of a lower quantile.
+  // This avoids underestimating overlap in uneven/multi-modal overlap shapes.
+  if (rowSpans.length > 0) spanCandidates.push(quantile(rowSpans, 0.5));
+  if (colSpans.length > 0) spanCandidates.push(quantile(colSpans, 0.5));
 
   if (spanCandidates.length > 0) {
     // Bias toward the narrower stable overlap dimension. This avoids
