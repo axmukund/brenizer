@@ -1,0 +1,22 @@
+{
+  "model": {
+    "model": "raptor-mini",
+    "api_base": "https://api.openai.com/v1",
+    "temperature": 0.3,
+    "max_tokens": 4096,
+    "timeout": 120,
+    "frontier_model": "gpt-4o"
+  },
+  "orchestrator": {
+    "max_workers": 12,
+    "max_review_cycles": 3,
+    "quality_threshold": 0.7,
+    "ensemble_voting": true,
+    "ensemble_size": 3,
+    "adversarial_review": true,
+    "synthesis_iterations": 2,
+    "verbose": true,
+    "persist_state": true,
+    "state_dir": "./grotto_state"
+  }
+}
